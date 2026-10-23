@@ -2046,6 +2046,30 @@ x itself for x >= +0, for |x| < 2^-24 and for a NaN, all decided on the integer 
 
 **Measured** (Pi Zero W): Mimi's `[115200, 24]` ELU 420 -> 209 ms, 2.0 s -> 0.9 s over the decoder.
 
+## PR 49 — `cpu`: AArch64, the direct 1-D convolution on per-thread staged slices and an 8 x 12 tile
+
+*(`cmake/patches/ggml-0053-conv1d-staged-8x12.patch`; depends on loom's ggml-0006/0007)*
+
+**Problem.** loom's direct 1-D convolution (the long-activation, small-weight case: HiFi-GAN resblocks)
+copies the whole activation, zero-padded, into the work buffer before sweeping it: at 32 channels x 73216
+positions that is 9.4 MB written and read back from DRAM per convolution, with no arithmetic over it. Its
+weights are packed `[ic][kx][oc]`, so a 4-channel tile reads one new cache line per (channel, tap), from
+L2 once the weights pass L1. On a Cortex-A72 it ran VITS's resblocks at 14-24 GFLOP/s.
+
+**Change.** On AArch64 (by default on cores without DOTPROD), for OC a multiple of 8: weights packed per
+8-channel tile, an 8 x 12 tile (24 named accumulators), and no global copy. Each thread stages its own
+positions ~16 KB of activation at a time (through the fused LEAKY_RELU, as the copy did), carries each
+slice's halo into the next, and saves its two cross-thread halos before the barrier, so an output written
+over its input stays correct. `GGML_CPU_CONV1D_STAGED=0|1` overrides.
+
+**Numerics.** The same order (bias, then each channel's taps as fused multiply-adds, then the residual):
+byte-identical to the direct and phase-major kernels (loom's `test_conv_1d_staged`, bit-exact against an
+`fmaf` loop at 1-4 threads, in place and not, both registrations).
+
+**Measured** (Pi 4, four threads, off/on, paired launches): the eighteen resblock shapes 1.91x
+(`scripts/bench67.cpp`); end to end VITS (piper) F32 **1.301x** (1.041 -> 0.799 s) and its Q8_0 1.284x, the
+audio identical; Citrinet-256 1.070x, Pocket-TTS 1.03-1.07x; Moonshine tiny (no direct convolution) 1.002x.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the

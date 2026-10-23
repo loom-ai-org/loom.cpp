@@ -359,8 +359,8 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   shipped: decide its status. *Context:
   [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md#the-a72-kernel-built-2026-10-22-p437),
   [ADR-082](../adrs/adr-082-an-outer-product-f32-gemm-under-an-l2-blocked-schedule-for-the-a72.md)*
-* [ ] **P4.41: Pocket-TTS's Mimi decoder on the Pi Zero -- BUILT 2026-10-23, PRs loom.cpp #96 + loom-exporter #66
-  (merge #96 first); open: merge, re-export the three small models for rc19.** 2m 1.93x (RTF
+* [ ] **P4.41: Pocket-TTS's Mimi decoder on the Pi Zero -- MERGED 2026-10-23 (loom.cpp #96, loom-exporter #66);
+  open: re-export the three small models for rc19.** 2m 1.93x (RTF
   3.9 -> 2.0), 7m 1.99x: the windowed `ATTENTION` ([ADR-085](../adrs/adr-085-a-windowed-attention-computes-only-its-band.md)),
   `ggml-0050` (`PAD`/`CONCAT` rows), `ggml-0051` (ARMv6 binary rows without divides), `ggml-0052` (ARMv6 `ELU`).
   Left, in order of size: the flow LM's per-node cost (~4.3 s profiled, ~51k node runs a call); int8 for Mimi's
@@ -377,10 +377,14 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   16 back and 3 ahead: a lookahead attr); the sliding-window causal LMs (gemma-3, `causal_lm_export`), whose
   attention is cached, which ADR-085 leaves out. Check per model that its block fuses at all, and measure: the
   win scales with T / window. Nemotron's chunked mask is not a band. *Context: [ADR-085](../adrs/adr-085-a-windowed-attention-computes-only-its-band.md)*
-* [ ] **P4.40: VITS's vocoder on the Pi 4 is ggml's direct 1-D kernel**, at ~20-23 GF/s against the 27-32 the
-  outer-product tile reaches on GEMMs. It is the largest share of a synthesis left (~37% profiled). The im2col
-  route was measured out in P4.39, so this would be a better direct kernel, e.g. an outer product over
-  (output channel x position). *Context: [ADR-083](../adrs/adr-083-the-convolutions-gemms-take-the-outer-product-path-with-a-carved-block.md#alternatives-considered)*
+* [ ] **P4.40: VITS's vocoder on the Pi 4 -- BUILT 2026-10-23 (`ggml-0053`, branch
+  `perf/p440-vits-vocoder-staged-conv`); open: commit, PR, merge.** The direct 1-D convolution on per-thread staged
+  slices under an 8 x 12 tile, weights packed per tile, byte-identical outputs: VITS F32 **1.301x** end to end
+  (RTF 0.31 -> 0.24), Q8_0_PC 1.284x, Citrinet-256 1.070x, Pocket-TTS 1.03-1.07x on the Pi 4
+  ([ADR-086](../adrs/adr-086-the-direct-convolution-stages-its-activation-per-thread.md)). On by default only on
+  cores without DOTPROD: **the M1 is not measured** (it was unreachable); `GGML_CPU_CONV1D_STAGED=1` forces it there
+  for the A/B, and a win there would widen the default. The AVX2 arm of the direct kernel has the same padded
+  copy and pack and was not tried. *Context: [Epic-05 P4.40](../epics/epic-05-edge-performance.md#p440-vitss-vocoder-convolutions-on-the-raspberry-pi-4-2026-10-23)*
 * [ ] **`SOFT_MAX`: PORTED 2026-10-13 as `ggml-0029`, measured on all four machines, CosyVoice3 gate re-bounded; open: commit + upstream.** (UPSTREAM.md PR 26.)
   XNNPACK's exponential kernels, a four-accumulator vector max, the copy/scale/mask fused into one pass
   (no pass at all for a plain softmax), and a sum that is NOT XNNPACK's. Its f32 accumulators raised
