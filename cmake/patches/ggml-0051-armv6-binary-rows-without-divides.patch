@@ -1,0 +1,76 @@
+diff --git a/src/ggml-cpu/binary-ops.cpp b/src/ggml-cpu/binary-ops.cpp
+index c4085e56..0a2a631d 100644
+--- a/src/ggml-cpu/binary-ops.cpp
++++ b/src/ggml-cpu/binary-ops.cpp
+@@ -93,6 +93,49 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
+     }
+ #endif
+ 
++#if defined(GGML_ARMV6_ELTWISE)
++    if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> && std::is_same_v<dst_t, float>) {
++        if (armv6_row) {
++            // ggml-0051: THE ROWS WALKED WITH COUNTERS, NOT DIVIDED OUT. The loop below derives each row's
++            // (i01, i02, i03) with three 64-bit divides and its src1 row with three 64-bit modulos, and on
++            // ARMv6 each of those is a libgcc call: ~1 us a row on a Pi Zero W. With rows of one float that
++            // is the whole cost -- Pocket-TTS's RoPE negates a strided [1, 64, 960] view eight times in its
++            // Mimi decoder, 61,440 rows each, 0.5 s of a 19 s synthesis (loom P4.41). One divide per
++            // thread now, then increments; a one-float row is done inline. The same op on the same
++            // operands, so bit-identical.
++            int64_t i03 = ir0/(ne02*ne01);
++            int64_t i02 = (ir0 - i03*ne02*ne01)/ne01;
++            int64_t i01 = (ir0 - i03*ne02*ne01 - i02*ne01);
++            int64_t i13 = i03 % ne13, i12 = i02 % ne12, i11 = i01 % ne11;
++            for (int64_t ir = ir0; ir < ir1; ++ir) {
++                float       * dst_ptr  = (float *)       ((char *)       dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
++                const float * src0_ptr = (const float *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
++                const float * src1_ptr = (const float *) ((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
++                if (ne00 == 1) {
++                    *dst_ptr = op(*src0_ptr, *src1_ptr);
++                } else if (ne10 == 1) {
++                    armv6_scalar((int32_t) ne00, dst_ptr, src0_ptr, *src1_ptr);
++                } else {
++                    for (int64_t r = 0; r < ne00 / ne10; ++r) {
++                        armv6_row((int32_t) ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
++                    }
++                }
++                if (++i11 == ne11) i11 = 0;
++                if (++i01 == ne01) {
++                    i01 = 0; i11 = 0;
++                    if (++i12 == ne12) i12 = 0;
++                    if (++i02 == ne02) {
++                        i02 = 0; i12 = 0;
++                        if (++i13 == ne13) i13 = 0;
++                        ++i03;
++                    }
++                }
++            }
++            return;
++        }
++    }
++#endif
++
+     for (int64_t ir = ir0; ir < ir1; ++ir) {
+         const int64_t i03 = ir/(ne02*ne01);
+         const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+@@ -106,21 +149,6 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
+         const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+         const src1_t * src1_ptr = (const src1_t *) ((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+ 
+-#if defined(GGML_ARMV6_ELTWISE)
+-        if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> && std::is_same_v<dst_t, float>) {
+-            if (armv6_row) {
+-                if (ne10 == 1) {
+-                    armv6_scalar((int32_t) ne00, dst_ptr, src0_ptr, *src1_ptr);
+-                } else {
+-                    for (int64_t r = 0; r < ne00 / ne10; ++r) {
+-                        armv6_row((int32_t) ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
+-                    }
+-                }
+-                continue;
+-            }
+-        }
+-#endif
+-
+         if (is_src1_contiguous_rows) {
+             // src1 is broadcastable across src0 and dst in i1, i2, i3
+             const int64_t nr0 = ne00 / ne10;
