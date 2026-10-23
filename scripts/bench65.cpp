@@ -18,6 +18,12 @@
 //
 // BUILD (on the board, against a ggml built from the patched tree):
 //
+// LINK THE ENGINE'S ggml, OR CONFIGURE A STANDALONE ONE LIKE IT: -DGGML_LLAMAFILE=ON -DGGML_OPENMP=OFF.
+// ggml's own CMake defaults GGML_LLAMAFILE to OFF when it is built by itself, and then the f32 arm is not
+// tinyBLAS at all: on the Pi 4 it read 6.05 GFLOP/s at fc2 and 12.1 at fc1, against 15.7 and 24.1 for
+// the engine's own build, and that put a false "fc2 collapses at four threads" lead into P4.38's scope
+// (Retro-090). The q8 and i8 arms do not depend on it (tinyBLAS's Q8_0 GEMM needs DOTPROD anyway).
+//
 //   g++ -O3 -std=c++17 -mcpu=native -I <ggml-src>/include scripts/bench65.cpp -o bench65 \
 //       -L <ggml-build>/src -lggml -lggml-base -lggml-cpu -lpthread -lm -Wl,-rpath,<ggml-build>/src
 //
