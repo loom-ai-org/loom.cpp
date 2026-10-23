@@ -132,6 +132,13 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   passed there, x-linked-etag = local sha256 `eee92e72...`; no Perth watermark, per Epic-03 §2).
   *Context: [Epic-03](../epics/epic-03-model-coverage.md),
   [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)*
+* [ ] **Pocket-TTS small English models (18m/7m/2m refl, 2026-10): BUILT 2026-10-23, not published.** Branches
+  `feat/pocket-tts-small` (loom.cpp, loom-exporter). Open: (1) publishing, which needs a loom-py release carrying the
+  `PocketTtsVocab` v4 rules, plus repo layout, cards and gate; (2) the new voice `daan` has no stated licence;
+  (3) upstream's default English is now `english_2026-10`, while ours is `english_2026-09`; (4) the v5 gate fixture
+  `pocket_tts.gguf` predates `unigram_scoring` (3/3000 differential misses on runs of punctuation; the published
+  file is exact). *Context: [ADR-084](../adrs/adr-084-pocket-ttss-small-models-ship-their-own-head-and-v4s-text-rules-as-data.md),
+  [Retro-091](../retros/retro-091-a-literal-fixture-reader-graded-a-different-sentence.md)*
 * [ ] **Pocket-TTS: cloning a voice from a recording.** Published (`pocket-tts-loom`, with 26 voice files under
   Kyutai's use restrictions; two voices are non-commercial). Cloning needs the Mimi encoder, which is in the gated
   voice-cloning weights and zeroed in the other release, as one more phase feeding the text prefill's ordinary input.
