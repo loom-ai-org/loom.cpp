@@ -1992,6 +1992,60 @@ loop and the same at every thread count (loom's `test_conv_neon_f32_4x8`).
 1.000x. It does not touch the direct 1-D kernel (`ggml_conv_1d_direct_ok`, a loom patch), which keeps VITS's
 vocoder: through im2col and this GEMM those shapes were slower.
 
+## PR 46 — `cpu`: `PAD` and `CONCAT` a row at a time
+
+*(`cmake/patches/ggml-0050-cpu-pad-concat-row-copies.patch`)*
+
+**Problem.** `ggml_compute_forward_pad_f32` and `ggml_compute_forward_concat_f32` move one element per
+iteration, forming 64-bit addresses and (for `PAD`) four range tests each time. On a Pi Zero W's ARM1176 that
+is ~180 ns an element for `PAD` and ~100 for `CONCAT`: Pocket-TTS's Mimi decoder pads two 2.8M-element
+activations before causal convolutions, 1.0 s of an 18 s synthesis.
+
+**Change.** When the source rows are contiguous floats (`nb00 == 4`, and for `CONCAT` both sources and dst):
+`PAD` (non-circular) writes each row as a zero head, one `memcpy` and a zero tail, or a whole zero row;
+`CONCAT` copies each dst row from its source row(s), both halves of it along dim 0. Threads split rows as the
+loops did. Everything else keeps the loops.
+
+**Numerics.** A copy: byte-identical, NaN payloads, `-0` and denormals included (loom's
+`test_pad_concat_rows`, contiguous, strided and transposed sources on every axis, F32 and I32).
+
+**Measured** (Pi Zero W, one thread): Mimi's `[115202, 24]` pad 520 -> 54 ms. A `CONCAT` of rows of one float
+(RoPE's pair swap, `[1, 64, 960]` twice) is not faster: two `memcpy` calls a row cost what the loop did.
+
+## PR 47 — `cpu`: ARMv6, binary-op rows walked with counters
+
+*(`cmake/patches/ggml-0051-armv6-binary-rows-without-divides.patch`; depends on loom's ggml-0037)*
+
+**Problem.** `apply_binary_op` derives each row's `(i01, i02, i03)` with three 64-bit divides and its
+broadcast `src1` row with three 64-bit modulos. On 32-bit ARM each is a libgcc call: ~1 us a row on an
+ARM1176. With short rows that is the op: Pocket-TTS negates a strided `[1, 64, 960]` view (one float a row)
+eight times, 61 ms each.
+
+**Change.** On ARMv6, where ggml-0037's row kernels are in use: one divide per thread to find its first row,
+then increments, the broadcast indices wrapping with them; a row of one float is computed inline.
+
+**Numerics.** The same IEEE operation on the same operands: byte-identical (loom's `test_eltwise_armv6`,
+3-D and 4-D broadcasts that wrap every counter, strided one-float rows, edge values, both registrations).
+
+**Measured** (Pi Zero W): the `[1, 64, 960]` multiply by a scalar 61 -> 8.8 ms.
+
+## PR 48 — `cpu`: ARMv6, `ELU` on the VFP's short vectors
+
+*(`cmake/patches/ggml-0052-armv6-elu.patch`; depends on loom's ggml-0039)*
+
+**Problem.** `op_elu` calls glibc's `expm1f` per element: ~150 ns on an ARM1176, 2.0 s of a Pocket-TTS
+synthesis (its SEANet decoder has an ELU before every convolution, up to 2.8M elements each).
+
+**Change.** A fifth kernel in ggml-0039's generated set (loom's `scripts/gen_armv6_act_f32.py`), on the same
+Cephes exp with v = x: where the reduction leaves n = 0 (|x| < ~0.35) the polynomial gives `expm1` before
+its 1 is added, so there is no cancellation; elsewhere `e^x - 1`, which cannot cancel there (`e^x <= 0.71`).
+x itself for x >= +0, for |x| < 2^-24 and for a NaN, all decided on the integer bits.
+
+**Numerics.** Not glibc's: 1.24 ULP worst on the test's inputs (glibc 0.70), `-inf` -> -1, `+-0` kept
+(loom's `test_activations_armv6`; with the n = 0 branch removed it reads 122 ULP).
+
+**Measured** (Pi Zero W): Mimi's `[115200, 24]` ELU 420 -> 209 ms, 2.0 s -> 0.9 s over the decoder.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the

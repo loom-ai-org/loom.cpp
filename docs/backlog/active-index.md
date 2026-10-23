@@ -359,6 +359,15 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   shipped: decide its status. *Context:
   [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md#the-a72-kernel-built-2026-10-22-p437),
   [ADR-082](../adrs/adr-082-an-outer-product-f32-gemm-under-an-l2-blocked-schedule-for-the-a72.md)*
+* [ ] **P4.41: Pocket-TTS's Mimi decoder on the Pi Zero -- BUILT 2026-10-23 (branch `perf/p441-pocket-mimi-pi-zero`
+  in loom.cpp and loom-exporter), open: commit, PR, re-export the three small models for rc19.** 2m 1.93x (RTF
+  3.9 -> 2.0), 7m 1.99x: the windowed `ATTENTION` ([ADR-085](../adrs/adr-085-a-windowed-attention-computes-only-its-band.md)),
+  `ggml-0050` (`PAD`/`CONCAT` rows), `ggml-0051` (ARMv6 binary rows without divides), `ggml-0052` (ARMv6 `ELU`).
+  Left, in order of size: the flow LM's per-node cost (~4.3 s profiled, ~51k node runs a call); int8 for Mimi's
+  linears; the dense `ATTENTION`'s Q is a strided view, so on ARMv6 its `Q @ K^T` takes ggml's per-element dot
+  ([Retro-092](../retros/retro-092-a-view-chose-the-kernel.md); copying it moves every attention model's sums);
+  the windowed softmax on 81-key rows (~0.24 s); RoPE's one-float-row `CONCAT`/`CONT` (~0.15 s); 18m not yet
+  measured on the board. *Context: [Epic-05 P4.41](../epics/epic-05-edge-performance.md#p441-pocket-ttss-mimi-decoder-on-the-pi-zero-2026-10-23)*
 * [ ] **P4.40: VITS's vocoder on the Pi 4 is ggml's direct 1-D kernel**, at ~20-23 GF/s against the 27-32 the
   outer-product tile reaches on GEMMs. It is the largest share of a synthesis left (~37% profiled). The im2col
   route was measured out in P4.39, so this would be a better direct kernel, e.g. an outer product over

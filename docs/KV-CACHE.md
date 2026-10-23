@@ -38,7 +38,9 @@ Everything below that cites a file or a count was checked against the tree durin
 * the cache binds per registered module and survives across calls (`lua_bridge.cpp:145`, `:520`), so a
   Lua driver gets persistence with **no address ever crossing the scripting boundary**.
 * `attrs.kv_cache=false` covers the non-autoregressive case, which is how the same op serves Whisper's
-  cross-attention (`convert_whisper/convert_whisper_decoder.py:90`).
+  cross-attention (`convert_whisper/convert_whisper_decoder.py:90`). With it, `attrs.window` declares a
+  causal sliding window and the op computes only that band
+  ([ADR-085](adrs/adr-085-a-windowed-attention-computes-only-its-band.md); Pocket-TTS's Mimi decoder).
 
 Two consequences worth stating plainly, because both were live questions:
 
