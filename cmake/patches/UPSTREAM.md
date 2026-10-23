@@ -1886,14 +1886,17 @@ the source runs contiguous along its second dimension. whisper's V^T (`[64, 12, 
 **Change.** When `type_size == 4`, `nb01 == 4`, `nb00 != 4` and dst is contiguous: 4x4 tiles transposed in
 registers (NEON `trn` on aarch64, after XNNPACK's x32-transposec 4x4 kernels, a plain 4x4 elsewhere), stored
 as 16-byte row segments, with the first dimension walked in blocks of 64 so the source lines stay in L1
-across a thread's rows. Threads split the second dimension, as before. Enabled on aarch64 and x86-64, the two ISAs measured.
+across a thread's rows. Threads split the second dimension, as before. Enabled on aarch64, x86-64 and ARMv6
+(`__ARM_FEATURE_SIMD32` without NEON), the three ISAs measured.
 
 **Numerics.** A copy, and byte-identical (loom's `test_cont_transpose_x32`, ragged shapes, 1-4 threads).
 
 **Measured** (whisper's V^T, both arms in one process, per-round ratio): Pi 4 4.68x at four threads (21.9 ->
 4.68 ms), 3.48x at one; Ryzen 3 3250U 1.76x at two, 1.82x at one. A decoder-sized `[32, 12, 50]` is neutral on
 the A72 (0.97x) and 4.3x on x86. End to end, whisper-small F32 on the Pi 4: 1.021x (7 paired launches, p10
-1.004, p90 1.050).
+1.004, p90 1.050). Pi Zero W (ARM1176, one thread), where the plain 4x4 replaces a libc `memcpy` call per
+element: 2.57-5.28x over the shapes its models materialise, and end to end Moonshine tiny 1.084x F32 and 1.101x
+Q8_0 (5 paired runs, byte-identical), its cross-attention V^T being copied at every decode step.
 
 ## PR 43 — `cpu`: an int8 `mul_mat` for AArch64 cores without DOTPROD, on Q8_0 weights with one scale per row
 
