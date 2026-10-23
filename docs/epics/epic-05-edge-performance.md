@@ -1443,6 +1443,29 @@ A one-thread loom profile next to the four-thread one gives each piece's scaling
   * Numerics: one sequential fused sum per output, bit-exact to an `fmaf` loop at 1/2/4 threads
     (`test_mul_mat_neon_f32_4x8`, sabotaged red). Not tinyBLAS's order; ~2x its error against f64
     (5.0e-7 vs 2.5e-7).
+* **P4.39, the convolutions' GEMMs on the same path — BUILT 2026-10-23 (`ggml-0049`,
+  [ADR-083](../adrs/adr-083-the-convolutions-gemms-take-the-outer-product-path-with-a-carved-block.md)).** A
+  convolution carves the path's block off the end of its own work buffer before sizing its im2col patches, and
+  hands it to the GEMM. All three of `conv_2d_impl`'s GEMM calls take it, and so does `conv_transpose_1d`'s.
+  A VITS profile split its convolutions three ways: the vocoder's resblocks (~37%) run ggml's **direct** kernel,
+  not a GEMM. The text encoder and flow (~21%) are im2col, and the three upsamplers (~6%) are GEMMs too. P4.38's
+  sweep had raced the resblock shapes against tinyBLAS, which they never reach
+  ([Retro-090](../retros/retro-090-the-baseline-arm-was-not-the-engine.md)). Sent through im2col and this GEMM,
+  they made the synthesis slower (1.178 s against 1.022), so they keep the direct kernel (P4.40).
+
+  | card (Pi 4, 4 threads, off/on, 5 paired launches) | ratio (p10-p90) | |
+  |---|---|---|
+  | VITS F32 | **1.068x** (1.062-1.090) | 1.097 → 1.025 s |
+  | VITS Q8_0_PC | 1.054x (1.024-1.070) | dequantized kernels, the same GEMMs |
+  | Citrinet-256-ls F32 / Q8_0_PC | **1.062x** / 1.060x | same transcripts |
+  | Moonshine tiny F32 | 1.034x (1.029-1.084) | the stem; same transcript |
+  | whisper-small F32 | 1.000x, unresolved | same transcript |
+  | Pocket TTS F32 | 1.003x, unresolved | |
+
+  The patch budget (512 KB) and the transpose's block were re-swept with the path on, and both stay as they are.
+  The README's Pi 4 table, both halves re-run on this build (#89-#91 plus `ggml-0049`), now has VITS F32 at
+  **1.03x** onnxruntime FP32 (0.98x at rc18), Citrinet 0.61x (0.57x), Moonshine 1.13x and whisper 0.99x
+  (unresolved). At Q8_0_PC against onnxruntime int8, whisper is 1.15x and VITS 3.90x.
 
 ### Operating notes: benchmarking
 

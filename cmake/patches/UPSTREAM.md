@@ -1965,6 +1965,30 @@ F32 **1.174x** (24.6 -> 20.9 s, same transcript), Moonshine tiny 1.057x, whisper
 products are F32 x F32). Citrinet, VITS (byte-identical audio)
 and Qwen3-0.6B are unmoved: their products are convolutions or under 128 rows.
 
+## PR 45 — `cpu`: the convolutions' im2col GEMMs on PR 44's outer-product path, with a block of their own
+
+*(`cmake/patches/ggml-0049-conv-f32-outer-product-gemm.patch`; depends on PR 44)*
+
+**Problem.** PR 44's path packs into `params->wdata`, so only graph `MUL_MAT` nodes may call it: the batched
+im2col in `ggml_compute_forward_conv_2d_impl` and the GEMM in `conv_transpose_1d` call mul_mat with their own
+data already in that buffer. Their GEMMs stayed on tinyBLAS.
+
+**Change.** In `ops.cpp`, on AArch64 with `GGML_USE_LLAMAFILE`: a convolution carves PR 44's block
+(`llamafile_sgemm_f32_wsize()` bytes) off the end of its work buffer before sizing its patches, and calls
+`llamafile_sgemm_f32_packed` with a copy of `params` whose `wdata`/`wsize` are that block. That happens at all
+three of `conv_2d_impl`'s GEMM calls (straight into dst, staged and deferred, through the permute) and at
+`conv_transpose_1d`'s, each keeping its tinyBLAS call as the fallback. `ggml_graph_plan` adds the block to
+`CONV_TRANSPOSE_1D`'s reservation; `CONV_2D`'s 16 MB already holds it. `GGML_CPU_NEON_F32_4X8_CONV=0` switches
+this off alone.
+
+**Numerics.** As PR 44's: one sequential fused sum per output, here in im2col order, bit-exact to a scalar `fmaf`
+loop and the same at every thread count (loom's `test_conv_neon_f32_4x8`).
+
+**Measured** on a Pi 4 at four threads, off/on, paired launches: VITS (piper) F32 **1.068x**, its Q8_0 1.054x
+(the kernels are dequantized to F32 first), Citrinet-256 1.062x / 1.060x, Moonshine tiny 1.034x, whisper-small
+1.000x. It does not touch the direct 1-D kernel (`ggml_conv_1d_direct_ok`, a loom patch), which keeps VITS's
+vocoder: through im2col and this GEMM those shapes were slower.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the

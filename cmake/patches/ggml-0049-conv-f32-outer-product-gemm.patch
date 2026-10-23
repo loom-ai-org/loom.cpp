@@ -1,0 +1,185 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index c33ed7d2..4cfaa21e 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -3065,6 +3065,10 @@ struct ggml_cplan ggml_graph_plan(
+                             // its own tile from the same budget, so the two have to agree. The MAX is
+                             // the tile == 1 case, where one position's worth of Cout*K is all it takes.
+                             cur += sizeof(float)*MAX((int64_t) GGML_CONV_TRANSPOSE_1D_TILE, ne00*ne01);
++#if GGML_USE_LLAMAFILE && defined(__aarch64__)
++                            // loom P4.39: the outer-product GEMM's packed block, after all of the above
++                            cur += llamafile_sgemm_f32_wsize();
++#endif
+ #if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
+                             cur = MAX(cur, ggml_armv6_conv_transpose_1d_wsize(node, n_tasks));
+ #endif
+diff --git a/src/ggml-cpu/llamafile/sgemm.h b/src/ggml-cpu/llamafile/sgemm.h
+index 425e6b18..575896e5 100644
+--- a/src/ggml-cpu/llamafile/sgemm.h
++++ b/src/ggml-cpu/llamafile/sgemm.h
+@@ -23,8 +23,9 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t, int64_t
+ 
+ 
+ #if defined(__aarch64__)
+-// loom P4.38: an outer-product F32 GEMM for cores without DOTPROD, for graph MUL_MAT nodes only (it packs
+-// into params->wdata). Returns false, having done nothing, where it does not apply.
++// loom P4.38: an outer-product F32 GEMM for cores without DOTPROD. It packs into params->wdata, so it is for
++// graph MUL_MAT nodes, and for the convolutions (P4.39), which hand it a buffer of its own carved off theirs
++// (ops.cpp, ggml_conv_f32_op_gemm). Returns false, having done nothing, where it does not apply.
+ size_t llamafile_sgemm_f32_wsize(void);
+ bool llamafile_sgemm_f32_packed(const struct ggml_compute_params * params, int64_t m, int64_t n, int64_t k,
+                                 const float * A, int64_t lda, const float * B, int64_t ldb, float * C, int64_t ldc);
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 738ba909..eb0f8eda 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -6794,6 +6794,10 @@ static void ggml_compute_forward_conv_transpose_1d_f16_f32(
+ static void ggml_call_mul_mat_ldc(ggml_type type, const ggml_compute_params * params,
+                                   int64_t m, int64_t n, int64_t k,
+                                   void * a, void * b, float * c, int64_t ldc);
++// loom P4.39, defined with it: the outer-product GEMM's block, carved off the end of a convolution's buffer.
++static size_t ggml_conv_f32_op_carve(ggml_type type, size_t wsize, size_t keep);
++static bool ggml_conv_f32_op_gemm(const ggml_compute_params * params, size_t carve, int64_t m, int64_t n,
++                                  int64_t k, const void * a, const void * b, float * c, int64_t ldc);
+ 
+ #if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
+ // ARMv6 (ggml-0038): the polyphase driver on the short-vector tiles, defined with them below.
+@@ -6903,11 +6907,18 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
+ 
+     const size_t need = (size_t) (nk + GGML_CONV_TRANSPOSE_1D_SKEW + ne10*ne11 + tile*mk) * sizeof(float);
+     if (need <= params->wsize) {
++        // loom P4.39: the outer-product GEMM's block, past everything above (ggml_graph_plan reserves it).
++        // It only takes a tile of >= 128 positions, i.e. Cout*K <= 512 at this tile; a larger tile, so that
++        // VITS's two wider upsamplers (Cout*K = 1024, 2048) would qualify too, measured 1-2% SLOWER over a
++        // whole synthesis at 2x, 4x and 8x it: the result block stops fitting where the overlap-add reads it.
++        const size_t op_carve = ggml_conv_f32_op_carve(GGML_TYPE_F32, params->wsize, need);
+         for (int64_t l0 = 0; l0 < ne10; l0 += tile) {
+             const int64_t nl = MIN(tile, ne10 - l0);
+ 
+-            ggml_call_mul_mat_ldc(GGML_TYPE_F32, params, mk, nl, ne02,
+-                                  wdata, wdata_src + l0*ne11, gemm, mk);
++            if (!ggml_conv_f32_op_gemm(params, op_carve, mk, nl, ne02, wdata, wdata_src + l0*ne11, gemm, mk)) {
++                ggml_call_mul_mat_ldc(GGML_TYPE_F32, params, mk, nl, ne02,
++                                      wdata, wdata_src + l0*ne11, gemm, mk);
++            }
+             ggml_barrier(params->threadpool);
+ 
+             // Overlap-add, split by OUTPUT CHANNEL. Consecutive input positions write overlapping runs
+@@ -7543,6 +7554,55 @@ static void ggml_call_mul_mat_ldc(ggml_type type, const ggml_compute_params * pa
+     ggml_compute_forward_mul_mat(params, &dst);
+ }
+ 
++#if defined(GGML_USE_LLAMAFILE) && defined(__aarch64__)
++// loom P4.39: the convolutions' GEMMs on P4.38's outer-product path (sgemm.cpp, llamafile_sgemm_f32_packed).
++// That path packs a block of A into its work buffer, and a convolution's work buffer already holds its
++// im2col patches -- which is why it is not reached through ggml_call_mul_mat*. So the block is carved off
++// the END of the convolution's buffer, before the patches are sized, and handed over as a buffer of its own.
++//
++// Pi 4, four threads, this switch off -> on, paired launches: VITS (piper miro) F32 1.068x (1.097 -> 1.025 s),
++// Q8_0_PC 1.054x; Citrinet-256-ls 1.062x / 1.060x; Moonshine tiny 1.034x. What takes it in VITS is the batched
++// im2col below -- the text encoder's and the flow's convolutions (192-768 channels, 100-286 positions,
++// weights over the direct path's budget) -- and the narrowest upsampler. The patch budget was re-swept with
++// the path on (256 KB ties the 512 KB default; 1 MB, 2 MB and no cap lose 5-45%), so it stays.
++//
++// NOT the vocoder's resblocks, which the direct kernel (ggml_conv_1d_direct_ok) keeps: forcing them through
++// im2col and this GEMM (GGML_CPU_CONV1D_BUDGET=0, the n >= 128 floor lowered to their 32-64 channels) made
++// the synthesis 1.178 s against 1.022 with the direct kernel. The gather is a second copy of the input per
++// tap, and with 32-64 output channels the per-call pack of the patches is barely amortised.
++//
++// GGML_CPU_NEON_F32_4X8_CONV=0 switches this off alone (GGML_CPU_NEON_F32_4X8=0 switches off both).
++static bool ggml_conv_f32_op_enabled(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char * e = getenv("GGML_CPU_NEON_F32_4X8_CONV");
++        on = (e && e[0] == '0') ? 0 : 1;
++    }
++    return on == 1;
++}
++
++// Bytes to hold back at the end of a work buffer of `wsize` for the block, or 0 where the path cannot run.
++static size_t ggml_conv_f32_op_carve(ggml_type type, size_t wsize, size_t keep) {
++    if (type != GGML_TYPE_F32 || !ggml_conv_f32_op_enabled()) return 0;
++    const size_t blk = llamafile_sgemm_f32_wsize();
++    return blk > 0 && wsize >= blk + keep ? blk : 0;
++}
++
++// C[j*ldc + i] = sum_l A[i*k + l] * B[j*k + l]; false, having done nothing, where the path declines.
++static bool ggml_conv_f32_op_gemm(const ggml_compute_params * params, size_t carve, int64_t m, int64_t n,
++                                  int64_t k, const void * a, const void * b, float * c, int64_t ldc) {
++    if (carve == 0) return false;
++    ggml_compute_params p = *params;
++    p.wdata = (char *) params->wdata + params->wsize - carve;
++    p.wsize = carve;
++    return llamafile_sgemm_f32_packed(&p, m, n, k, (const float *) a, k, (const float *) b, k, c, ldc);
++}
++#else
++static size_t ggml_conv_f32_op_carve(ggml_type, size_t, size_t) { return 0; }
++static bool ggml_conv_f32_op_gemm(const ggml_compute_params *, size_t, int64_t, int64_t, int64_t,
++                                  const void *, const void *, float *, int64_t) { return false; }
++#endif
++
+ static inline int64_t ggml_wrap_around(int64_t coord, int64_t size) {
+     return (coord  + size) % size; // adding size avoids negative number weirdness
+ }
+@@ -9311,10 +9371,13 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+         conv_heur_off = (e && e[0] && e[0] != '0') ? 1 : 0;
+     }
+     const int64_t patch_budget      = ggml_conv_2d_patch_budget();
++    // loom P4.39: the outer-product GEMM's own block, off the end of the buffer (see ggml_conv_f32_op_carve)
++    const size_t  op_carve          = ggml_conv_f32_op_carve(kernel_type, params->wsize, (size_t) space_per_patch);
++    const int64_t wsize_patches     = (int64_t) (params->wsize - op_carve);
+     const int64_t wbudget           = (!conv_heur_off && patch_budget > 0
+                                        && patch_total * space_per_patch > 3 * patch_budget)
+-                                        ? MIN((int64_t) params->wsize, patch_budget)
+-                                        : (int64_t) params->wsize;
++                                        ? MIN(wsize_patches, patch_budget)
++                                        : wsize_patches;
+     const int64_t batch_size        = wbudget / space_per_patch;
+     const int64_t patches_per_batch = batch_size > 8 ? (batch_size / 8) * 8 : batch_size;
+     const int64_t batch_n           = (patch_total + patches_per_batch - 1) / patches_per_batch;
+@@ -9490,7 +9553,9 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+             // shape); everything else, and anything it declines, runs the F32 one. Only THIS call
+             // site is served: the staged path below is the rarer one and is left alone.
+             if (!ggml_conv_2d_armv6_qgemm(params, qk_data, tmp, patches_per_batch, patch_n, c_out,
+-                                          knl_n, dst_data + patch_start_batch, dst_w * dst_h)) {
++                                          knl_n, dst_data + patch_start_batch, dst_w * dst_h) &&
++                !ggml_conv_f32_op_gemm(params, op_carve, patch_n, c_out, knl_n, tmp, knl_data,
++                                       dst_data + patch_start_batch, dst_w * dst_h)) {
+                 ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
+                                       dst_data + patch_start_batch, dst_w * dst_h);
+             }
+@@ -9523,7 +9588,7 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+ 
+         float * gemm_output = (float *) ((char *) tmp + patches_per_batch * knl_n * traits->type_size);
+ 
+-        GGML_ASSERT(gemm_output + patch_n * c_out <= (float*)tmp + params->wsize);
++        GGML_ASSERT(gemm_output + patch_n * c_out <= (float*)tmp + wsize_patches);
+ 
+         if (defer) {
+             // Staged CHANNEL-MAJOR -- [c_out, patch_n] with a row stride of patch_n -- so that landing
+@@ -9531,8 +9596,11 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+             // the other way round (one row per patch, which is what the permute path wants) the flush
+             // reads with a stride of c_out, and that gather costs more than the whole ADD this fusion
+             // exists to remove: measured 1.70 s against 1.60 s unfused.
+-            ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
+-                                  gemm_output, patch_n);
++            if (!ggml_conv_f32_op_gemm(params, op_carve, patch_n, c_out, knl_n, tmp, knl_data,
++                                       gemm_output, patch_n)) {
++                ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
++                                      gemm_output, patch_n);
++            }
+             ggml_barrier(params->threadpool);
+             pending_start = patch_start_batch;
+             pending_n     = patch_n;
+@@ -9540,7 +9608,10 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+         }
+ 
+         // GEMM: patches[patch_n, knl_n] × kernel[knl_n, c_out] = output[patch_n, c_out]
+-        ggml_call_mul_mat(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data, gemm_output);
++        // (ggml_call_mul_mat puts the kernel in src0: C is [patch_n, c_out])
++        if (!ggml_conv_f32_op_gemm(params, op_carve, c_out, patch_n, knl_n, knl_data, tmp, gemm_output, c_out)) {
++            ggml_call_mul_mat(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data, gemm_output);
++        }
+ 
+         ggml_barrier(params->threadpool);
+ 

@@ -91,8 +91,10 @@ End to end, paired launches, `GGML_CPU_NEON_F32_4X8` off against on, rc18 harnes
   is ~2x tinyBLAS's: 5.0e-7 against 2.5e-7 relative at k = 768, both far inside every F32 gate.
 * **Only measured on the A72.** The guard is the missing ISA feature, as for `CPU_NEON_I8`, so an A53, A55,
   A57 or A73 takes it too. No such board is available (user, 2026-10-22).
-* **The convolutions do not get it yet.** VITS's convolution GEMMs won 1.15-1.58x in the shape sweep. To
-  take this path they would reserve the block beside their own im2col patches and pass it in: a follow-up
-  in the hub.
+* **The convolutions got it in P4.39**, with the block carved off their own buffer
+  ([ADR-083](adr-083-the-convolutions-gemms-take-the-outer-product-path-with-a-carved-block.md)): VITS
+  1.068x, Citrinet 1.062x. The sweep's "VITS convolution GEMMs" above were the vocoder's resblocks, which in
+  the model run ggml's direct kernel, not tinyBLAS. They keep it
+  ([Retro-090](../retros/retro-090-the-baseline-arm-was-not-the-engine.md)).
 * An M1 or any DOTPROD core is untouched: there tinyBLAS beat XNNPACK's F32 kernels (92 vs 74 GF on one
   core), and this was not raced.

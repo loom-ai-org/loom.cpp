@@ -2,7 +2,7 @@
 type: retro
 date: 2026-10-22
 domain: performance
-tags: [benchmark, harness, baseline, tinyblas, llamafile, thread-pool, pi-4, p4.38]
+tags: [benchmark, harness, baseline, tinyblas, llamafile, thread-pool, pi-4, p4.38, p4.39, direct-conv, ld-library-path]
 ---
 
 # Retro-090: The Baseline Arm Was Not the Engine
@@ -46,6 +46,25 @@ is measuring something else, and its ratios mean nothing yet.
   region (the barrier), never between them. `bench66`'s pool sleeps on a condition variable when idle.
 * The earlier records are unaffected: P4.37's numbers come from `bench65`'s q8 and i8 arms, and tinyBLAS
   has no Q8_0 GEMM without DOTPROD, so LLAMAFILE changes neither.
+
+## It happened again, twice, in P4.39 (2026-10-23)
+
+P4.39 ([ADR-083](../adrs/adr-083-the-convolutions-gemms-take-the-outer-product-path-with-a-carved-block.md))
+was opened on P4.38's 27-shape sweep, which listed VITS's resblock convolutions (`224 x 32 x 73472` and the
+like) as GEMMs the new tile won by 1.15-1.58x. The sweep raced the tile against tinyBLAS, and in the model those
+shapes never reach tinyBLAS: `ggml_conv_1d_direct_ok` sends them to ggml's direct convolution kernel, which
+runs them at 20-23 GF/s in a profile of the real synthesis. Forcing them through im2col and the new tile made
+VITS slower (1.178 s against 1.022). The rule above would have caught it: the profile's time for the shape
+was not the sweep's ggml arm time. **The baseline arm has to be the path the model takes, not just the
+engine's build.**
+
+The second instance was a harness one. A copied build directory still pointed at its old source tree, so
+it was configured afresh. The wait for that build matched the `build=` line the previous build had left in
+the same log, and the benchmark started while the new build directory did not exist yet. `LD_LIBRARY_PATH`
+pointing at a missing directory is not an error. The binaries fell back to their RUNPATH, the rc18 release
+libraries, and all four arms ran them. The arms' output hashes were identical with the switch off and on,
+which is what gave it away. The scripts now refuse to run without their libraries, and wait for a marker the
+job itself creates.
 
 Related: [Retro-010](retro-010-an-unpinned-competitor-baseline.md) (a baseline that was one unrepeatable
 wall time), [Retro-023](retro-023-a-bench-whose-graph-was-the-treatment.md) (a bench whose graph was the
