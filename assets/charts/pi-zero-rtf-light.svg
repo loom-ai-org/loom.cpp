@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="394" viewBox="0 0 760 394">
+<rect width="760" height="394" rx="10" fill="#ffffff"/>
+<text x="20.0" y="30.0" fill="#1f2328" font-size="17" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">Raspberry Pi Zero W — one 1 GHz ARM11 core, 512 MB</text>
+<text x="20.0" y="52.0" fill="#59636e" font-size="12" text-anchor="start" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">real-time factor: seconds of compute per second of audio · lower is better · left of the line is faster than real time</text>
+<line x1="200.0" y1="74" x2="200.0" y2="358" stroke="#d1d9e0" stroke-width="1"/>
+<text x="200.0" y="376.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0</text>
+<line x1="304.0" y1="74" x2="304.0" y2="358" stroke="#d1d9e0" stroke-width="1"/>
+<text x="304.0" y="376.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.5</text>
+<line x1="408.0" y1="74" x2="408.0" y2="358" stroke="#d1d9e0" stroke-width="1"/>
+<text x="408.0" y="376.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">1</text>
+<line x1="512.0" y1="74" x2="512.0" y2="358" stroke="#d1d9e0" stroke-width="1"/>
+<text x="512.0" y="376.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">1.5</text>
+<line x1="616.0" y1="74" x2="616.0" y2="358" stroke="#d1d9e0" stroke-width="1"/>
+<text x="616.0" y="376.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">2</text>
+<line x1="720.0" y1="74" x2="720.0" y2="358" stroke="#d1d9e0" stroke-width="1"/>
+<text x="720.0" y="376.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">2.5</text>
+<line x1="408.0" y1="70" x2="408.0" y2="358" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="4 3"/>
+<text x="414.0" y="68.0" fill="#cf222e" font-size="11" text-anchor="start" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">real time</text>
+<rect x="200" y="82.0" width="39.5" height="20" rx="4" fill="#1a7f37"/>
+<text x="245.5" y="97.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.19</text>
+<text x="188.0" y="97.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">WakeHuBERT tiny <tspan fill="#59636e" font-size="11">· wake word</tspan></text>
+<rect x="200" y="116.0" width="41.6" height="20" rx="4" fill="#1a7f37"/>
+<text x="247.6" y="131.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.20</text>
+<text x="188.0" y="131.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">Silero VAD <tspan fill="#59636e" font-size="11">· VAD</tspan></text>
+<rect x="200" y="150.0" width="58.2" height="20" rx="4" fill="#1a7f37"/>
+<text x="264.2" y="165.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.28</text>
+<text x="188.0" y="165.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">sanoTTS heartnano <tspan fill="#59636e" font-size="11">· TTS</tspan></text>
+<rect x="200" y="184.0" width="133.1" height="20" rx="4" fill="#1a7f37"/>
+<text x="339.1" y="199.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.64</text>
+<text x="188.0" y="199.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">sanoTTS heart <tspan fill="#59636e" font-size="11">· TTS</tspan></text>
+<rect x="200" y="218.0" width="153.9" height="20" rx="4" fill="#1a7f37"/>
+<text x="359.9" y="233.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.74</text>
+<text x="188.0" y="233.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">Citrinet-256 <tspan fill="#59636e" font-size="11">· ASR</tspan></text>
+<rect x="200" y="252.0" width="164.3" height="20" rx="4" fill="#1a7f37"/>
+<text x="370.3" y="267.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.79</text>
+<text x="188.0" y="267.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">sanoTTS thorsten (de) <tspan fill="#59636e" font-size="11">· TTS</tspan></text>
+<rect x="200" y="286.0" width="459.7" height="20" rx="4" fill="#0969da"/>
+<text x="665.7" y="301.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">2.21</text>
+<text x="188.0" y="301.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">Moonshine tiny <tspan fill="#59636e" font-size="11">· ASR</tspan></text>
+<rect x="200" y="320.0" width="461.8" height="20" rx="4" fill="#0969da"/>
+<text x="667.8" y="335.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">2.22</text>
+<text x="188.0" y="335.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">Conformer-CTC small <tspan fill="#59636e" font-size="11">· ASR</tspan></text>
+</svg>

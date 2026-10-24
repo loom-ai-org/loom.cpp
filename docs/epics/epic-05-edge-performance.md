@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-10-23
+last_updated: 2026-10-24
 ---
 
 # Epic-05: Edge CPU Performance
@@ -366,7 +366,7 @@ machine — one second between arms on x86, cooled to 60 C before each arm on th
 `>1.00x` is loom faster, and a **bolded** TTS or LM cell is one whose paired p10 and p90 both sit on one
 side of 1.00x — five of the ten do, and the Pi's TTS is the only one that resolves as a loss. The full
 table with its methodology and caveats is in the
-[README](../../README.md#performance-against-onnxruntime); the ones that change how it should be read
+[benchmarks](../BENCHMARKS.md#three-tasks-on-three-machines); the ones that change how it should be read
 are that the baseline is the **PyPI** onnxruntime wheel (conda-forge's build of the *same version* is
 1.86x faster on VITS, and against it the x86 TTS wins become losses), and that the Pi row is taken
 cooled and interleaved because that board drifts 33% when it is not.

@@ -6,764 +6,283 @@
   &nbsp;loom.cpp
 </h1>
 
-An inference engine built on [`ggml`](https://github.com/ggml-org/ggml) that hardcodes no model. A
-model is a GGUF that carries its own **graph topologies** as JSON metadata and its own **driver
-script** as embedded Lua, alongside the weights those describe; the engine parses them and builds the
-compute graph at run time. Adding a model architecture is an export, not a C++ patch.
+<p align="center">
+  <b>Speech, audio and language models on everything from a GPU to a Raspberry Pi Zero.</b><br>
+  One self-describing GGUF per model · no per-model code · built on <a href="https://github.com/ggml-org/ggml">ggml</a>
+</p>
 
-That is the whole architectural bet, and it is why this repo stays small: it targets edge devices, so
-every per-model decision belongs in the exporter where it costs a Python change instead of a
-specialized C++ driver. See [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md).
+<p align="center">
+  <a href="https://pypi.org/project/loom-py-rt/"><img alt="PyPI" src="https://img.shields.io/pypi/v/loom-py-rt?include_prereleases&label=pip%20install%20loom-py-rt&color=0969da"></a>
+  <a href="https://huggingface.co/loom-ai-org"><img alt="Models on Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20models-64-ffcc4d"></a>
+  <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-1a7f37"></a>
+  <img alt="Platforms" src="https://img.shields.io/badge/runs%20on-x86--64%20%C2%B7%20ARM64%20%C2%B7%20ARMv6%20%C2%B7%20Apple%20Silicon-6e7781">
+</p>
 
-## What the engine offers a host, and what it leaves alone
+---
 
-The engine hardcodes no model, but it does own the loops every host would otherwise write. Those are
-**per-task, not per-model** — one CTC decoder covers every CTC model — and they live here because the
-copies hosts wrote had already drifted apart from each other:
+loom.cpp is a small inference engine for **speech recognition, text to speech, voice activity, speaker
+and language identification, audio codecs, music and small language models**. Every model is a single
+GGUF file that carries its weights, its compute graphs and the script that drives them, so the engine
+runs **64 models** across speech, audio and text without a line of model-specific C++. Export a new
+checkpoint and it runs everywhere loom does.
+
+## Highlights
+
+* 🚀 **Faster than onnxruntime on a Raspberry Pi 4.** loom's int8 beats onnxruntime's int8 on every
+  model measured, by **1.2x to 9.3x**. At F32 it is ahead on four of six models, level on whisper and
+  behind on Citrinet ([charts below](#performance)).
+* 🍓 **Real time on a Raspberry Pi Zero.** Wake-word features, voice activity, tiny TTS voices and
+  Citrinet ASR all run faster than real time on the Zero W's single 1 GHz ARM11 core with 512 MB of RAM.
+* 📦 **One file per model.** Weights, graph topologies, driver script, tokenizer and voices travel
+  together. Nothing to configure, and no Python needed at run time.
+* 🧩 **64 models, one engine.** Whisper, Parakeet, Canary, Moonshine, Kokoro, Piper VITS, Pocket TTS,
+  CosyVoice3, Qwen3-TTS, Voxtral TTS, MusicGen, Qwen3, Gemma 3 and more ([catalogue](#supported-models)).
+* ⚡ **CPU everywhere, GPU where you have one.** x86-64, ARM64, 32-bit ARMv6 and Apple Silicon on the
+  CPU; Vulkan, CUDA and Metal as optional backends.
+* 🔢 **Per-channel int8 (`Q8_0_PC`)** with hand-tuned kernels for the Pi 4's Cortex-A72 and the Pi
+  Zero's ARM11, beside ggml's own F32, F16 and Q4/Q8 formats.
+
+## Quickstart
+
+### Python
+
+```sh
+pip install "loom-py-rt[hub]"
+```
+
+```python
+import loom
+
+# Text to speech: Kyutai's Pocket TTS, 130 MB at int8, with 26 voices
+tts = loom.Model.from_pretrained("loom-ai-org/pocket-tts-loom", "pocket-tts-q8_0_pc.gguf")
+tts.text2speech.infer("Hello from a Raspberry Pi!").save("hello.wav")
+
+# Speech recognition: Whisper, with timestamps (16 kHz mono audio)
+import soundfile
+audio, _ = soundfile.read("speech.wav")
+asr = loom.Model.from_pretrained("loom-ai-org/whisper-small-loom")
+print(asr.speech2text.infer(audio, language="en").text)
+# ' And so my fellow Americans, ask not what your country can do for you, ...'
+
+# A small chat model
+lm = loom.Model.from_pretrained("loom-ai-org/gemma-3-270m-it-loom")
+print(lm.text2text.chat("What is the capital of France?", temperature=0.0))
+# 'The capital of France is Paris.'
+```
+
+Every model answers through the door named for what it does (`speech2text`, `text2speech`,
+`text2text`, `speech2class`, `speech2embeddings`, `text2class`, `text2codes`, `codes2speech`). The
+[loom-py README](https://github.com/loom-ai-org/loom-py) has an example for each.
+
+### Command line (C++)
+
+```sh
+git clone https://github.com/loom-ai-org/loom.cpp && cd loom.cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"$(nproc)"
+
+loom_cli=build/tools/loom_cli/loom_cli
+$loom_cli --model whisper-small.gguf --wav samples/jfk.wav                       # transcribe
+$loom_cli --model pocket-tts-q8_0_pc.gguf --prompt "Hello from loom." --out hi.wav # speak
+$loom_cli --model gemma-3-270m-it.gguf --chat --prompt "Tell me a joke."          # chat
+```
+
+CMake fetches every dependency (ggml, LuaJIT, nlohmann_json). Building for a GPU, for 32-bit ARM, and
+running the tests are covered in [`docs/BUILDING.md`](docs/BUILDING.md).
+
+## Performance
+
+Both engines were run on the same board, at the same precision, with the same thread count, inputs and
+output length. **A bar past the dashed line means loom is faster**:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/charts/pi4-vs-onnxruntime-dark.svg">
+  <img alt="Raspberry Pi 4: loom against onnxruntime. F32: VITS 1.34x, Pocket TTS 2.06x, Qwen3 1.06x, Moonshine 1.13x, whisper 1.00x, Citrinet 0.65x. Int8: VITS 5.03x, Pocket TTS 3.27x, Qwen3 3.45x, Moonshine 1.75x, whisper 1.17x, Citrinet 9.31x." src="assets/charts/pi4-vs-onnxruntime-light.svg" width="760">
+</picture>
+
+| Raspberry Pi 4, 4 threads | loom F32 | onnxruntime FP32 | loom int8 | onnxruntime int8 |
+|---|---|---|---|---|
+| VITS Piper en-GB · TTS, 3.3 s of speech | **0.80 s** | 1.07 s | **0.82 s** | 4.12 s |
+| Pocket TTS · TTS, 4.8 s of speech¹ | **9.11 s** | 18.77 s | **4.25 s** | 13.88 s |
+| Qwen3-0.6B · 24 tokens | **16.6 s** | 17.6 s | **4.15 s** | 14.28 s |
+| Moonshine tiny · ASR, 11 s clip | **1.34 s** | 1.50 s | **0.85 s** | 1.49 s |
+| whisper-small · ASR, 11 s clip | 20.7 s | 20.6 s | **12.5 s** | 14.7 s |
+| Citrinet-256 · ASR, 11 s clip | 0.45 s | **0.29 s**² | **0.46 s** | 4.30 s² |
+
+The tiny models run below real time even on a Pi Zero:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/charts/pi-zero-rtf-dark.svg">
+  <img alt="Raspberry Pi Zero W real-time factors: WakeHuBERT 0.19, Silero VAD 0.20, sanoTTS heartnano 0.28, sanoTTS heart 0.64, Citrinet-256 0.74, sanoTTS thorsten 0.79, Moonshine tiny 2.21, Conformer-CTC small 2.22." src="assets/charts/pi-zero-rtf-light.svg" width="760">
+</picture>
+
+Distilled Pocket TTS on a Pi 4 synthesises 4.8 s of speech in **0.59 s (2M)**, **1.07 s (7M)** and
+**1.44 s (18M)** at int8. Every number above, with its protocol, the onnxruntime build, the GGUF
+checksums and the x86 measurements, is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+<sub>onnxruntime 1.28.0 (PyPI wheel). Times are paired medians of five launches, with the board cooled to 60 °C
+before each one. Both engines did the same work: the same samples, transcripts and tokens.
+¹ Against the community ONNX export [`KevinAHM/pocket-tts-onnx`](https://huggingface.co/KevinAHM/pocket-tts-onnx),
+since there is no official one. ² onnxruntime is timed from precomputed mel features; loom's time includes
+its front end.</sub>
+
+## Supported models
+
+All on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org), ready for
+`loom.Model.from_pretrained(...)`. Sizes are the GGUF on disk, with the int8 file first where both are
+published. Each model keeps its upstream licence: † marks a non-commercial one, and each model card
+has the details.
+
+### 🎙️ Speech recognition
+
+| Model | Size | Languages | |
+|---|---|---|---|
+| [Whisper small](https://huggingface.co/loom-ai-org/whisper-small-loom) | 969 MB | 99 | transcribe and translate, timestamps |
+| [Canary 1B v2](https://huggingface.co/loom-ai-org/canary-1b-v2-loom) | 3.9 GB | 25 | transcribe and translate, long-form |
+| [Parakeet-TDT 0.6B v3](https://huggingface.co/loom-ai-org/parakeet-tdt-0.6b-loom) | 2.5 GB | 25 | |
+| [Parakeet-RNNT 0.6B](https://huggingface.co/loom-ai-org/parakeet-rnnt-0.6b-loom) | 2.5 GB | en | |
+| [Nemotron 3.5 ASR Streaming 0.6B](https://huggingface.co/loom-ai-org/nemotron-3.5-asr-streaming-0.6b-loom) | 2.6 GB | 35 | streaming, language prompt |
+| [Qwen3-ASR 0.6B](https://huggingface.co/loom-ai-org/qwen3-asr-0.6b-loom) | 3.1 GB | 30 | |
+| [Granite Speech 4.0 1B](https://huggingface.co/loom-ai-org/granite-speech-4.0-1b-loom) | 8.8 GB | 6 | transcribe and translate |
+| [Kyutai STT 1B](https://huggingface.co/loom-ai-org/kyutai-stt-1b-en-fr-loom) | 4.2 GB | en, fr | streaming |
+| [LFM2.5-Audio 1.5B](https://huggingface.co/loom-ai-org/lfm2.5-audio-1.5b-asr-loom) | 5.2 GB | en | |
+| [SenseVoice Small](https://huggingface.co/loom-ai-org/sensevoice-small-loom) | 939 MB | zh, en, ja, ko, yue | |
+| [Paraformer-large](https://huggingface.co/loom-ai-org/paraformer-zh-loom) | 866 MB | zh, en | non-autoregressive |
+| [GigaAM v3 RNNT](https://huggingface.co/loom-ai-org/gigaam-v3-rnnt-loom) | 893 MB | ru, en | |
+| [Moonshine tiny](https://huggingface.co/loom-ai-org/moonshine-tiny-loom) | 31 / 110 MB | en | fast on a Pi |
+| [Moonshine Streaming tiny](https://huggingface.co/loom-ai-org/moonshine-streaming-tiny-loom) · [small](https://huggingface.co/loom-ai-org/moonshine-streaming-small-loom) | 136 / 495 MB | en | streaming |
+| [Conformer-CTC small](https://huggingface.co/loom-ai-org/conformer-ctc-small-loom) | 60 MB | en | |
+| [Citrinet-256](https://huggingface.co/loom-ai-org/citrinet-256-ls-loom) · [Citrinet-1024](https://huggingface.co/loom-ai-org/citrinet-1024-loom) | 13 MB · 565 MB | en | real time on a Pi Zero (256) |
+| [HuBERT Large](https://huggingface.co/loom-ai-org/hubert-large-ls960-ft-loom) · [data2vec-audio Base](https://huggingface.co/loom-ai-org/data2vec-audio-base-960h-loom) | 1.3 GB · 373 MB | en | |
+
+### 🗣️ Text to speech
+
+| Model | Size | Languages | |
+|---|---|---|---|
+| [Pocket TTS](https://huggingface.co/loom-ai-org/pocket-tts-loom) | 130 / 405 MB | en | 26 voices, takes text |
+| Pocket TTS distilled [18M](https://huggingface.co/loom-ai-org/pocket-tts-18m-loom) · [7M](https://huggingface.co/loom-ai-org/pocket-tts-7m-loom) · [2M](https://huggingface.co/loom-ai-org/pocket-tts-2m-loom) | 31 · 11 · 4.2 MB | en | new in 1.0.0-rc19 |
+| [Kokoro 82M](https://huggingface.co/loom-ai-org/kokoro-82m-loom) | 325 MB | en | |
+| [Piper VITS en-GB miro](https://huggingface.co/loom-ai-org/vits-piper-en-gb-miro-loom) | 63 MB | en-GB | |
+| [sanoTTS](https://huggingface.co/loom-ai-org/sanotts-loom) | 1–9 MB | 14 | 28 tiny voices (GPL-3.0) |
+| [Vocetta2 1M](https://huggingface.co/loom-ai-org/vocetta2-1m-loom) · [500K](https://huggingface.co/loom-ai-org/vocetta2-500k-loom) · [276K](https://huggingface.co/loom-ai-org/vocetta2-276k-loom) | 2.9 · 1.2 · 0.6 MB | en | a whole TTS in under 3 MB |
+| [Supertonic 2](https://huggingface.co/loom-ai-org/supertonic-2-loom) | 268 MB | 5 | takes text |
+| [Soprano 1.1 80M](https://huggingface.co/loom-ai-org/soprano-1.1-80m-loom) | 441 MB | en | 32 kHz |
+| [SpeechT5](https://huggingface.co/loom-ai-org/speecht5-tts-loom) | 636 MB | en | voice files |
+| [Matcha-TTS](https://huggingface.co/loom-ai-org/matcha-tts-ljspeech-loom) · [StyleTTS2](https://huggingface.co/loom-ai-org/styletts2-ljspeech-loom) | 129 · 411 MB | en | LJSpeech |
+| [Chatterbox](https://huggingface.co/loom-ai-org/chatterbox-loom) | 2.7 GB | en | |
+| [Fun-CosyVoice3 0.5B](https://huggingface.co/loom-ai-org/fun-cosyvoice3-0.5b-loom) | 3.4 GB | 9 | voice cloning |
+| [Qwen3-TTS 0.6B](https://huggingface.co/loom-ai-org/qwen3-tts-12hz-0.6b-loom) + [its codec](https://huggingface.co/loom-ai-org/qwen3-tts-tokenizer-12hz-loom) | 4.1 GB + 456 MB | 10 | voice cloning |
+| [F5-TTS v1](https://huggingface.co/loom-ai-org/f5-tts-v1-base-loom) † | 1.4 GB | en, zh | voice cloning |
+| [VoxCPM2](https://huggingface.co/loom-ai-org/voxcpm2-loom) | 9.3 GB | 30 | 48 kHz |
+| [Voxtral 4B TTS](https://huggingface.co/loom-ai-org/voxtral-4b-tts-2603-loom) † | 16 GB | 9 | voice files |
+| [LFM2.5-Audio 1.5B](https://huggingface.co/loom-ai-org/lfm2.5-audio-1.5b-tts-loom) | 5.5 GB | en | 4 voices |
+| [Dia 1.6B](https://huggingface.co/loom-ai-org/dia-1.6b-loom) + [DAC 44 kHz](https://huggingface.co/loom-ai-org/dac-44khz-loom) | 6.4 GB + 217 MB | en | dialogue |
+| [MOSS-TTS v1.5](https://huggingface.co/loom-ai-org/moss-tts-local-transformer-v1.5-loom) + [its codec](https://huggingface.co/loom-ai-org/moss-audio-tokenizer-v2-loom) | 17 GB + 4.3 GB | 31 | 48 kHz stereo, voice cloning |
+
+### 🎧 Audio understanding
+
+| Model | Size | |
+|---|---|---|
+| [Silero VAD v6](https://huggingface.co/loom-ai-org/silero-vad-loom) | 4.3 MB | voice activity, every 32 ms |
+| [MarbleNet VAD v2](https://huggingface.co/loom-ai-org/marblenet-vad-v2-loom) | 0.5 MB | voice activity, every 20 ms, 6 languages |
+| [pyannote segmentation 3.0](https://huggingface.co/loom-ai-org/pyannote-segmentation-3.0-loom) | 6 MB | who speaks when, up to 3 speakers |
+| [ECAPA VoxLingua107](https://huggingface.co/loom-ai-org/ecapa-voxlingua107-loom) | 85 MB | spoken language id, 107 languages |
+| [TitaNet-Large](https://huggingface.co/loom-ai-org/titanet-large-loom) | 89 MB | speaker embeddings |
+| [WakeHuBERT tiny](https://huggingface.co/loom-ai-org/wakehubert-tiny-loom) | 1.2 MB | streaming features for wake words |
+
+### 💬 Language models and text
+
+| Model | Size | |
+|---|---|---|
+| [Qwen3 0.6B Base](https://huggingface.co/loom-ai-org/qwen3-0.6b-base-loom) | 2.4 GB | completion |
+| [Gemma 3 270M IT](https://huggingface.co/loom-ai-org/gemma-3-270m-it-loom) | 1.1 GB | chat |
+| [SmolLM2 360M Instruct](https://huggingface.co/loom-ai-org/smollm2-360m-instruct-loom) | 1.4 GB | chat |
+| [LFM2 350M](https://huggingface.co/loom-ai-org/lfm2-350m-monolithic-loom) ([modular export](https://huggingface.co/loom-ai-org/lfm2-350m-modular-loom)) | 1.4 GB | completion |
+| [FLAN-T5 small](https://huggingface.co/loom-ai-org/flan-t5-small-loom) | 309 MB | instructions, encoder-decoder |
+| [DistilBERT NER](https://huggingface.co/loom-ai-org/distilbert-ner-loom) | 261 MB | named entities |
+| [Punctuate-All](https://huggingface.co/loom-ai-org/punctuate-all-loom) | 1.1 GB | punctuation, 12 languages |
+
+### 🎵 Music and audio codecs
+
+| Model | Size | |
+|---|---|---|
+| [MusicGen small](https://huggingface.co/loom-ai-org/musicgen-small-loom) † + [EnCodec 32 kHz](https://huggingface.co/loom-ai-org/encodec-32khz-loom) † | 2.1 GB + 118 MB | text to music |
+| [SNAC 24 kHz](https://huggingface.co/loom-ai-org/snac-24khz-loom) | 53 MB | codec decoder |
+
+Something missing? [loom-exporter](https://github.com/loom-ai-org/loom-exporter) turns a PyTorch
+checkpoint into a loom GGUF, and a new family is an export, not engine code.
+
+## Where it runs
+
+| Platform | CPU | GPU | Install |
+|---|---|---|---|
+| Linux x86-64 | ✅ every x86-64 CPU (the best kernel is picked at load) | Vulkan, CUDA | `pip install loom-py-rt` |
+| Linux ARM64: Raspberry Pi 3/4/5, Jetson, Graviton | ✅ NEON, tuned for the Pi 4's Cortex-A72 | Vulkan | `pip install loom-py-rt` |
+| Linux ARMv6: Raspberry Pi Zero, Zero W, Pi 1 | ✅ tuned for the ARM1176's VFP | — | [wheel on the release page](https://github.com/loom-ai-org/loom-py/releases/latest) |
+| macOS on Apple Silicon | ✅ with Accelerate | Metal | `pip install loom-py-rt` |
+| macOS on Intel | ✅ built and imported in CI, best effort | — | `pip install loom-py-rt` |
+
+GPU backends are separate, small packages (`pip install "loom-py-rt[vulkan]"`, `[cuda]`, `[metal]`) and
+the engine falls back to the CPU for anything a backend cannot run. Windows is not supported yet.
+
+## How it works
+
+```mermaid
+flowchart LR
+    ckpt["PyTorch checkpoint"] -->|loom-exporter| gguf
+    subgraph gguf["one .gguf file"]
+        direction TB
+        w["weights"]
+        g["graph topologies (JSON)"]
+        d["driver script (Lua)"]
+        t["tokenizer · voices · chat template"]
+    end
+    gguf --> engine["loom.cpp<br/>builds the ggml graphs at run time"]
+    engine --> cpu["CPU: x86-64 · ARM64 · ARMv6"]
+    engine --> gpu["GPU: Vulkan · CUDA · Metal"]
+```
+
+The engine knows nothing about any model. It reads the graphs a file declares, builds them with ggml,
+and runs the file's own driver script, which decides how they are called: an encoder once, a decoder
+in a loop, a vocoder at the end. Everything specific to a model is decided when it is exported, which
+keeps the engine small enough for the boards it targets.
+
+What is not per model, but per task, is in the engine, so every host gets the same behaviour:
 
 | | |
 |---|---|
-| `loom::text::generate` | the causal-LM decode loop, both driver shapes, the file's own stop tokens and its own decode rule |
-| `loom::ChatTemplate` | a conversation to the prompt text a checkpoint was tuned on, from role tags the exporter reduced its own Jinja to |
-| `loom::audio::transcribe` | long-form ASR: windowing, segment splitting, and the seek to where the model closed its last segment |
-| `loom::Session` | topologies registered and caches attached, in an order that cannot dangle |
+| `loom::text::generate` | the decode loop, with each checkpoint's own stop tokens and sampling defaults |
+| `loom::ChatTemplate` | a conversation formatted the way the checkpoint was tuned |
+| `loom::audio::transcribe` | long-form ASR: windowing, segments, and seeking to where the model closed the last one |
+| `loom::Session` | the model's graphs registered and its caches attached |
 
-Underneath them the low-level surface is unchanged and stays raw: `LoomLuaBridge::call` invokes the
-driver with the driver's own arguments. The split is the same rule the whole tree is built on —
-**in the file when it is a property of the checkpoint, in the engine when it is a property of the
-task, in the host when it needs the host's ecosystem** — and
-[`docs/HIGH-LEVEL-API.md`](docs/HIGH-LEVEL-API.md) is where it is argued.
-
-A model says what it is, so a host never has to recognise one:
+A model also says what it is, so a host never has to recognise one:
 
 ```cpp
 const loom::ModelContract contract = loom::ModelContract::read(model);
 contract.task;             // "automatic-speech-recognition"
-contract.interface_name(); // "speech2text" -- the modality pair a host offers a door for
+contract.interface_name(); // "speech2text"
 ```
+
+## Documentation
+
+| | |
+|---|---|
+| [`docs/BUILDING.md`](docs/BUILDING.md) | building from source, the ggml patches, 32-bit ARM, GPU backends, running the tests |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | every benchmark table, with its protocol, provenance and caveats |
+| [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) | the self-describing GGUF and why the engine hardcodes nothing |
+| [`docs/HIGH-LEVEL-API.md`](docs/HIGH-LEVEL-API.md) | the task doors, and what a file declares so a host can dispatch it |
+| [`docs/backlog/active-index.md`](docs/backlog/active-index.md) | open work and what is next, for all three repos |
+| [`docs/`](docs/) | the project knowledge base: [epics](docs/epics/) (how each area works), [ADRs](docs/adrs/) (why each choice was made), [retros](docs/retros/) (what broke and what it taught) |
 
 ## The three repos
 
 | | |
 |---|---|
-| [**loom.cpp**](https://github.com/loom-ai-org/loom.cpp) | this one — the runtime, its primitives and its Lua bridge |
+| [**loom.cpp**](https://github.com/loom-ai-org/loom.cpp) | this one: the engine, its primitives and its Lua bridge |
+| [**loom-py**](https://github.com/loom-ai-org/loom-py) | Python bindings, published on PyPI as `loom-py-rt` |
 | [**loom-exporter**](https://github.com/loom-ai-org/loom-exporter) | turns a PyTorch checkpoint into a GGUF this engine runs |
-| [**loom-py**](https://github.com/loom-ai-org/loom-py) | Python bindings, with the engine as a submodule |
-
-## Supported models
-
-Seventeen, published at [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org). Each is a
-single GGUF carrying its own topologies, driver and — where the architecture has one — its vocabulary,
-so the engine runs all of them without a line of per-model C++.
-
-### Language models
-
-| Model | Exported from |
-|---|---|
-| [`loom-ai-org/qwen3-0.6b-base-loom`](https://huggingface.co/loom-ai-org/qwen3-0.6b-base-loom) | [`Qwen/Qwen3-0.6B-Base`](https://huggingface.co/Qwen/Qwen3-0.6B-Base) |
-| [`loom-ai-org/lfm2-350m-monolithic-loom`](https://huggingface.co/loom-ai-org/lfm2-350m-monolithic-loom) | [`LiquidAI/LFM2-350M`](https://huggingface.co/LiquidAI/LFM2-350M) |
-| [`loom-ai-org/lfm2-350m-modular-loom`](https://huggingface.co/loom-ai-org/lfm2-350m-modular-loom) | [`LiquidAI/LFM2-350M`](https://huggingface.co/LiquidAI/LFM2-350M) |
-| [`loom-ai-org/smollm2-360m-instruct-loom`](https://huggingface.co/loom-ai-org/smollm2-360m-instruct-loom) | [`HuggingFaceTB/SmolLM2-360M-Instruct`](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) |
-| [`loom-ai-org/gemma-3-270m-it-loom`](https://huggingface.co/loom-ai-org/gemma-3-270m-it-loom) | [`google/gemma-3-270m-it`](https://huggingface.co/google/gemma-3-270m-it) |
-
-The two LFM2 entries are the *same checkpoint exported two ways* — one fused graph against one topology
-per layer — which is how the engine's two decomposition paths stay honest about producing the same
-model.
-
-### Speech recognition
-
-| Model | Exported from |
-|---|---|
-| [`loom-ai-org/whisper-small-loom`](https://huggingface.co/loom-ai-org/whisper-small-loom) | [`openai/whisper-small`](https://huggingface.co/openai/whisper-small) |
-| [`loom-ai-org/conformer-ctc-small-loom`](https://huggingface.co/loom-ai-org/conformer-ctc-small-loom) | [`nvidia/stt_en_conformer_ctc_small`](https://huggingface.co/nvidia/stt_en_conformer_ctc_small) |
-| [`loom-ai-org/parakeet-tdt-0.6b-loom`](https://huggingface.co/loom-ai-org/parakeet-tdt-0.6b-loom) | [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) |
-| [`loom-ai-org/parakeet-rnnt-0.6b-loom`](https://huggingface.co/loom-ai-org/parakeet-rnnt-0.6b-loom) | [`nvidia/parakeet-rnnt-0.6b`](https://huggingface.co/nvidia/parakeet-rnnt-0.6b) |
-| [`loom-ai-org/gigaam-v3-rnnt-loom`](https://huggingface.co/loom-ai-org/gigaam-v3-rnnt-loom) | [`ai-sage/GigaAM-v3`](https://huggingface.co/ai-sage/GigaAM-v3) |
-| [`loom-ai-org/qwen3-asr-0.6b-loom`](https://huggingface.co/loom-ai-org/qwen3-asr-0.6b-loom) | [`Qwen/Qwen3-ASR-0.6B`](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) |
-| [`loom-ai-org/granite-speech-4.0-1b-loom`](https://huggingface.co/loom-ai-org/granite-speech-4.0-1b-loom) | [`ibm-granite/granite-4.0-1b-speech`](https://huggingface.co/ibm-granite/granite-4.0-1b-speech) |
-
-Each takes a raw waveform: the mel frontend is inside the graph, not in front of it.
-
-### Speech synthesis
-
-| Model | Exported from |
-|---|---|
-| [`loom-ai-org/kokoro-82m-loom`](https://huggingface.co/loom-ai-org/kokoro-82m-loom) | [`hexgrad/Kokoro-82M`](https://huggingface.co/hexgrad/Kokoro-82M) |
-| [`loom-ai-org/matcha-tts-ljspeech-loom`](https://huggingface.co/loom-ai-org/matcha-tts-ljspeech-loom) | [Matcha-TTS (LJSpeech checkpoint)](https://github.com/shivammehta25/Matcha-TTS) |
-| [`loom-ai-org/supertonic-2-loom`](https://huggingface.co/loom-ai-org/supertonic-2-loom) | [`Supertone/supertonic-2`](https://huggingface.co/Supertone/supertonic-2) |
-| [`loom-ai-org/vits-piper-en-gb-miro-loom`](https://huggingface.co/loom-ai-org/vits-piper-en-gb-miro-loom) | [`OpenVoiceOS/pipertts_en-GB_miro`](https://huggingface.co/OpenVoiceOS/pipertts_en-GB_miro) |
-| [`loom-ai-org/styletts2-ljspeech-loom`](https://huggingface.co/loom-ai-org/styletts2-ljspeech-loom) | [`yl4579/StyleTTS2-LJSpeech`](https://huggingface.co/yl4579/StyleTTS2-LJSpeech) |
-
-**Only Supertonic takes text.** It encodes graphemes itself and its GGUF carries the codepoint table;
-the other four consume *phoneme* ids that a phonemiser produces outside the engine, so their files
-embed no vocabulary at all. That is a real limitation of those checkpoints, not a missing feature here.
-
-## Performance against onnxruntime
-
-The reference question for an edge runtime: **the same checkpoint, on the same machine, at the same
-thread count — how does loom compare to onnxruntime?** Three tasks, because no single one is
-representative: an all-convolutional vocoder, an encoder-decoder ASR model, and an autoregressive LM.
-
-**`>1.00x` means loom is faster.** **Every TTS and LM cell was re-sampled per launch on 2026-09-02**
-and those are the numbers below, on all three machines; the ASR column is from 2026-08-29 and is not
-re-sampled here. **Both engines run back to back on the machine in the row** — one second apart on x86,
-and on the Pi cooled to a fixed 60 C before each arm, which is that board's standing protocol. See
-[what these numbers are not](#what-these-numbers-are-not).
-
-The **default** row for each machine is the one at that machine's physical core count, which is what
-the engine now uses when `$LOOM_N_THREADS` is unset.
-
-| machine | arch | threads | onnxruntime 1.28.0 build | TTS<br>VITS (piper en-GB) | LM<br>Qwen3-0.6B | ASR<br>whisper-small |
-|---|---|---|---|---|---|---|
-| Intel Core Ultra 9 285K | x86-64 | 4 | conda-forge | **1.05x** | 1.02x | 0.64x |
-| Intel Core Ultra 9 285K | x86-64 | **24 (default)** | conda-forge | 1.20x | 0.99x | **1.37x** |
-| AMD Ryzen 3 3250U | x86-64 | **2 (default)** | PyPI wheel | 0.98x | **1.01x** | 0.80x |
-| AMD Ryzen 3 3250U | x86-64 | 4 (all) | PyPI wheel | 1.00x | **1.02x** | 0.81x |
-| Raspberry Pi 4B | aarch64 | **4 (default)** | PyPI wheel | 0.96x | **1.03x** | 0.57x |
-
-**Half of the ten TTS and LM cells resolve, and those are the bolded ones.** In those two columns a
-cell is bolded when the paired p10 and p90 over its launches both sit on one side of 1.00x; the rest
-straddle it, which means the measurement did not separate the two engines — not that they tied at
-exactly the printed number. **Read an unbolded TTS or LM cell as parity.** The five that resolve are
-the 285K's four-thread TTS (p10 1.03, p90 1.17), both Ryzen LM cells (p10 1.00, p90 1.02-1.03), and
-both Pi cells — its LM at p10 1.03 / p90 1.04 and its TTS at p10 0.95 / p90 0.98, the one cell in the
-table that resolves as a **loss**. In the ASR column bold keeps its older meaning of simply `>1.00x`.
-
-**The Pi is the best-behaved machine in this table, not the worst.** Cooled to 60 C before every arm it
-holds a 1.02-1.05x spread per engine across launches, where the 285K's hybrid placement gives 1.45x —
-so the board that needs the most protocol produces the tightest numbers once it has it, and both its
-cells resolve. Its LM arms run `nrun=2` on both sides rather than the x86 rows' 3, because a generation
-there is 47 s; the estimator is matched within the row, which is what the ratio depends on.
-
-**Every TTS and LM cell is now a MEAN over separate process LAUNCHES** — per engine, 31 launches for
-TTS on x86 and 15 on the Pi; 21 for the LM on the 285K, 15 on the Ryzen and 7 on the Pi, where a single
-generation is 47 s. A mean rather than a median because at 24 threads both engines' VITS time splits
-into two per-launch modes about 1.4x apart at roughly even odds, and a median over that is a coin flip
-between them that moves the cell by the whole 1.4x. **This retires the Pi's old "report the fastest
-run" special case**: cooling to a fixed temperature before every arm is what makes its launches
-comparable to each other, so it can use the same estimator as the rest of the table. The ASR column is
-still a median over launches (9 on the 285K, 7 on the Ryzen, 5 cooled pairs on the Pi), taken
-2026-08-29.
-
-**The re-sample confirmed the table rather than overturning it.** No TTS or LM cell on any of the three
-machines moved by more than 0.04, the largest being the Ryzen's two-thread LM at 1.05x → 1.01x. Three
-faults were fixed on the way there and none of them was worth much: `bench_onnx_tasks.py`'s `vits` task
-had no warm-up while loom's did, `bench_vits_loom.cpp` took `ts[ts.size()/2]` rather than a median, and
-the LM's equal-work check was asserted rather than printed. What *did* move cells is the second of two
-back-to-back launches paying for the first — see
-[Retro-025](docs/retros/retro-025-the-arm-that-ran-second-paid-for-the-first.md).
-
-**All three machines were checked to be running byte-identical inputs on both sides**, and they are the
-published artifacts rather than a working export: the VITS GGUF is `md5 949dd988…` and the
-Qwen3-0.6B-Base GGUF is `md5 4882ce99…` (the files in `hf-models/`), with the onnx models matching
-across all three boxes as well (`md5 395ed93d…` and `md5 44961f8a…`). The whisper GGUF was checked the
-same way when the ASR column was taken (`md5 1deaac83…`). The Pi additionally reproduces the *same
-audio digest* from the 62.8 MB post-P4.28 export and the 81.7 MB one before it — `fnv1a=aa320f8a…` from
-both — which is what says the export that halved the file did not change the waveform.
-
-**The Pi row was regressed by one of this repository's own ggml patches, and that is now fixed.**
-`ggml-0011` — worth 2.15x at whisper's `A@V` shape on AVX2 — cost a Cortex-A72 **1.3-1.75x on every
-f32 GEMM shape measured**, because it inlined a scalar tail loop into the register tile. NEON's
-`KN = 4` divides every contraction these models have, so that tail never even ran; its presence alone
-changed what GCC's allocator did with the tile. Dispatching it out of line, before the tile, restores
-aarch64 without moving x86 at all:
-
-| Raspberry Pi 4B, 4 threads | published 2026-08-24 | with the regression | **fixed** |
-|---|---|---|---|
-| TTS | 0.98x | 0.84x | **0.96x** |
-| LM | 1.08x | 1.05x | **1.06x** |
-| ASR | 0.58x | 0.45x | **0.57x** |
-
-It was measured on x86 and shipped to every architecture, and **the Pi was not re-measured after it
-landed** — which is the whole of why it survived four days.
-
-**And it happened again with the next patch — now fixed, and the axis was not the ISA.** `ggml-0012` —
-worth **2.75x** at whisper's `QK^T` on x86 — was checked on this board at that same shape and found
-neutral, which it is. It was never checked at any other shape, and it cost the Pi **2.4%** on VITS,
-most of it in the *convolution*, because this repository lowers convolution through the same `sgemm`.
-**That is why the Pi's TTS cell moved 0.96x -> 0.93x between 2026-08-29 and 2026-08-30 with no change
-to the harness.**
-
-What the patch removes is a per-*output* cost and what it adds is per-*work*, so its benefit decays as
-`1/k` while its cost does not: over a `k` sweep it is 2.04x at `k = 64` and 0.97x at `k = 2304` on the
-285K, 1.01x and 0.90x on the Pi — monotone on both, crossing 1.0 at about the same place. **So the
-predicate is `k`, not the ISA**, and `!defined(__aarch64__)` would have been wrong in both directions.
-Gating the ragged prefix on `k <= 256` keeps every x86 win (whisper's `QK^T` improves further, 1.81x to
-**1.94x**) and returns the Pi to parity with the unpatched tree. P4.26 in
-[Epic-05](docs/epics/epic-05-edge-performance.md) has the sweeps;
-[Retro-022](docs/retros/retro-022-a-benefit-and-a-cost-on-the-same-axis.md) is the lesson, which
-generalises [Retro-019](docs/retros/retro-019-a-patch-measured-on-one-isa.md)'s "measure every ISA a
-patch is enabled for" to **every regime it is enabled for**.
-
-**The Pi's LM and ASR cells did not carry it**, which was the open question when this was found: the
-LM's decode step has `ne1 = 1` and never reaches the blocked GEMM, and whisper's own `QK^T` is `k = 64`
-— the regime the branch is *for* — and measures neutral on that board at the op level and unresolved
-end to end (ASR median 1.007 over four paired rounds, p10 0.989, p90 1.016; LM median 0.995, p10 0.983,
-p90 1.003 over six).
-
-**The Pi's TTS cell is re-measured, and it reads 0.95x** — it was 0.93x with the regression and 0.96x
-before it. Four rounds, both engines back to back on the board, **cooled to a fixed 60 C before every
-arm** and the arm order alternated round to round, onnxruntime normalised to loom's 73 216 samples:
-
-| round | loom | onnxruntime | ratio |
-|---|---:|---:|---:|
-| 1 (loom first) | 1.1154 s | 1.1172 s | 1.002 |
-| 2 (onnx first) | 1.1118 s | 1.0567 s | 0.950 |
-| 3 (loom first) | 1.1193 s | 1.0609 s | 0.948 |
-| 4 (onnx first) | 1.1147 s | 1.0552 s | 0.947 |
-
-**Round 1's onnxruntime arm is the session's first and pays the 63 MB model's cold page cache**; it is
-kept in the table and in the median (0.949) rather than dropped, because dropping the round that
-disagrees is how a number stops being reproducible. The other three span 0.5% and loom's four span
-0.7%, which is what the cooling protocol is for.
-
-**Re-sampled at 15 cooled rounds on 2026-09-02 the cell reads 0.96x**, which is the number in the
-table: loom mean 1.1151 s over 15 launches (spread 1.05x), onnxruntime 1.0732 s (1.03x), paired p10
-0.947 and p90 0.977, so it is one of the two cells in this table that resolve as a **loss** rather than
-as parity. Four rounds had already put it within 0.01 of that, which is the useful part — on this board
-the protocol, not the sample size, is what the number depends on.
-
-**TTS and the LM are at parity on x86; ASR is still behind, and on the Pi loom wins the LM and loses
-TTS.** Most x86 cells sit within a few percent of 1.00x, which on those machines is the noise floor
-rather than a result — read them as parity, not as wins. The Pi is the exception in both directions:
-its two cells are the tightest in the table and both resolve. The caveats below matter as much as the
-numbers.
-
-* **TTS is at parity everywhere**, 0.96x to 1.20x. That is what P4.14/P4.15 was for: a built-in F32
-  GEMM micro-kernel, four convolution patches to the pinned `ggml`, and a duplicated text encoder
-  removed from the export. Two cells resolve: the 285K's four-thread one at **1.05x**, and the Pi's at
-  **0.96x**, which is the clearest *loss* in the table and the only place TTS is meaningfully behind.
-  The 285K's 24-thread cell is the largest number in the column and also the one the launch lottery
-  makes least certain (p10 0.94, p90 1.73 over 31 paired launches), so 1.20x is where the mean fell and
-  not a win to quote. The Pi's cell read 0.84x for four days while `ggml-0011` was regressing it
-  (above).
-* **The LM is at parity**, a few percent either way, and it was the one task `ggml-0011`'s aarch64
-  regression left alone — a decode step's `mul_mat` has `ne1 = 1` and never reaches the blocked GEMM,
-  which is the control that made that diagnosis trustworthy. It only just became so — until 2026-08-23 the
-  engine called every causal-LM driver's `infer` rather than its `infer_with_past`, so the host re-fed
-  a growing prompt and each token recomputed the whole sequence. That was worth 2.83x. **Its one loss
-  is the 24-thread cell, and that is the LM at a thread count that does not suit it**: a decode step's
-  `mul_mat` has `ne1 = 1`, so this task peaks at 8 threads and plateaus after. It shows up as *spread* —
-  loom ranges 22.0-28.6 tok/s over 21 launches there where onnxruntime holds 27.3-28.0. **Re-sampled
-  per launch that cell is 0.99x rather than 0.96x**, which is parity and not a loss; what moved it was
-  letting the machine settle between arms, worth 0.94x → 0.99x on its own. **Three LM cells resolve in
-  loom's favour** — both Ryzen ones and the Pi's 1.03x — and they are the tightest measurements in this
-  table (1.02-1.03x spread per engine). The LM is the one task where loom is ahead on the two machines
-  a person would actually deploy on.
-* **ASR is the one still behind — 1.24x on the Ryzen and 1.57x on the 285K at four threads, 2.2x on the
-  Pi, against a 1.37x win at 24.** (The Pi is the outlier for a reason that is not the encoder: see
-  `ggml-0011` above.) Whisper's
-  exported driver used to hand the decoder the raw encoder output every step, so cross-attention K/V
-  was re-projected over all 1500 encoder frames per token — `MUL_MAT 768x1500` ran 684 times for an
-  11-second clip where the encoder itself needs 84, **57.7% of ASR runtime**, where onnxruntime
-  computes those tensors once. Exporting the projected K/V as its own topology is worth **2.4-2.6x on
-  every machine here** (on the Pi, 90.0 s to 37.4 s for the same clip).
-* **Most of the remaining ASR gap is the ENCODER, and it is two kernels rather than a systemic
-  deficit.** Split per shape at one thread with both engines' own profilers, interleaved round by round
-  (2026-08-28, Ryzen; `scripts/whisper_encoder_split.py` re-derives it), loom's encoder is **1.20x**:
-
-  | encoder piece | loom | onnxruntime | ratio | share of the gap |
-  |---|---|---|---|---|
-  | **`QK^T`** (12 calls) | 1957 ms | 1027 ms | **1.96x** | **51%** |
-  | `Softmax` (12) | 780 | 491 | 1.60x | 16% |
-  | `fc2` (12) | 2302 | 2016 | 1.14x | 16% |
-  | `fc1` (12) | 2240 | 2034 | 1.09x | 11% |
-  | Q/K/V/O (48) | 2138 | 1970 | 1.11x | 9% |
-  | `A@V` (12) | 1101 | 1046 | **1.07x** | 3% |
-  | GELU, LayerNorm + bias | 290 | 476 | **0.61x** | *loom ahead, −11%* |
-
-  **The dense GEMMs are 1.09-1.14x each and 36% of the gap** — both true: per shape there is nothing in
-  them to win, but they are 6.7 s of an 11.1 s encoder. `QK^T` alone is 6.0% of a whole transcription.
-  *An earlier version of this table read the decoder as 1.50x FASTER and "nothing left there".* That was
-  wrong: the 471 ms layout bucket under it was assigned to the encoder by eye, and 93% of it is the
-  decode loop — which is why `$LOOM_PROFILE_NODES=1` now exists to attribute a bucket to a graph instead
-  of to a guess. Three items on that list are now closed:
-  * **GELU is done.** ggml's exact-erf GELU was a scalar `erff()` libm call per element with no SIMD
-    path on any architecture; `cmake/patches/ggml-0010` replaces it with a rational approximation,
-    **9.9x on the op in model** and 14.3-21.8x standalone. End to end on whisper that is **2.1% on the
-    285K at four threads, 4.4% on the Ryzen at two, and 0.9% on the Pi** — a large kernel win that is a
-    small share of a whole transcription, which is exactly what a 3.6%-of-runtime op can be.
-  * **A GEMM cliff is done.** tinyBLAS rejected every matmul whose *contraction* was not a whole number
-    of vectors (`k % KN`), handing the whole thing to ggml's generic kernel — and a contraction in
-    attention is a sequence length or a head dimension, i.e. a number nothing rounds. `ggml-0011` splits
-    it: **2.15x at whisper's `A@V` shape** — confirmed in the model, where `A@V` went 2.23x to **1.07x**
-    against onnxruntime — and **1.19-1.24x end to end on Conformer-CTC**, whose head dimension
-    (176/4 = 44) misses the vector width on every utterance. It also **regressed aarch64 by 1.3-1.75x
-    for four days** by inlining its tail into the register tile; dispatching that out of line fixed it
-    without moving x86 (see the note under the table).
-  * **`SOFT_MAX` is measured out — but not for the reason first given.** Its five row passes really are
-    three too many, and rewriting them is worth 1.08x on the machine that motivated it. The original
-    reason, *"at 108 MB the op is DRAM-bandwidth bound"*, is false: against a `memcpy` of the same bytes
-    ggml's row body is **3.6x on the Ryzen and 7.8x on the 285K**. It is closed on size instead —
-    the exp is 7-26% of the op depending on the core, specialising `ggml_v_expf` to this domain is
-    1.00-1.16x, and deleting the polynomial outright is only 1.8x
-    ([Retro-012](docs/retros/retro-012-optimizations-that-were-measured-out.md)).
-  * **The decoder's loop-invariant V transpose is done** (2026-08-29), and it is an EXPORT change, so
-    the table above does not contain it. Whisper's decoder re-materialised the transpose of its
-    cross-attention V every token in every layer — 12 nodes x 4.6 MB, 47% of the decode loop — of a
-    tensor the cross-KV fix had already made constant for the utterance. The `cross_kv` phase now emits
-    it transposed and the traced chain is deleted from the decoder topology: **1.106x end to end**, and
-    the decoder's logits against HF are bit-identical. **The published GGUFs do not have it yet** — the
-    ASR column above is the rc6 artifact, and the re-export lands in rc7.
-  * What is left is `QK^T` at `k = 64` — **51% of the remaining encoder gap**, and closing it entirely
-    would take the encoder from 1.20x to 1.10x.
-* **Read the 285K's four-thread ASR cell as unstable.** onnxruntime's own time at that thread count
-  ranges **1.08 s to 1.64 s across launches, a 1.5x spread**, because that part is 8 P-cores plus 16
-  E-cores and a process is placed once and then stays there; loom's spread over the same launches is
-  1.09x. The cell has read 0.71x, 0.59x and now 0.64x across three samplings in which the engines did
-  not change. **The two onnxruntime builds are indistinguishable here** — nine paired launches of the
-  conda-forge and PyPI 1.28.0 wheels straddle 1.0 at four threads and are 1.01x at 24 — so the 1.86x
-  build difference that VITS shows does **not** carry to whisper.
-* **loom used to stop scaling at 8 threads and go backwards; that is fixed, and the 24-thread row is
-  the fix.** VITS on the 285K was 0.080 s at 8 threads and **0.191 s at 24 — the same as at one
-  thread**. The cause was not in this repository: `ggml` defaults to OpenMP, so `ggml_barrier` was
-  `#pragma omp barrier` — one after every non-empty graph node, 2520 of them in a synthesis — and
-  libgomp's default wait policy **slept every thread on a futex at each one** (334,609 voluntary
-  context switches per 5 syntheses, against 160 now). Building `ggml` against its own threadpool, whose
-  spin is bounded, made the curve monotonic again and is worth **4.8x at 24 threads**
-  ([Retro-017](docs/retros/retro-017-libgomp-slept-at-every-graph-node.md)).
-* **The engine defaults to this machine's PHYSICAL CORE COUNT**, as of P4.30b. It used to default to
-  `ggml`'s `GGML_DEFAULT_N_THREADS` — 4, whatever the machine has — which ran a 24-core workstation on
-  four cores and said nothing about it; that is why two machines have two rows here. `$LOOM_N_THREADS`
-  overrides it, and on Linux the count respects the process's CPU affinity, so `taskset` and a cgroup
-  cpuset are honoured. Against the old default of 4 the 285K gains **1.98x on TTS, 2.41x on ASR and
-  1.18x on the LM**, and the Ryzen gains **1.19x on TTS and 1.03x on the LM by going *down* to 2** —
-  its two extra SMT siblings buy nothing on any task and cost on two, so "use every CPU" would have
-  been right on one of these machines and a 1.19x TTS regression on the other. A Pi 4 does not move.
-  **This does not move the published ratios much, because onnxruntime wants the same thing** — over the
-  same 4 → 2 change on the Ryzen it gains 1.17x, 1.02x and 1.07x on the three tasks, so loom's ASR cell
-  gets *worse* (0.80x → 0.67x at the time it was measured) purely because onnxruntime is the one that
-  gains there. **The physical-core rule is a property of these CPUs, not of loom.**
-  What the change costs is the case it was previously left at 4 for: every figure on this page is one
-  inference at a time on an idle machine, and a host running several loom instances concurrently now
-  has each of them claim every core. That host sets `$LOOM_N_THREADS`.
-
-### The Raspberry Pis at F32 and Q8_0_PC (1.0.0-rc18)
-
-**Q8_0_PC is Q8_0 with one scale per output channel** (`--quantize Q8_0_PC`,
-[ADR-076](docs/adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md)). On the Pi 4's
-Cortex-A72 (an aarch64 core without DOTPROD) and on ARMv6 it takes loom's integer GEMM paths; elsewhere it runs ggml's
-Q8_0 kernels. Against it the Pi 4 runs onnxruntime's int8 models, the ones an onnxruntime user would pick. **Both halves of
-the Pi 4 row were re-measured on the night of 2026-10-23 on one engine build not yet released**, main `159f4cb` plus
-`ggml-0053`, which carries the A72 int8 GEMM (loom.cpp #90), the A72 F32 GEMM (#91), that GEMM for the convolutions too
-(P4.39, `ggml-0049`) and the direct convolution on per-thread staged slices (P4.40, `ggml-0053`, #97). Same protocol as the
-table above: 4 threads (the board's default), each engine launched once per arm, 5 paired rounds in ABBA order, cooled to
-60 C before every arm, median per engine; onnxruntime is the 1.28.0 PyPI wheel. The ratio is onnx/loom, so **`>1.00x`
-means loom is faster**, and **eleven of the twelve cells resolve**: each one's paired p10 and p90 sit on the same side
-of 1.00x. whisper-small's F32 cell does not (p10 0.99, p90 1.01), so read it as parity.
-
-**Each time is followed by its real-time factor (RTF) in brackets:** the time divided by the length of the audio, which
-for ASR, VAD and wake word is the input clip and for TTS is the audio the model produced. Below 1.00 is faster than real
-time. The LM row has no audio, so its time stands alone.
-
-| Raspberry Pi 4B, 4 threads | loom F32 | onnxruntime FP32 | ratio | loom Q8_0_PC | onnxruntime int8 | ratio |
-|---|---|---|---|---|---|---|
-| VITS piper en-GB miro (TTS, 3.32 s of audio) | 0.802 s (0.24) | 1.072 s (0.32) | **1.34x** | 0.821 s (0.25) | 4.117 s (1.24) | **5.03x** |
-| Citrinet-256-ls (ASR, jfk 11.0 s) | 0.454 s (0.04) | 0.294 s (0.03)¹ | 0.65x | 0.459 s (0.04) | 4.300 s (0.39)¹ | **9.31x** |
-| Moonshine tiny (ASR, jfk 11.0 s) | 1.335 s (0.12) | 1.504 s (0.14) | **1.13x** | 0.848 s (0.08) | 1.485 s (0.13) | **1.75x** |
-| whisper-small (ASR, jfk 11.0 s) | 20.73 s (1.88) | 20.63 s (1.88) | 1.00x | 12.52 s (1.14) | 14.74 s (1.34) | **1.17x** |
-| Qwen3-0.6B-Base (LM, 24 tokens) | 16.59 s | 17.56 s | **1.06x** | 4.15 s | 14.28 s | **3.45x** |
-| Pocket TTS (TTS, 4.80 s of audio)² | 9.107 s (1.90) | 18.77 s (3.91) | **2.06x** | 4.248 s (0.88) | 13.88 s (2.89) | **3.27x** |
-| Pocket TTS 18m refl (TTS, 4.80 s of audio)³ | 2.412 s (0.50) | — | — | 1.439 s (0.30) | — | — |
-| Pocket TTS 7m refl (TTS, 4.80 s of audio)³ | 1.275 s (0.27) | — | — | 1.067 s (0.22) | — | — |
-| Pocket TTS 2m refl (TTS, 4.80 s of audio)³ | 0.619 s (0.13) | — | — | 0.593 s (0.12) | — | — |
-
-¹ onnxruntime is timed from NeMo's mel features, computed outside the timer; loom's time includes its front end.
-² Measured with the rest of each half, and each launch is the mean of 3
-syntheses after an untimed one (`scripts/bench_driver.cpp` against `scripts/bench_pocket_onnx.py`). There is no official ONNX Pocket TTS, so the
-onnxruntime side is the community export [`KevinAHM/pocket-tts-onnx`](https://huggingface.co/KevinAHM/pocket-tts-onnx)
-at `58a6d00` (its fp32 and int8 files) through its own `generate()`. That export holds the `english_2026-04`
-weights, an older release of the same architecture as loom's `english_2026-09`, and it keeps decoding on a second
-thread and attends over a fixed 1000-position cache. Both sides run exactly 60 frames, with the EOS head disarmed, from
-the same 28 text ids and a 126-row `alba` voice.
-³ Kyutai's distilled `english_{18m,7m,2m}_refl_2026-10` (ADR-084), timed like the Pocket TTS row. There is no ONNX export
-of them, so they have no onnxruntime cells. Their own F32/Q8_0_PC ratios are in the last bullet below.
-
-* **Both engines did the same work in every pair**, checked by one untimed launch of each arm: the same 73 216 VITS
-  samples, the same 24 tokens, and the same transcript at each precision except one word each of Citrinet (loom Q8_0_PC
-  hears "asks", onnxruntime int8 "askd ... ask") and of Moonshine at Q8_0_PC (loom transcribes jfk exactly, onnxruntime
-  int8 hears "as" for "ask", as loom's own Q8_0_PC did before the A72 int8 GEMM). **loom's Q8_0_PC Qwen3 decodes the
-  same tokens as its F32**, where onnxruntime's int8 model decodes different ones from its own FP32 (`220, 16, 15, ...` against `12095, 13, 576, ...`).
-* **onnxruntime's int8 is slower than its FP32 on both convolutional models** — 3.8x on VITS, 14.6x on Citrinet —
-  which is what makes those two Q8_0_PC cells large. loom's Q8_0_PC is within 3% of its own F32 there, and is a win
-  by itself on the transformer models: 1.57x on Moonshine, 1.66x on whisper and 4.00x on Qwen3. Before the A72 int8
-  GEMM, whisper's was 1.13x and the cell read 0.64x: ggml's Q8_0 kernel needs DOTPROD, which the A72 lacks.
-* **Where the int8 models come from:** Qwen3, whisper and the Moonshine decoder are onnx-community's published int8
-  files (`model_int8`, `encoder_model_int8` + `decoder_model_merged_int8`); VITS and Citrinet are `quantize_dynamic`
-  (QInt8) of the same FP32 models the left half runs. Moonshine's encoder is `quantize_dynamic` with MatMul only,
-  because the published int8 encoder's quantized conv stem garbles jfk.
-* The engine is `integration/rc18` at `d66c2ce`, whose code is 1.0.0-rc18's except for #83's fix to how the GPU wheels
-  find the ggml patches, which a CPU build does not reach. The GGUFs are md5 `3f25d02d`/`6e095a95` (VITS), `0711bf17`/`37a8d3b6`
-  (Citrinet), `4831ba56`/`9284eaa8` (Moonshine), `7b6af094`/`39077edf` (whisper) and `4882ce99`/`b93d7779` (Qwen3),
-  F32/Q8_0_PC. Both sides run from `scripts/bench_{vits,asr,lm}_loom.cpp` and `scripts/bench_onnx_tasks.py`, whose
-  `ctc` and `moonshine` tasks are new with this table. **Both halves** ran the same harness, binaries and GGUFs with
-  only the engine libraries swapped for main `159f4cb` + `ggml-0053`: loom.cpp #89, #90 and #91 (`ggml-0045`-`0048`),
-  `ggml-0049`, P4.41's `ggml-0050`-`0052` (two of them ARMv6-only) and `ggml-0053`. Every Q8_0_PC arm placed its
-  per-channel weights in the A72's `CPU_NEON_I8` buffer. whisper's and Moonshine's F32 linears and whisper Q8_0_PC's
-  attention products (which are F32) take the outer-product F32 GEMM. Since `ggml-0049` so do the im2col
-  convolutions: VITS's text encoder and flow, and Citrinet's. Since `ggml-0053` the direct ones (VITS's vocoder, and
-  some of Citrinet's and of Pocket TTS's Mimi decoder) run an 8 x 12 tile over per-thread staged slices of their
-  input ([ADR-086](docs/adrs/adr-086-the-direct-convolution-stages-its-activation-per-thread.md)), with VITS's audio
-  byte-identical either way. Against rc18's F32 half that moves whisper 0.80x → 1.00x, Moonshine 1.03x → 1.13x,
-  VITS 0.98x → 1.34x and Citrinet 0.57x → 0.65x; whisper Q8_0_PC goes 0.64x → 1.17x. `ggml-0053` alone took VITS
-  from 1.03x to 1.34x, and from 3.90x to 5.03x at Q8_0_PC, whose convolution kernels run at F32.
-* **Pocket TTS did the same work too:** 115 200 samples on every arm. The onnxruntime outputs at both precisions, and
-  the Pi Zero's Q8_0_PC output below, transcribe under whisper-small as the sentence spoken, word for word (it spells
-  "grey" as "gray"). Its GGUFs are
-  md5 `26aa0137`/`6e71ec37`, F32/Q8_0_PC, the files `loom-ai-org/pocket-tts-loom` publishes.
-* **The small Pocket TTS models are weighed against their own Q8_0_PC.** They ran in the same session, through the same
-  `bench_driver` call as the Pocket TTS row, with the same 5 paired rounds, cooled to 60 C before every arm. F32/Q8_0_PC
-  is **1.68x** on the 18m (p10-p90 1.63-1.73) and **1.21x** on the 7m (1.20-1.23). The 2m's 1.03x does not resolve
-  (0.99-1.15). At F32 the 18m model is 3.8x faster than the full one and the 2m 14.7x. Every arm produced 115 200
-  samples, and whisper-small hears all six outputs as the sentence spoken (the 7m Q8_0_PC writes "gray" for
-  "grey"). The GGUFs are fresh exports on loom-exporter main `89750ac`, whose Mimi decoder attends over a window
-  (P4.41), so they are not the Pi Zero rows' files and are not on the Hub yet: md5 `4564c993`/`740ec54f` (18m),
-  `45aabdb0`/`f0b44c07` (7m) and `8a2ff5e2`/`d4d4e23c` (2m), F32/Q8_0_PC.
-
-The Pi Zero W has no onnxruntime build, since onnxruntime ships no ARMv6 wheel. The Pi 4's new GEMMs and
-`ggml-0053` are AArch64-only, so this table was not re-run; P4.41's ARMv6 patches are measured in Epic-05. It weighs loom's two precisions
-against each other on the 1.0.0-rc18 ARMv6 wheel, with RTFs as above: its one core, each model launched once per arm through
-`loom-py`, 3 rounds with the arms' order flipped every round and a 3 s settle between launches, median per arm, nothing
-polling the board while it runs. The ratio is F32/Q8_0_PC, so **`>1.00x` means Q8_0_PC is faster**; a ratio in bold
-resolves, its three paired rounds all on the same side of 1.00x.
-
-| Raspberry Pi Zero W, 1 core | loom F32 | loom Q8_0_PC | ratio | paired rounds |
-|---|---|---|---|---|
-| Citrinet-256-ls (ASR, jfk 11.0 s) | 10.96 s (1.00) | 8.09 s (0.74) | **1.35x** | 1.35–1.37x |
-| Moonshine tiny (ASR, jfk 11.0 s) | 30.41 s (2.76) | 24.32 s (2.21) | **1.25x** | 1.24–1.26x |
-| Silero VAD (jfk 11.0 s) | 2.662 s (0.24) | 2.203 s (0.20) | **1.21x** | 1.14–1.22x |
-| sanoTTS heart (TTS, 3.18 s of audio) | 2.308 s (0.73) | 2.030 s (0.64) | **1.14x** | 1.13–1.25x |
-| WakeHuBERT tiny (wake word, jfk 11.0 s) | 2.383 s (0.22) | 2.102 s (0.19) | **1.13x** | 1.12–1.16x |
-| Conformer-CTC small (ASR, 3.0 s of jfk) | 6.919 s (2.31) | 6.672 s (2.22) | **1.04x** | 1.02–1.07x |
-| sanoTTS amy en 1.46M (TTS, 5.90 s of audio) | 15.49 s (2.63) | 14.95 s (2.53) | 1.04x | 0.96–1.05x |
-| sanoTTS de thorsten 0.51M (TTS, 4.40 s of audio) | 3.490 s (0.79) | 3.553 s (0.81) | 0.98x | 0.96–1.01x |
-| VITS piper en-GB miro (TTS, 3.39 s of audio) | 21.96 s (6.48) | 22.16 s (6.51) | 0.99x | 0.98–1.00x |
-| sanoTTS heartnano (TTS, 3.06 s of audio), control | 0.847 s (0.28) | 0.862 s (0.28) | 0.98x | 0.96–1.01x |
-| Pocket TTS (TTS, 4.80 s of audio) | does not fit | 115.0 s (23.96) | — | — |
-| Pocket TTS 18m refl (TTS, 4.80 s of audio) | 67.02 s (13.96) | 58.85 s (12.26) | **1.14x** | 1.14–1.15x |
-| Pocket TTS 7m refl (TTS, 4.80 s of audio) | 46.60 s (9.71) | 45.16 s (9.41) | 1.03x | 0.98–1.03x |
-| Pocket TTS 2m refl (TTS, 4.80 s of audio) | 19.14 s (3.99) | 19.57 s (4.08) | **0.98x** | 0.98–0.99x |
-
-* **sanoTTS heartnano is the noise floor.** None of its tensors is large enough to quantize, so its Q8_0_PC export is
-  byte-identical to its F32 one (md5 `75579b65` for both). Its 0.96–1.01x is what two runs of the same file differ by on
-  this board, and the three unresolved TTS rows sit inside it.
-* **Q8_0_PC wins on every ASR, VAD and wake-word model, and on sanoTTS heart.** The other three TTS models sit inside
-  the noise floor. VITS doesn't gain on the Pi 4's Q8_0_PC either.
-* **The work is the same, checked on every launch:** the two ASR transcripts and Citrinet's 47 CTC ids hash
-  identically at both precisions, and every arm's output hash is identical across its three rounds. Each TTS model's
-  Q8_0_PC arm produces one 256-sample frame more than its F32 arm.
-* **DistilBERT-NER is left out:** its F32 GGUF is 261 MB, and with Python beside it that is more than the board's
-  427 MB. The first attempt drove the board into swap until sshd stopped answering.
-* **Pocket TTS has no F32 arm for the same reason:** its F32 file is 405 MB. Its 130 MB Q8_0_PC file was timed alone,
-  on 2026-10-21 with the 1.0.0-rc18 release wheel. The time is the median of 3 launches, each launch's first call, on the
-  Pi 4 row's 60 frames. The output hashed the same in all three. 79 of its weights (97 MB) take the ARMv6 int8 path.
-* **The small Pocket TTS models do fit at F32.** These are Kyutai's distilled `english_{18m,7m,2m}_refl_2026-10`
-  (ADR-084): 77, 29 and 8.5 MB at F32, 31, 11 and 4.2 MB at Q8_0_PC. They were measured on 2026-10-23 with the same
-  rc18 wheel and the same call as the Pocket TTS row (60 frames, EOS disarmed, seed 1, `alba`), timing each
-  launch's first call. The token ids are fixed, so the text rules ADR-084 adds to the engine don't come into it.
-  Every arm's output hashed the same in all three rounds, and whisper-small hears all six as the sentence
-  spoken (the 7m Q8_0_PC writes "gray" for "grey"). Q8_0_PC pays off only on the 18m model. The 2m's 0.98x
-  resolves by the rule above but sits inside heartnano's noise floor. The GGUFs are md5 `d0147aa6`/`2eb67407`
-  (18m), `fa467304`/`98c9c51e` (7m) and `be656b10`/`89835bf9` (2m), F32/Q8_0_PC.
-* The wheel is the `integration/rc18` ARMv6 build at engine `d66c2ce` (wheels CI run 39510002375). The GGUFs are
-  md5 `0711bf17`/`37a8d3b6` (Citrinet), `4831ba56`/`9284eaa8` (Moonshine), `ae4a116f`/`a815c984` (Silero VAD),
-  `b3df3baf`/`14df8278` (heart), `be98f1a8`/`6586f559` (WakeHuBERT), `9ae1d8a2`/`241b1bca` (Conformer-CTC),
-  `1d2e4e7b`/`cc149c53` (amy), `715fc16d`/`1a7596ea` (thorsten) and `3f25d02d`/`6e095a95` (VITS), F32/Q8_0_PC.
-
-### What these numbers are not
-
-**The onnxruntime build is named per row, because at the identical version it is worth up to 1.86x.**
-The conda-forge build synthesises VITS in 0.065 s where the PyPI wheel takes 0.120 s — same machine,
-same script — and against conda-forge the x86 TTS wins above become losses. The two 285K rows are
-measured against conda-forge and the other three against the PyPI wheel, which is the channel `loom-py`
-ships through. **That difference does not carry to whisper**: nine paired launches on the 285K put the
-two builds within the thread-placement noise at four threads and at 1.01x at 24, so the ASR column is
-comparable across rows even though its baselines are not the same package. The TTS column is not, and
-the Pi and Ryzen TTS cells are the PyPI-wheel ones.
-
-**Each pair is checked for equal work, not merely equal wall time.** TTS pins VITS's three scales so
-both engines emit the same 73216 samples, and both harnesses print that count; ASR compares the
-transcripts, which are identical; the LM runs the same prompt to the same token budget greedily on both
-sides, and both emit the same tokens. **Model load is outside every timer on both sides.**
-
-**Every cell is an average over separate process LAUNCHES, not over runs inside one.** The TTS and LM
-cells are means — per engine, 31 TTS launches on x86 and 15 on the Pi; 21 LM launches on the 285K, 15
-on the Ryzen and 7 on the Pi, where one generation is 47 s. The ASR cells are medians (9 per engine on
-each 285K row, 7 on each Ryzen row, 5 cooled pairs on the Pi) and were taken 2026-08-29. **The Pi's TTS
-and LM cells no longer report the fastest run.** That special case existed because thermal drift on
-that board only ever makes a run slower; enforcing the cooldown before *every arm* rather than around
-the session removes the drift instead of estimating around it, and the board then holds a 1.02-1.05x
-spread per engine — tighter than either x86 machine.
-
-**A median is used where the samples are unimodal and a mean where they are not, and the difference is
-worth up to 1.4x.** At 24 threads on the 285K both engines' VITS time splits into two per-launch modes
-about 1.4x apart at roughly even odds; a median over that lands on whichever mode drew the majority, so
-the same eight minutes of benchmarking can report 1.19x or 1.66x with nothing changed. `paired_arms.py`
-now prints both estimators and warns when an arm's launches split into two weighted clusters.
-
-**Thread placement is chosen once per PROCESS on a hybrid part, it is worth up to 1.47x, and it is not
-a lottery — it is WHICH CLUSTER.** The Core Ultra 9 285K is 8 P-cores (`/sys/devices/cpu_core/cpus` =
-0-7) plus 16 E-cores (`cpu_atom` = 8-23), no SMT. A four-thread process lands on one cluster and then
-stays there for its whole life, so every run inside it inherits that choice and a within-process median
-cannot average it out. Pinned to a cluster, every number is reproducible to ~1%:
-
-| VITS, 4 threads, 5 launches each | loom | onnxruntime | ratio |
-|---|---:|---:|---:|
-| P-cluster (`taskset -c 0-3`) | 0.0624-0.0628 s | 0.0646-0.0661 s | **1.034-1.053** |
-| E-cluster (`taskset -c 8-11`) | 0.0916-0.0927 s | 0.1033-0.1075 s | **1.114-1.165** |
-
-So the two clusters give *different ratios*, and a cell that does not say which one the process got is
-under-specified. Pinning is how that table was measured and it is the right way to *explain* the
-spread, but it is not how the cells above are taken: it constrains onnxruntime more than loom (pinned
-to P-cores its whisper time is 1.76 s, worse than its lucky unpinned launches), so a pinned table would
-not be like-for-like.
-
-**One second of idle between the two arms on x86, and a cooldown to 60 C on the Pi, because otherwise
-the second arm pays for the first.** Run
-immediately after loom, onnxruntime landed in its slow VITS mode in 29 of 31 launches; run alone on the
-same box in the same session, 10 of 20. A `sleep 1` between arms restored it to 21 of 31 and moved the
-285K's 24-thread TTS cell from 1.41x to 1.20x. Alternating the arm order does not cancel this, because
-both orders penalise whoever is second, and it is not symmetric between the engines — ggml's threadpool
-spins where onnxruntime re-decides placement at session creation. The settle is worth ~1% on the
-homogeneous Ryzen and up to 1.18x on the hybrid 285K, which is what says it is a placement effect.
-[Retro-025](docs/retros/retro-025-the-arm-that-ran-second-paid-for-the-first.md) has the rest.
-
-**Both sides use the same estimator**, which is not a detail: every harness here warms up and reports
-a best-or-median over repeated runs in one process. `bench_lm_loom.cpp` used to time a single cold
-generation instead, and comparing that against a warmed-up onnxruntime moved the LM column by 5-7% —
-enough to flip its sign on all three machines. **`bench_asr_loom.cpp` had the same fault until
-2026-08-29** and it was missed because the retro that fixed the LM harness asserted this one was
-already warm rather than checking. Cold/warm on whisper is 1.25-1.7x at 24 threads on the 285K, 1.02x
-at four, and *below* 1.0 on the Ryzen, where the box heats faster than the first run pays for itself —
-a thread-count effect, which is why it landed on the one cell the table called an ASR win. The harness
-now discards a warm-up run and prints it, and **`nrun` must be >= 3**: `times[size / 2]` on two samples
-is the larger of the two, not a median.
-
-**And the same two faults were still in the other half of the comparison until 2026-09-02.**
-`bench_onnx_tasks.py`'s `vits` task had no warm-up while `bench_vits_loom.cpp` discards its first
-synthesis, and `bench_vits_loom.cpp` carried the same `ts[size / 2]` index. Both are fixed. The audit
-that fixed the ASR harness opened **loom's three harnesses** and asserted the onnxruntime side, which is
-Retro-018's own lesson landing on its own blind spot; the check is one line and it has to name both
-globs — `grep -n 'warm' scripts/bench_*_loom.cpp scripts/bench_onnx_tasks.py`. `bench_lm_loom.cpp` now
-prints its first five tokens, so the LM's equal-work check is shown rather than asserted, the way VITS
-prints a sample count and ASR prints a transcript.
-
-**Reproducing it:** loom's side is `scripts/bench_{vits,lm,asr}_loom.cpp`, onnxruntime's is
-`scripts/bench_onnx_tasks.py`. The latter drives `onnxruntime` directly rather than through `optimum`,
-which added roughly 2x of its own overhead to whisper and mis-derives Qwen3's `head_dim`.
-
-**The Pi throttles, and it will lie if allowed to.** It goes 55 -> 84 C during a single whisper run and
-caps the ARM clock at 1580 MHz; two back-to-back measurements once came out 87.1 s and 115.8 s, 33%
-apart. Its row is taken with a cooldown before every measurement and the two engines interleaved, so
-both meet the same clock.
-
-## Building
-
-```sh
-cmake -B build
-cmake --build build -j"$(nproc)"
-```
-
-Dependencies (`ggml`, `nlohmann_json`, LuaJIT) are fetched by CMake; nothing else is needed to build
-and run the hermetic suite. The fetched `ggml` is patched at configure time from `cmake/patches/` —
-eleven diffs at present, fixing GCC's code generation for ggml's ARM F32 GEMM (1.6x), the matmuls it
-declined to accept at all — by row count and by contraction length — a fused convolution that batched
-its work too coarsely to stay in cache, a direct 1-D convolution for long activations with small
-weights, the elementwise nodes a vocoder's resblock wraps around every convolution — its bias, its
-leaky ReLU and its residual — none of which now costs a pass over memory of its own, an exact-erf GELU
-that was a scalar libm call per element, and `conv_transpose_1d`'s single-threaded prologue and
-dot-product-at-a-time compute; see `cmake/GgmlPatches.cmake` for the rules such a patch has to meet.
-**`ggml-0011` is why `UPSTREAM.md` now requires a number from an x86 box AND one from the Pi before a
-patch here is called done** — it was measured on one ISA, shipped to both, and regressed the other by
-1.3-1.75x.
-
-Two of them are heuristics tuned on measured hardware, so they carry a run-time escape:
-`GGML_CPU_DISABLE_CONV_HEURISTICS=1` declines both, the way ggml's own `GGML_CPU_DISABLE_FUSION`
-declines its fusions.
-
-**32-bit ARM (ARMv6, ARMv7) builds from this checkout with no flags of its own.** There is no
-ISA-specific code in this repo — `grep -rE '__aarch64__|__ARM_NEON|immintrin|AVX' src include tools`
-returns nothing — so `__ARM_NEON` simply goes undefined, ggml takes its scalar arms, and the patches
-above take their generic ones. Two things are worth knowing before you do it. `GGML_NATIVE` is off in
-a wheel build and this path passes no `-march`, so the baseline is **the compiler's own default**:
-build in the userland the binary is for, or a Debian armhf toolchain's `armv7-a+neon` will produce
-something that dies on a Pi Zero. And `GGML_CPU_ALL_VARIANTS` cannot be used at all here — ggml's ARM
-variant ladder is AArch64-only, so a 32-bit build is one un-split `libggml-cpu.so`. `loom-py` handles
-both for you; [Epic-08 §6](docs/epics/epic-08-packaging-and-release.md) is the whole story, including
-the emulated Raspbian the `linux_armv6l` wheel is built in.
-
-There is one build option of this repo's own, `-DLOOM_TINYBLAS=OFF`, which drops ggml's blocked GEMM
-(`GGML_LLAMAFILE`) back out again. It exists to make GEMM measurements A/B-able and defaults **on**,
-where it is worth ~2x on x86-64 and 1.6x on aarch64 at convolutional shapes ([Epic-05](docs/epics/epic-05-edge-performance.md)).
-
-### Running on a GPU
-
-A default build is CPU-only. Compiling a device backend in is a `ggml` option, passed straight through
-— this repo adds no option of its own here, because there is nothing per-backend for it to decide:
-
-```sh
-cmake -B build -DGGML_VULKAN=ON     # or -DGGML_CUDA=ON, -DGGML_METAL=ON, -DGGML_SYCL=ON, ...
-cmake --build build -j"$(nproc)"
-
-build/tools/loom_cli/loom_cli --list-devices
-build/tools/loom_cli/loom_cli --device gpu --model model.gguf --wav audio.wav
-```
-
-`--device` takes `auto` (the default, and what `$LOOM_DEVICE` sets), `cpu`, `gpu`, or a device name
-such as `Vulkan0`. **`auto` prefers a device and falls back to the CPU; `gpu` is an error when there
-is none**, because a caller who spelled it out is asking a question about the machine, and answering it
-with a silent CPU run turns "no GPU here" into an unexplained performance number.
-
-**The Vulkan build tools sort themselves out.** `glslc` and the Vulkan headers on a stable distribution
-are likely too old for `ggml`'s Vulkan backend, and both fail in ways that name neither cause — so
-`cmake/VulkanToolchain.cmake` probes for those two failures specifically and, when it finds them,
-fetches pinned Vulkan-Headers and builds `glslc` from a pinned `shaderc` into the build directory. That
-costs several minutes on the first configure of a machine that needed it, and nothing at all on one that
-did not. `-DLOOM_VULKAN_FETCH_TOOLCHAIN=OFF` turns the diagnosis into an error naming what to install
-instead, which is the right setting for an image that provides its own toolchain.
-
-**A primitive can choose its own lowering.** Some ops are host callbacks through `ggml_map_custom` (a C
-function pointer, so there is nothing for a GPU to dispatch) and others are real ggml ops a given backend
-happens not to implement. Either way a primitive builds what the topology asked for, asks
-`ggml_backend_supports_op`, and either keeps it or emits an equivalent — so the same GGUF lowers
-differently per backend and the file on disk keeps saying what the model does. Every device run still
-carries a CPU backend behind it for whatever is left. The CLI prints where each module actually ran;
-`ctest -L gate -R device_parity` checks that a device gets the same answer as the CPU.
-
-## Testing
-
-Two classes of test, and a test's own directory is which class it is in.
-
-```sh
-ctest --test-dir build -L ci      # hermetic: builds its own fixtures, seconds, what CI runs
-ctest --test-dir build -L gate    # real exported checkpoints; skips cleanly without them
-```
-
-`tests/ci/` needs nothing but this repo, a toolchain and `gguf`+`numpy` — every fixture it reads is
-generated from `tests/fixtures/*.py` by a ctest step that runs first. `tests/gate/` compares against
-real models: gigabytes that cannot live in git and hours that cannot run in CI, so each of those tests
-exits 77 (Skipped) when its fixture is absent, and a developer with none of them still gets a green
-suite that means *nothing hermetic broke*.
-
-Point the gate suite at its fixtures with one variable:
-
-```sh
-export LOOM_FIXTURES=~/loom-fixtures
-scripts/fixtures.py status    # what the gate tests want, and what you have
-scripts/fixtures.py fetch     # from the published fixture repo
-```
-
-Every fixture also still honours the per-test variable it always had
-(`LOOM_KOKORO_MIL_GGUF`, …), which wins over the root — pointing one test at one artifact you just
-rebuilt is what you do while working on it.
-
-## Documentation
-
-The project's knowledge base is a four-tier hub-and-spoke set under [`docs/`](docs/), covering all
-three repos.
-
-| | |
-|---|---|
-| [`docs/backlog/active-index.md`](docs/backlog/active-index.md) | **the hub** — open work only, one line each, linked to its context |
-| [`docs/epics/`](docs/epics/) | what each domain is and how it works (engine, exporter, models, backends, performance, host API, text front-ends, packaging) |
-| [`docs/adrs/`](docs/adrs/) | why a technical choice was made, what was considered, and what it cost |
-| [`docs/retros/`](docs/retros/) | what broke, the root cause, and the takeaway |
-
-The specifications those tiers refer back to:
-
-| | |
-|---|---|
-| [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) | the data-driven design and why the engine hardcodes nothing |
-| [`docs/KV-CACHE.md`](docs/KV-CACHE.md) | how a cached attention block reaches the engine from an export |
-| [`docs/LOOM_PROCEDURAL_GENERALIZATION.md`](docs/LOOM_PROCEDURAL_GENERALIZATION.md) | the embedded-Lua orchestration blueprint |
-| [`docs/HIGH-LEVEL-API.md`](docs/HIGH-LEVEL-API.md) | one door per task, what each layer owns, and what a file must declare for a host to dispatch |
-
-[`BACKLOG.md`](BACKLOG.md) was the single-file ledger until it reached ~9,000 lines. It is now a
-redirect carrying a map from every old section to its new home, so a code comment citing an item by
-number (`P4.3e`, `P4.15b`) still resolves. Item numbers were not changed.
-
-## Roadmap
-
-**1. GPUs — done; NPUs, not yet.** The engine takes a device backend and a CPU fallback and schedules
-across them ([Epic-04](docs/epics/epic-04-backends-and-accelerators.md)); see [Running on a GPU](#running-on-a-gpu) above. Measured on an AMD
-Vega 3 iGPU against 4 CPU threads, one forward each:
-
-| model | splits | GPU vs CPU |
-|---|---|---|
-| conformer-ctc-small | 1 | **2.56×** |
-| lfm2-350m | 1 | **2.22×** |
-| qwen3-0.6b | 1 | **2.82×** |
-| matcha `encoder_mu` | 1 | **3.65×** |
-| kokoro `decoder_vocoder` | 3 | **4.62×** |
-
-What decides that number is how many times the scheduler has to cut the graph, and what forces a cut is
-`ggml_map_custom` — a host callback, so there is nothing for a device to dispatch. Those splits used to
-be 453, 181, 61, 107 and 5, which left Qwen3 at 0.95× and Matcha at 0.84× — *slower than the CPU*. None
-of it was the engine: it was three patterns the exporter emitted as host callbacks because it had never
-been taught to recognise them — an RMS norm (`POW`+`RSQRT`), a squaring (`POW`), and a hand-rolled
-LayerNorm. **Across all thirteen exported models there are now exactly two `ggml_map_custom` nodes
-left** — one `ATAN` each in Kokoro's and StyleTTS2's STFT phase, which has no ggml counterpart.
-[Retro-009](docs/retros/retro-009-host-callback-count-was-the-wrong-lens.md) has the numbers, including a CPU measurement that came out wrong twice before
-anything interleaved the runs.
-
-**Counting host callbacks turned out to be the wrong lens**, which is worth knowing before optimizing
-anything here: a graph splits just as readily on a *real* ggml op whose backend kernel is missing, and
-the gaps do not line up between backends — CUDA has `PAD_REFLECT_1D` but no `POOL_1D`, Vulkan has
-`POOL_2D` but neither, and the NPU backends have none of the three.
-
-So **a primitive asks the backend what it can run** ([ADR-007](docs/adrs/adr-007-backend-capability-negotiation.md)) and emits either the native op
-or an exactly-equivalent composition. That decision belongs in the engine rather than the export: one
-GGUF may be run by any backend, so deciding it at export time compiles every artifact for the least
-capable one. The same Kokoro file builds 1692 ggml nodes on a CPU and 1732 on Vulkan, and its topology
-says `PAD_1D_REFLECT` either way.
-
-`ATAN` had no exact composition anywhere — ggml has no inverse trigonometry in any backend — so it gets
-the one **approximation** in the engine: range reduction, a degree-8 minimax polynomial and a branchless
-reconstruction, measured at **1.81 ULP** and confined to backends that cannot dispatch the host callback,
-so a CPU build still gets libm. **Eleven of the twelve models now run a whole module on the GPU with
-nothing falling back at all.** The twelfth is Whisper, whose 400-wide reflect pad is cheaper to fall back
-on than to compose — and which CUDA, Metal and SYCL run natively regardless.
-
-One caveat on every speedup on this page: the GPU measured here reports `uma: 1`, so it shares memory
-with the host and a split costs a synchronisation rather than a transfer. These numbers are a lower bound
-on what a discrete card over PCIe would show.
-
-Of the two decisions the earlier version of this item said were waiting on a GPU, one was answered and
-one is still open. Retained inter-module outputs turn out not to be what a device charges for — measured
-before the fusion above, LFM2's 20-module modular export cost 183 splits against the monolithic
-export's 181, so decomposing a model into modules was never the expensive part. `FLASH_ATTENTION` is
-still unbuilt: a GPU makes `ggml_flash_attn_ext`'s forced F16 K/V cast worth considering, but what
-stands in the way is the gate suite's exact-fp32 comparisons, not the hardware.
-
-**What is next is CUDA, then NPUs** — see [Epic-04](docs/epics/epic-04-backends-and-accelerators.md). Sixteen backend directories already
-ship in the pinned ggml — CUDA, Metal, SYCL, OpenCL, HIP, OpenVINO, Hexagon (Qualcomm), CANN (Ascend)
-among them — and because `loom::Device` resolves a spec against ggml's *device registry* rather than
-against any backend name it knows, a CUDA build's `CUDA0` is already selectable by code that has never
-heard of CUDA. Those cost a build matrix and a test run, not C++. CoreML (the Neural Engine, which
-Metal is not) and RKNPU2 are out of tree and cost more, licence check included.
-
-Compiling all of them in would end the leanness this engine is for, so the answer is `GGML_BACKEND_DL`:
-each backend becomes a shared library ggml discovers at run time, one engine binary serves every
-accelerator, and the deployment decides which files travel with it. That already works through
-`loom::Device` unchanged. See [ADR-009](docs/adrs/adr-009-backends-as-dynamic-libraries.md) and the [backlog](docs/backlog/active-index.md#backends--accelerators) for what is still missing (a `Backends` that holds more than two, and
-the custom-op fusion above, which on an NPU stops being an optimization and becomes a prerequisite).
-
-**2. Builds for more platforms.** Linux x86-64 is what is built and tested today. Next: macOS on Intel,
-macOS on Apple Silicon, and Linux on ARM — the last of which is the one that matters most for an engine
-whose stated target is edge devices.
-
-**3. More models — [Epic-03](docs/epics/epic-03-model-coverage.md)**, ordered by coverage per unit of effort. BERT token
-classifiers (the smallest possible template, and the first non-audio task), codec decoders, text
-encoder-decoders, CNN+CTC and SANM encoders are all done; what is left is the remaining TTS families →
-small classifiers → music. Each is an export, so the measure of the design is that none of them should
-need engine work — and SANM, the most recent, needed none.
-
-**4. The follow-ups the docs already name.** [`docs/backlog/active-index.md`](docs/backlog/active-index.md)
-is the ledger and the authority; the ones worth knowing about from here are the `KvCache` memory redesign (deferred with its reasons),
-KV-cache addressing policies beyond the contiguous append `ggml_set_rows` already permits, quantized KV
-cache, a permissively-licensed phonemiser so the phoneme-input TTS models get a text door, and
-generalizing the grapheme front-end out of C++ once a second such model exists.
 
 ## Licence
 
-MIT — see [`LICENSE`](LICENSE).
+MIT, see [`LICENSE`](LICENSE). Each model on the Hub keeps the licence of the checkpoint it was exported
+from.
