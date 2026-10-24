@@ -25,10 +25,11 @@ are not renumbered. New items continue the scheme.
 | **P5 breadth: family 14 (music): the next leaf** | MusicGen Small is **published** (2026-10-10, `musicgen-small-loom`, [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)). The next leaves are unscoped. MusicGen medium/large are the same export at 1.5B/3.3B parameters; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
 | **Nemotron 3.5 ASR: the English-only sibling** | Nemotron 3.5 ASR is **published** (2026-10-10, `nemotron-3.5-asr-streaming-0.6b-loom`, Hub `4a28fa5`, on rc16; [Epic-03 §2](../epics/epic-03-model-coverage.md#family-1s-fourth-transducer-nemotron-35-asr)). Next leaf: `nvidia/nemotron-speech-streaming-en-0.6b`, the same encoder with no language prompt (a `nemotron_asr_streaming` recognizer and an encoder wrapper without the prompt), NVIDIA Open Model License |
 
-**State anchor, 2026-10-24 — `1.0.0-rc19` is released.**
+**State anchor, 2026-10-24 — `1.0.0-rc19` is released and the Hub equals the staging tree.**
 The signed tag `1.0.0-rc19` sits on the merge of loom-py #68 (`VERSION` and its ten derived copies, and
-`vendor/loom.cpp` at `62cfb05`, the merge of #98). The four packages publish at `1.0.0rc19` and the
-`linux_armv6l` wheel is a GitHub release asset, as for rc18.
+`vendor/loom.cpp` at `62cfb05`, the merge of #98). Four packages are on PyPI at `1.0.0rc19` (17/2/2/1
+files, as rc18) and the `linux_armv6l` wheel is a GitHub release asset. `wheels.yml` run 40049247435 was
+green, including `publish-pypi` and the three Raspberry Pi checks (`gpu-smoke-test` skipped, as always).
 
 rc19 carries, in loom.cpp: the Raspberry Pi 4 work P4.35-P4.40: whisper's attention (#89), the A72 int8
 GEMM `CPU_NEON_I8` (#90, ADR-076), the A72 outer-product F32 GEMM (#91, ADR-082) and the same GEMM for the
@@ -43,8 +44,22 @@ ADR-081 pad pass on by default (#64), the Pocket-TTS small models (#65), the win
 On the Pi 4 against onnxruntime 1.28.0 this build has VITS at 1.34x (F32) and 5.03x (`Q8_0_PC`), whisper-small
 at 1.00x and 1.17x, Qwen3-0.6B at 1.06x and 3.45x ([BENCHMARKS.md](../BENCHMARKS.md#raspberry-pi-4)).
 
-**Still to publish on it:** the three small Pocket TTS repos (the item under model coverage), and the
-re-exports that pick up ADR-081's pad pass.
+**9 repos are published on it, 64 on the Hub.** Re-exported from loom-exporter `1f6d6c2`: the Pocket TTS
+family (the windowed Mimi `ATTENTION`) and the models whose weights ADR-081's pad pass touches materially.
+A header scan picked them (a padded share of 5% or more, or a published int8 file with unaligned weights);
+each was exported and `cmp`'d against the rc18 staging tree, and only those that differ were uploaded:
+`citrinet-256-ls`, `kokoro-82m`, `styletts2-ljspeech`, `wakehubert-tiny` (all four precisions), `sanotts` (heart
+and heart-nano; the other 26 voices are unchanged), `pocket-tts`, and the new **`pocket-tts-18m`, `-7m` and
+`-2m`** (F32 + `Q8_0_PC`, 27 voices each). whisper-small, Moonshine tiny, SenseVoice and the three Vocetta2
+repos re-exported byte-identical. Every card is unchanged. The card gate ran on the RELEASED rc19 wheel: the
+nine cards at F32, plus a swap to each repo's other precisions (seven runs), all passed with rc18's counts;
+sanoTTS heart, which its card does not load, was checked through whisper-small separately. A dry run of all
+64 repos after the upload found the Hub equal to the staging tree, `hf-models-rc19`.
+
+**Not re-exported:** the rest of the zoo, where the pad pass would change under 2% of the weight bytes
+(chatterbox, conformer-ctc-small, soprano, CosyVoice3, ...), and the large models, which barely move
+(MOSS-TTS 0.8%; VoxCPM2, the MOSS codec and Voxtral 0%) and do not export on the dev box. They run as
+published on every runtime; P4.34 below keeps the question of whether any is worth republishing.
 
 **Previous anchor, 2026-10-21 — `1.0.0-rc18` is released and the Hub equals the staging tree.**
 Four packages are on PyPI at `1.0.0rc18` (17/2/2/1 files, as rc17), and the `linux_armv6l` wheel is a
@@ -153,13 +168,9 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   passed there, x-linked-etag = local sha256 `eee92e72...`; no Perth watermark, per Epic-03 §2).
   *Context: [Epic-03](../epics/epic-03-model-coverage.md),
   [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)*
-* [ ] **Pocket-TTS small English models (18m/7m/2m refl, 2026-10): BUILT and STAGED 2026-10-23; open: publish.**
-  The engine and exporter work is merged (loom.cpp #94, loom-exporter #65). The user decided on three repos,
-  `loom-ai-org/pocket-tts-{18m,7m,2m}-loom`, each with F32, Q8_0_PC and its own 27 voices, with `daan` marked "not
-  stated". They are staged in `hf-models/` and card-gated (rc18). loom-py 1.0.0rc19, released 2026-10-24, carries
-  the `PocketTtsVocab` v4 rules the upload waited for (`upload_all.py --only pocket-tts-18m pocket-tts-7m pocket-tts-2m --create`, after a fresh
-  export with `LOOM_POCKET_TTS_REPO` at v4.0.1+). Also open: upstream's default English is now `english_2026-10` (ours
-  is `english_2026-09`), and the v5 gate fixture `pocket_tts.gguf` predates `unigram_scoring`. *Context:
+* [ ] **Pocket-TTS's English release.** Upstream's default English is now `english_2026-10` (ours is
+  `english_2026-09`; the small 18m/7m/2m models, published on rc19, are 2026-10), and the v5 gate fixture
+  `pocket_tts.gguf` predates `unigram_scoring`. *Context:
   [ADR-084](../adrs/adr-084-pocket-ttss-small-models-ship-their-own-head-and-v4s-text-rules-as-data.md),
   [Retro-091](../retros/retro-091-a-literal-fixture-reader-graded-a-different-sentence.md)*
 * [ ] **Pocket-TTS: cloning a voice from a recording.** Published (`pocket-tts-loom`, with 26 voice files under
@@ -244,7 +255,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Exporter / MIL compiler
 
-* [ ] **P4.34: pad weight axes to what the kernels need ([ADR-081](../adrs/adr-081-the-exporter-pads-weight-axes-to-what-the-kernels-need.md), accepted 2026-10-22).** Built: loom-exporter #64 (`pad_axes.py`, default `auto`). Vocetta2 exported with it and published (F32 + Q8_0_PC, three repos): F32 1.10-1.36x on the Pi Zero, 1.09-1.15x on the Pi 4 at one thread. Open: merge #64 (before loom-exporter #63, whose cards assume it); the zoo republish sweep, one model at a time through the republish recipe and a board check (Kokoro, StyleTTS2, sanoTTS heart/heart-nano, WakeHuBERT; Q8: conformer, sanoTTS 0.51m, Moonshine streaming small); the residual-stream v2.
+* [ ] **P4.34: pad weight axes to what the kernels need ([ADR-081](../adrs/adr-081-the-exporter-pads-weight-axes-to-what-the-kernels-need.md), accepted 2026-10-22).** Built: loom-exporter #64 (`pad_axes.py`, default `auto`). Vocetta2 exported with it and published (F32 + Q8_0_PC, three repos): F32 1.10-1.36x on the Pi Zero, 1.09-1.15x on the Pi 4 at one thread. Republished on rc19 where it pads materially: Kokoro, StyleTTS2, sanoTTS heart/heart-nano, WakeHuBERT, Citrinet-256 (the state anchor above). Open: a board check of those padded F32 files against the rc18 ones; whether any sub-2% straggler is worth republishing; the Q8 rule's cases (conformer, sanoTTS 0.51m, Moonshine streaming small) once they publish an int8 file; the residual-stream v2.
 * [ ] **A shape read as DATA aborts in the engine.** (Nemotron ASR met it too, 2026-10-10: `(n - 1) - arange(2n - 1)` put a 4-wide `n - 1` into a SUB; spelled `-arange(1 - n, n)` instead.) `length / waveform.shape[1]` (or `lengths *
   x.shape[-1]`, speechbrain's relative-length masks) traces to `SHAPE` -> `GET_ROWS` -> arithmetic. The
   engine's `SHAPE` is a four-element `ne` vector and `GET_ROWS` on a 1-D tensor returns it whole, so the
@@ -380,8 +391,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   shipped: decide its status. *Context:
   [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md#the-a72-kernel-built-2026-10-22-p437),
   [ADR-082](../adrs/adr-082-an-outer-product-f32-gemm-under-an-l2-blocked-schedule-for-the-a72.md)*
-* [ ] **P4.41's leftovers: Pocket-TTS's Mimi decoder on the Pi Zero; the three small models' windowed re-export
-  is what gets published (below).** Shipped: 2m 1.93x (RTF 3.9 -> 2.0), 7m 1.99x from the windowed `ATTENTION` ([ADR-085](../adrs/adr-085-a-windowed-attention-computes-only-its-band.md)),
+* [ ] **P4.41's leftovers: Pocket-TTS's Mimi decoder on the Pi Zero.** Shipped (published on rc19): 2m 1.93x (RTF 3.9 -> 2.0), 7m 1.99x from the windowed `ATTENTION` ([ADR-085](../adrs/adr-085-a-windowed-attention-computes-only-its-band.md)),
   `ggml-0050` (`PAD`/`CONCAT` rows), `ggml-0051` (ARMv6 binary rows without divides), `ggml-0052` (ARMv6 `ELU`).
   Left, in order of size: the flow LM's per-node cost (~4.3 s profiled, ~51k node runs a call); int8 for Mimi's
   linears; the dense `ATTENTION`'s Q is a strided view, so on ARMv6 its `Q @ K^T` takes ggml's per-element dot
