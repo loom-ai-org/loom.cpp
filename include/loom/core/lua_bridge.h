@@ -258,6 +258,7 @@ private:
     // "layer_input"/"h_prev"/"c_prev" inputs, and BOTH "h_new" and "c_new" as declared outputs, in that
     // order. It took two module names until the topology gained its second output -- one call for each
     // half of a step whose node lists were identical, so the gate stack was computed twice per timestep.
+    // A GRU cell is the other shape: "layer_input"/"h_prev" in and "h_new" alone out (its state is h).
     // `reverse=true` walks timesteps backward (seq_len-1 down to 0), writing each result
     // to its own real time index in the (still forward-ordered) output -- the same convention
     // BiLstmStepper::run uses for its own backward pass. Returns (output_flat, shape) where output_flat
