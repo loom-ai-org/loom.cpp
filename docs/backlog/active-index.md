@@ -150,7 +150,8 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 * [ ] **Text door: contractions are split before the lexicon lookup.** orthography2ipa tokenizes
   "doesn't" as `doesn` + `t`, so a lexicon's `doesn't` entry is never read and the `t` is spelled as
   a letter; 5 of the 30 LibriSpeech door sentences have one. Every lexicon-backed card is affected
-  (sanoTTS, Vocetta2, VITS, Vaniq-Edge, AuroraTTS). Found 2026-10-25. *Context:
+  (sanoTTS, Vocetta2, VITS, Vaniq-Edge, AuroraTTS). Found 2026-10-25; reported upstream as
+  [TigreGotico/orthography2ipa#1721](https://github.com/TigreGotico/orthography2ipa/issues/1721). *Context:
   [Epic-03](../epics/epic-03-model-coverage.md#vaniq-edge-and-auroratts-100k-two-more-small-english-voices),
   [ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md)*
 * [ ] **Vaniq-Edge and AuroraTTS-100K: publish** (built 2026-10-25, F32 + `Q8_0_PC` each,
