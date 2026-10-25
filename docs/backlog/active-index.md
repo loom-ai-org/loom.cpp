@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-10-24
+last_updated: 2026-10-25
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -147,6 +147,18 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Models
 
+* [ ] **Text door: contractions are split before the lexicon lookup.** orthography2ipa tokenizes
+  "doesn't" as `doesn` + `t`, so a lexicon's `doesn't` entry is never read and the `t` is spelled as
+  a letter; 5 of the 30 LibriSpeech door sentences have one. Every lexicon-backed card is affected
+  (sanoTTS, Vocetta2, VITS, Vaniq-Edge, AuroraTTS). Found 2026-10-25. *Context:
+  [Epic-03](../epics/epic-03-model-coverage.md#vaniq-edge-and-auroratts-100k-two-more-small-english-voices),
+  [ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md)*
+* [ ] **Vaniq-Edge and AuroraTTS-100K: publish** (built 2026-10-25, F32 + `Q8_0_PC` each,
+  `vaniq-edge-loom` and `auroratts-100k-loom`). Vaniq-Edge runs on the released 1.0.0-rc19; AuroraTTS
+  needs the engine's GRU cells ([ADR-087](../adrs/adr-087-a-recurrent-cell-declares-the-state-it-carries.md))
+  and loom-py's `arpabet` fold ([ADR-088](../adrs/adr-088-arpabet-is-a-phoneme-style-the-door-folds-to.md)),
+  so it uploads only after the release that carries them. *Context:
+  [Epic-03](../epics/epic-03-model-coverage.md#vaniq-edge-and-auroratts-100k-two-more-small-english-voices)*
 * [ ] **Moonshine base**: the same leaf as tiny (`moonshine_v1_export.py`), on disk at `~/Dev/models/moonshine-base`, not exported
   or measured. *Context: [Epic-03](../epics/epic-03-model-coverage.md#family-2s-third-leaf-moonshine-v1-tiny)*
 * [ ] **MOSS-TTS + MOSS-Audio-Tokenizer: three open pieces.** Both are published
