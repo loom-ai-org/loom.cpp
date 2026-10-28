@@ -2028,3 +2028,10 @@ if(LOOM_GGML_VC4)
     set_tests_properties(test_vc4_backend_cpu_only PROPERTIES LABELS ci)
 endif()
 
+# P4.44: a host-memory primary (ggml-vc4, BLAS) lowers ops as its CPU fallback would. ggml's private
+# backend header for the fake device it builds; safe because cmake/GgmlPin.cmake pins ggml.
+add_executable(test_host_primary_lowering ci/test_host_primary_lowering.cpp)
+target_link_libraries(test_host_primary_lowering PRIVATE loom::engine)
+target_include_directories(test_host_primary_lowering PRIVATE ${ggml_SOURCE_DIR}/src)
+add_test(NAME test_host_primary_lowering COMMAND test_host_primary_lowering)
+set_tests_properties(test_host_primary_lowering PROPERTIES LABELS ci)

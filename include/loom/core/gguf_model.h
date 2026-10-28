@@ -149,6 +149,9 @@ private:
         ggml_tensor* plain = nullptr; // the plain copy, once a consumer needed one
     };
     ggml_tensor* plain_copy(ggml_tensor* w);
+    // The CPU backend whose extra buffer types hold `repacked_`: the primary, or the CPU fallback beside
+    // a host-memory primary (P4.44). Null when nothing may be repacked.
+    ggml_backend_t repack_backend_ = nullptr;
     std::string path_;
     ggml_backend_buffer_ptr repack_buf_;
     std::unordered_map<const ggml_tensor*, Repacked> repacked_;
