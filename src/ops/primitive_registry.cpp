@@ -17,7 +17,15 @@ bool backend_can_run(const PrimitiveContext& pc, const ggml_tensor* node) {
     // The PRIMARY backend specifically, not "any of them". The CPU fallback can run everything by
     // construction, so asking it would always say yes and the question exists precisely to avoid being
     // sent there.
-    return ggml_backend_supports_op(pc.backends.primary, node);
+    if (ggml_backend_supports_op(pc.backends.primary, node)) return true;
+    // ...UNLESS THE PRIMARY'S TENSORS ARE HOST MEMORY (P4.44). Such a primary -- ggml-vc4 on a Pi Zero,
+    // BLAS -- is an accelerator BESIDE the CPU, which runs nearly every node of the graph on the same
+    // memory with no copy, so being sent there is what normally happens rather than what this function
+    // exists to avoid. Answering for the primary alone gave those graphs the lowerings composed for a
+    // GPU, which the CPU then ran: on the Pi Zero VITS Q8_0_PC's folded convolutions became im2col +
+    // mul_mat (19.7 s -> 112 s, the QPUs taking none of it), and ATAN lost libm for the polynomial.
+    const bool host_primary = ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(pc.backends.primary));
+    return host_primary && pc.backends.fallback != nullptr && ggml_backend_supports_op(pc.backends.fallback, node);
 }
 
 bool is_materialized(const ggml_tensor* t) {

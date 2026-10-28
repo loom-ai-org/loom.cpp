@@ -278,18 +278,25 @@ std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, Backends bac
         }
     }
 
-    // Extra-buffer placement (route_repacked_uses has the why). Only on a plain CPU primary: a hybrid
-    // build goes through the scheduler, which plans its copies from each weight's buffer and would
-    // have to read a repacked one back.
+    // Extra-buffer placement (route_repacked_uses has the why). These are the CPU's buffer types, so
+    // only where the CPU is what reads those weights: a plain CPU primary, or the CPU fallback beside a
+    // primary whose tensors are host memory (P4.44: ggml-vc4 on a Pi Zero, where "auto" made every
+    // Q8_0_PC model lose CPU_ARMV6_I8). Such a primary cannot claim a repacked weight -- the buffer type
+    // is not host memory, so its supports_buft says no -- and the scheduler gives those nodes to the CPU.
+    // A primary with its own memory gets none: the scheduler plans its copies from each weight's
+    // buffer and would have to read a repacked one back.
     model->path_ = path;
+    ggml_backend_t repack_backend = !backends.hybrid() ? backend
+                                    : ggml_backend_buft_is_host(buft) ? backends.fallback : nullptr;
+    model->repack_backend_ = repack_backend;
     std::vector<ggml_tensor*> to_repack;
-    ggml_backend_buffer_type_t repack_buft = backends.hybrid() ? nullptr : requested_extra_buffer_type(backend);
+    ggml_backend_buffer_type_t repack_buft = repack_backend == nullptr ? nullptr : requested_extra_buffer_type(repack_backend);
     std::unordered_set<std::string> per_channel;
-    if (repack_buft == nullptr && !backends.hybrid()) {
-        repack_buft = per_channel_buffer_type(backend, model->gguf_ctx_.get(), model->meta_ctx_.get(), per_channel);
+    if (repack_buft == nullptr && repack_backend != nullptr) {
+        repack_buft = per_channel_buffer_type(repack_backend, model->gguf_ctx_.get(), model->meta_ctx_.get(), per_channel);
     }
     if (repack_buft != nullptr) {
-        to_repack = extra_buffer_candidates(model->meta_ctx_.get(), backend, repack_buft);
+        to_repack = extra_buffer_candidates(model->meta_ctx_.get(), repack_backend, repack_buft);
         if (!per_channel.empty()) {
             to_repack.erase(std::remove_if(to_repack.begin(), to_repack.end(),
                                            [&](ggml_tensor* t) { return per_channel.count(ggml_get_name(t)) == 0; }),
@@ -678,7 +685,7 @@ void GgufModel::route_repacked_uses(ggml_cgraph* gf) {
                                    ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_GET_ROWS) && act != nullptr &&
                                     act->ne[3] == 1 && (t->op != GGML_OP_MUL_MAT || act->nb[0] == sizeof(float)));
             const bool served = j == 0 && layout_ok &&
-                                ggml_backend_dev_supports_op(ggml_backend_get_device(backend_), t);
+                                ggml_backend_dev_supports_op(ggml_backend_get_device(repack_backend_), t);
             if (!served) {
                 if (repacked_.at(s).plain == nullptr) {
                     std::fprintf(stderr, "loom: plain copy of '%s' for %s\n", ggml_get_name(s), ggml_op_desc(t));
