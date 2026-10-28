@@ -92,11 +92,16 @@ end to end it is a wash: its Mimi convolutions dominate and stay on the CPU.
   QPUs took and declined.
 * A QPU program that does not finish leaves the QPUs stuck, and `qpu_enable(0)` then wedges the
   firmware; the backend aborts after 2 s and says a reboot is needed rather than attempt recovery.
-  Every kernel loop is bounded.
+  Every kernel loop is bounded. A soft reboot is not enough: with the QPUs stuck the board did not
+  come back from `systemctl reboot` (2026-10-28), so it takes a power cycle.
 * Decisions 6 and 7 also change BLAS-primary runs (macOS base wheel, `"auto"`): a quantized folded
-  convolution now takes the CPU's direct packed sweep instead of im2col + a BLAS GEMM. That sweep is
-  the measured faster path on the CPU (P4.29); against Accelerate it is unmeasured -- an M1 A/B is
-  owed before this ships.
+  convolution now takes the CPU's direct packed sweep instead of im2col + a BLAS GEMM. Measured on an
+  M1 Pro (2026-10-28, BLAS without Metal, main d063024 against this branch, ABBA, median of 10, 40
+  phonemes): VITS Q4_0 under `"auto"` 104-106 ms -> 42.4-43.7 ms (2.45x), and main's `"auto"` had
+  synthesised a different utterance -- 55 808 samples where the CPU gives 56 320 -- which this branch
+  does not (56 320). VITS F32 under `"auto"` 45.8 -> 46.5 ms with identical output (no folded kernels
+  there), and both models under `cpu` identical in output and time. Decision 6 places nothing on an
+  M1: no per-channel int8 buffer type is registered on a core with DOTPROD.
 * QPU float rounding is not IEEE (no denormals), so the board gate compares with a tolerance; the
   emulator tests are bit-exact against an fmul-then-fadd reference.
 * Tests: `test_vc4_qpu_isa` (encoder against a dump cross-checked with py-videocore's assembler),
