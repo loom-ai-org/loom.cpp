@@ -2005,13 +2005,14 @@ set_tests_properties(test_fft_ops PROPERTIES LABELS ci)
 # the hazards the reference guide warns about, so they are hermetic and run everywhere, whatever
 # LOOM_GGML_VC4 says: the encoder against a golden dump cross-checked with py-videocore, and both
 # GEMM kernels bit for bit against an fmul-then-fadd reference, each with a legal-but-wrong sabotage
-# that must fail. Header-only, so no ggml and no engine.
+# that must fail. Header-only, so no ggml and no engine. P4.45 adds the 1-D convolution and the
+# per-channel int8 GEMM (r4's byte unpack modelled as measured on the board).
 set(LOOM_VC4_DIR ${PROJECT_SOURCE_DIR}/backends/ggml-vc4)
 add_executable(test_vc4_qpu_isa ci/test_vc4_qpu_isa.cpp)
 target_include_directories(test_vc4_qpu_isa PRIVATE ${LOOM_VC4_DIR})
 add_test(NAME test_vc4_qpu_isa COMMAND test_vc4_qpu_isa ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/vc4_qpu_golden.hex)
 set_tests_properties(test_vc4_qpu_isa PROPERTIES LABELS ci)
-foreach(t test_vc4_gemm_emu test_vc4_gemm_wt_emu)
+foreach(t test_vc4_gemm_emu test_vc4_gemm_wt_emu test_vc4_conv1d_emu test_vc4_gemm_q8_emu)
     add_executable(${t} ci/${t}.cpp)
     target_include_directories(${t} PRIVATE ${LOOM_VC4_DIR})
     add_test(NAME ${t} COMMAND ${t})
