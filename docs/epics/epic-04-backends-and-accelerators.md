@@ -1321,7 +1321,9 @@ the same audio (1.0e-5); Qwen3-0.6B Q8_0_PC 509 s against 4.18 s for 24 tokens, 
 F32 does not fit (2.38 GB of weights, 1.99 GB device). V3D peaks at 32 GFLOPS, a third of four A72s.
 
 **Verified:** on V3D the 30 ops VITS uses and Qwen3's op set pass test-backend-ops, and both models'
-outputs match the CPU; open there, on neither model's path: `ARGSORT` from 1 023 columns, `GATED_DELTA_NET`'s
-fused L2_NORM (precision), `MUL_MAT_ID` Q8_0 (7 of 80). On an AMD Vega 3 (RADV, 1024 invocations) every
+outputs match the CPU. The every-op sweep found SSM_CONV wrong in all 45 cases -- its workgroup has two
+spec-sized dimensions and the fitter skipped it -- now fixed; open there, on neither model's path:
+`ARGSORT` from 1 023 columns, `GATED_DELTA_NET`'s fused L2_NORM (precision), and 36 `MUL_MAT_ID` cases at
+n = 129 over tolerance (ADR-087 lists them). On an AMD Vega 3 (RADV, 1024 invocations) every
 op passes, 17 490 cases, and the device-parity gates run on it, so nothing changes where 512 fits. A
 conv2d tile for V3D was measured out ([Retro-094](../retros/retro-094-a-speedup-measured-against-a-run-with-different-output.md)).
