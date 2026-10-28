@@ -1,0 +1,19 @@
+diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
+--- a/src/ggml-backend.cpp
++++ b/src/ggml-backend.cpp
+@@ -1104,10 +1104,13 @@
+             if (src == NULL) {
+                 continue;
+             }
+-            if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++            // A view of a weight is a weight: until the allocator initialises it, a view has no
++            // buffer of its own, only its view_src does -- and a reshaped or sliced kernel is a view.
++            const struct ggml_tensor * wsrc = src->view_src ? src->view_src : src;
++            if (wsrc->buffer != NULL && wsrc->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+                 // check if a backend with higher prio wants to offload the op
+-                if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
++                if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(wsrc->buffer)) {
+                     for (int b = 0; b < src_backend_id; b++) {
+                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                             SET_CAUSE(tensor, "1.off");
