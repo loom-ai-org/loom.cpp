@@ -1,18 +1,19 @@
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index fe1621c4..b6e37128 100644
+index fe1621c4..9d874d53 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -503,6 +503,116 @@ static bool ggml_vk_strip_decode_vector(const uint32_t * code, size_t word_count
+@@ -503,6 +503,140 @@ static bool ggml_vk_strip_decode_vector(const uint32_t * code, size_t word_count
      return true;
  }
  
 +// The workgroup a shader whose default is `size` along dimension `dim` actually runs with on `device`:
-+// `size` when the device allows it, else the largest power of two it does. ggml_vk_fit_workgroup_size
-+// applies this to pipelines; a dispatch that counts WORKGROUPS rather than invocations (SET_ROWS)
-+// must use it too.
-+static uint32_t ggml_vk_fitted_workgroup(const vk_device & device, uint32_t size, int dim = 0) {
-+    const uint32_t limit = std::min(device->properties.limits.maxComputeWorkGroupInvocations,
-+                                    device->properties.limits.maxComputeWorkGroupSize[dim]);
++// `size` when the device allows it, else the largest power of two it does. `budget` is what the
++// workgroup's other dimensions leave of the invocation limit. ggml_vk_fit_workgroup_size applies this
++// to pipelines; a dispatch that counts WORKGROUPS rather than invocations (SET_ROWS) must use it too.
++static uint32_t ggml_vk_fitted_workgroup(const vk_device & device, uint32_t size, int dim = 0,
++                                         uint32_t budget = UINT32_MAX) {
++    const uint32_t limit = std::min({device->properties.limits.maxComputeWorkGroupInvocations,
++                                     device->properties.limits.maxComputeWorkGroupSize[dim], budget});
 +    if (size <= limit) {
 +        return size;
 +    }
@@ -28,14 +29,18 @@ index fe1621c4..b6e37128 100644
 +// 512). Exceeding maxComputeWorkGroupInvocations is invalid usage, and Mesa's V3DV compiles such a
 +// pipeline without complaint and computes garbage, so this is a correctness fix rather than tuning.
 +//
-+// It reads the SPIR-V instead of trusting each call site: the one dimension whose size is a spec
-+// constant, its SpecId and default come from the module, the value in effect is the caller's or that
-+// default, and a value over the limit is fitted. That dimension's dispatch denominator follows by the
-+// same factor when it is a multiple of the old size -- one element per invocation (512 -> 256) or two
-+// (1024 -> 512) -- and is left alone otherwise (one workgroup per row, which the shaders reduce over
-+// with a stride of the workgroup size). Spec constants the caller did not pass, up to the workgroup's
-+// id, are filled with the module's own defaults so nothing else changes. A device that allows 1024
-+// invocations -- the most any ggml shader asks for -- returns at once.
++// It reads the SPIR-V instead of trusting each call site: the dimensions whose sizes are spec
++// constants, their SpecIds and defaults come from the module, the value in effect is the caller's or
++// that default, and a workgroup over the limit is fitted -- the outer dimensions first, so x, the one
++// memory is contiguous along, keeps its width (ssm_conv's 32x16 runs as 32x8; it was the one shader
++// with two, and a fitter that handled only one skipped it silently, leaving 512 invocations and wrong
++// results). A literal dimension cannot be refitted but counts against the limit, and a workgroup still
++// over it is reported rather than left to the driver. A fitted dimension's dispatch denominator follows
++// by the same factor when it is a multiple of the old size -- one element per invocation (512 -> 256)
++// or two (1024 -> 512) -- and is left alone otherwise (one workgroup per row, which the shaders reduce
++// over with a stride of the workgroup size). Spec constants the caller did not pass, up to the
++// workgroup's highest id, are filled with the module's own defaults so nothing else changes. A device
++// that allows 1024 invocations -- the most any ggml shader asks for -- returns at once.
 +static void ggml_vk_fit_workgroup_size(const vk_device & device, const std::string & name, const uint32_t * code,
 +                                       size_t word_count, std::array<uint32_t, 3> & wg_denoms,
 +                                       std::vector<uint32_t> & spec) {
@@ -72,54 +77,73 @@ index fe1621c4..b6e37128 100644
 +        }
 +        i += wc;
 +    }
-+    // Exactly one dimension a spec constant, the other two literal 1s.
-+    int dim = -1;
++    // Each dimension's size in effect: a spec constant's (the caller's value, else the module's
++    // default) or a literal, which cannot be refitted but counts against the limit.
++    std::array<bool, 3> is_spec = {false, false, false};
++    std::array<uint32_t, 3> size = literal;
++    uint32_t max_id = 0;
 +    for (int d = 0; d < 3; d++) {
-+        if (wg_ids[d] != 0 && spec_id.count(wg_ids[d])) {
-+            if (dim >= 0) {
-+                return;
-+            }
-+            dim = d;
-+        } else if (wg_ids[d] != 0 && (!value.count(wg_ids[d]) || value[wg_ids[d]] != 1)) {
++        if (wg_ids[d] == 0) {
++            continue;
++        }
++        if (!value.count(wg_ids[d])) {
 +            return;
 +        }
-+    }
-+    if (dim < 0) {
-+        // A literal size cannot be refitted; say so instead of letting the driver compute garbage.
-+        if (literal[0] * std::max(literal[1], 1u) * std::max(literal[2], 1u) > limit) {
-+            GGML_LOG_WARN("ggml_vulkan: %s needs %ux%ux%u invocations, the device allows %u\n", name.c_str(),
-+                          literal[0], literal[1], literal[2], limit);
++        size[d] = value[wg_ids[d]];
++        if (spec_id.count(wg_ids[d])) {
++            const uint32_t id = spec_id[wg_ids[d]];
++            is_spec[d] = true;
++            if (id < spec.size()) {
++                size[d] = spec[id];
++            }
++            max_id = std::max(max_id, id);
 +        }
++    }
++    for (int d = 0; d < 3; d++) {
++        size[d] = std::max(size[d], 1u);
++    }
++    std::array<uint32_t, 3> fitted = size;
++    for (int d = 2; d >= 0; d--) {
++        if (is_spec[d]) {
++            fitted[d] = ggml_vk_fitted_workgroup(device, size[d], d, limit / (fitted[(d + 1) % 3] * fitted[(d + 2) % 3]));
++        }
++    }
++    if (fitted[0] * fitted[1] * fitted[2] > limit) {
++        // Its literal dimensions alone exceed the limit; say so instead of letting the driver compute garbage.
++        GGML_LOG_WARN("ggml_vulkan: %s needs %ux%ux%u invocations, the device allows %u\n", name.c_str(),
++                      size[0], size[1], size[2], limit);
 +        return;
 +    }
-+    const uint32_t id = spec_id[wg_ids[dim]];
-+    const uint32_t current = id < spec.size() ? spec[id] : value[wg_ids[dim]];
-+    const uint32_t fitted = ggml_vk_fitted_workgroup(device, current, dim);
-+    if (fitted == current) {
++    if (fitted == size) {
 +        return;
 +    }
-+    if (spec.size() <= id) {
++    if (spec.size() <= max_id) {
 +        std::unordered_map<uint32_t, uint32_t> default_of;  // SpecId -> default
 +        for (const auto & [result, sid] : spec_id) {
 +            if (value.count(result)) {
 +                default_of[sid] = value[result];
 +            }
 +        }
-+        for (uint32_t k = (uint32_t) spec.size(); k <= id; k++) {
++        for (uint32_t k = (uint32_t) spec.size(); k <= max_id; k++) {
 +            spec.push_back(default_of.count(k) ? default_of[k] : 0);
 +        }
 +    }
-+    spec[id] = fitted;
-+    if (wg_denoms[dim] >= current && wg_denoms[dim] % current == 0) {
-+        wg_denoms[dim] = wg_denoms[dim] / current * fitted;
++    for (int d = 0; d < 3; d++) {
++        if (fitted[d] == size[d]) {
++            continue;
++        }
++        spec[spec_id[wg_ids[d]]] = fitted[d];
++        if (wg_denoms[d] >= size[d] && wg_denoms[d] % size[d] == 0) {
++            wg_denoms[d] = wg_denoms[d] / size[d] * fitted[d];
++        }
++        VK_LOG_DEBUG("ggml_vk_fit_workgroup_size(" << name << ", dim " << d << "): " << size[d] << " -> " << fitted[d] << " (limit " << limit << ")");
 +    }
-+    VK_LOG_DEBUG("ggml_vk_fit_workgroup_size(" << name << "): " << current << " -> " << fitted << " (limit " << limit << ")");
 +}
 +
  static bool ggml_vk_roll_bk_loop(const uint32_t * code, size_t word_count, std::vector<uint32_t> & out) {
      if (word_count < 5) {
          return false;
-@@ -1998,7 +2108,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -1998,7 +2132,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                  pipeline->name = name;
                  pipeline->parameter_count = parameter_count;
                  pipeline->push_constant_size = push_constant_size;
@@ -134,7 +158,7 @@ index fe1621c4..b6e37128 100644
                  pipeline->align = align;
                  pipeline->initialized = true;
  #if defined(VK_EXT_shader_64bit_indexing)
-@@ -2021,13 +2137,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -2021,13 +2161,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
  
              if (!pipeline->compile_pending) {
                  pipeline->compile_pending = true;
@@ -155,7 +179,7 @@ index fe1621c4..b6e37128 100644
                  claimed_task.disable_robustness = disable_robustness;
                  claimed_task.require_full_subgroups = require_full_subgroups;
                  claimed_task.required_subgroup_size = required_subgroup_size;
-@@ -5250,12 +5371,43 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher() {
+@@ -5250,12 +5395,43 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher() {
      return ggml_vk_default_dispatcher_instance;
  }
  
@@ -199,7 +223,7 @@ index fe1621c4..b6e37128 100644
      // See https://github.com/KhronosGroup/Vulkan-Hpp?tab=readme-ov-file#extensions--per-device-function-pointers-
      ggml_vk_default_dispatcher_instance.init(vkGetInstanceProcAddr);
  
-@@ -5374,6 +5526,11 @@ void ggml_vk_instance_init() {
+@@ -5374,6 +5550,11 @@ void ggml_vk_instance_init() {
              new_driver.pNext = &new_id;
              devices[i].getProperties2(&new_props);
  
@@ -211,7 +235,7 @@ index fe1621c4..b6e37128 100644
              if ((new_props.properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu || new_props.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu) && ggml_vk_device_is_supported(devices[i])) {
                  // Check if there are two physical devices corresponding to the same GPU
                  // This handles the case where the same GPU appears with different drivers (e.g., RADV + AMDVLK on Linux),
-@@ -5468,7 +5625,8 @@ void ggml_vk_instance_init() {
+@@ -5468,7 +5649,8 @@ void ggml_vk_instance_init() {
          // If only CPU devices are available, return without devices.
          if (vk_instance.device_indices.empty()) {
              for (size_t i = 0; i < devices.size(); i++) {
@@ -221,7 +245,7 @@ index fe1621c4..b6e37128 100644
                      vk_instance.device_indices.push_back(i);
                      break;
                  }
-@@ -9759,8 +9917,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+@@ -9759,8 +9941,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                  // quants run 32 threads each doing QUANT_K elements
                  ne = CEIL_DIV(ne, 32 * ggml_blck_size(dst->type));
              } else {

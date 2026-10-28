@@ -2099,10 +2099,14 @@ produced a wrong number of samples (CONV_2D_DW). Separately, Mesa's V3D compiler
 **Change.** (1) Each of the thirty-two declares its size as a specialization constant WITH the old
 literal as the default -- `layout(local_size_x = 512, local_size_x_id = N)`, because a bare
 `local_size_x_id` defaults to 1 in glslang -- and the BLOCK_SIZE shaders read `gl_WorkGroupSize.x`. (2)
-`ggml_vk_fit_workgroup_size` reads the spec-sized dimension, its SpecId and default from the SPIR-V
-and, only when the value in effect exceeds the device limit, specializes it to the largest power of
-two that fits, scales that dimension's dispatch denominator by the same factor when it is a multiple of
-the old size, and pads unpassed spec constants with the module's own defaults. The denominators are
+`ggml_vk_fit_workgroup_size` reads the spec-sized dimensions, their SpecIds and defaults from the
+SPIR-V and, only when the workgroup in effect exceeds the device limit, specializes them to the largest
+powers of two that fit -- the outer dimensions first, so x keeps its width (`ssm_conv`'s 32x16 becomes
+32x8) -- scales each fitted dimension's dispatch denominator by the same factor when it is a multiple
+of the old size, and pads unpassed spec constants with the module's own defaults. Literal dimensions
+count against the limit, and a workgroup still over it is logged, never skipped silently: a first
+version that fitted only one-dimensional workgroups passed over `ssm_conv`, and SSM_CONV failed all 45
+cases on V3D. The denominators are
 fitted when the pipeline is first initialised, not at compile time: `ggml_vk_fill` sizes its grid from
 them before it requests the pipeline. A device allowing 1024 invocations returns at once. (3) SET_ROWS, whose dispatch
 counts workgroups rather than invocations, uses the same rule (`ggml_vk_fitted_workgroup`). (4)
@@ -2114,7 +2118,10 @@ the loader loads Mesa. (5) V3DV is left out of the default device list (see belo
 Vega 3: every op test-backend-ops has, 17 490 cases, 0 failures). The fit itself was checked by forcing it
 on that GPU (limit pretended 256): 17 032 of 17 102 pass, and the 70 are ARGSORT and SOLVE_TRI, which size
 their own blocks from the real limit and so are never fitted on a device that needs it. On V3D: 30 ops VITS and Qwen3 use pass, VITS
-matches the CPU to 1e-5 and Qwen3-0.6B Q8_0 produces the CPU's tokens.
+matches the CPU to 1e-5 and Qwen3-0.6B Q8_0 produces the CPU's tokens; every op of the converted shaders
+and SSM_CONV passes (57 ops), and an every-op sweep fails only ARGSORT's large path, GATED_DELTA_NET's
+fused L2_NORM (precision) and 36 `MUL_MAT_ID` cases at n = 129, which also pass on RADV with the fit
+forced, so they are V3D's, not the fit's.
 
 **Why V3DV is not offered by default.** It is correct and far slower than the CPU it shares memory with:
 on a Pi 4, VITS 64.9 s against 0.836 s, Qwen3-0.6B Q8_0 509 s against 4.2 s for 24 tokens; its peak (32

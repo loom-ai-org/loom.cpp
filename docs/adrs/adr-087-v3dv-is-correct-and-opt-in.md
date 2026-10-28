@@ -37,8 +37,8 @@ loom ranks a device with its own buffer type (rank 0) above the CPU, so a workin
 
 1. **Make V3DV correct** (`ggml-0055`): the thirty-two shaders' workgroup size becomes a
    specialization constant whose default is the old literal, and one function fits it to the device
-   when the pipeline is initialised, reading the SpecId and default from the SPIR-V and scaling the
-   dispatch denominator with it.
+   when the pipeline is initialised, reading the SpecIds and defaults from the SPIR-V, fitting every
+   spec-sized dimension (outer ones first) and scaling the dispatch denominators with them.
    No device that allows 512 invocations sees a change. `V3D_DEBUG=noloopunroll` for Mesa's compiler.
 2. **Leave V3DV out of ggml-vulkan's default device list**, beside the existing "unsupported" and
    "CPU-type" exclusions; `GGML_VK_VISIBLE_DEVICES` opts in. On a Pi 4, `"auto"` is then the CPU and
@@ -67,8 +67,19 @@ loom ranks a device with its own buffer type (rank 0) above the CPU, so a workin
   dispatch may read `wg_denoms` before requesting the pipeline (FILL), so they are fitted at
   initialisation. Forcing the fit on a GPU that does not need it (RADV, limit pretended 256, scratch)
   is what separated these from V3D's own failures.
+* A fitter that skips what it does not handle hides it: the first version fitted only one-dimensional
+  workgroups and passed over `ssm_conv`'s 32x16 without a word, so SSM_CONV failed all 45 cases on V3D
+  until the every-op sweep found it. Every spec-sized dimension is fitted now (32x8), and a workgroup
+  still over the limit is logged.
 * Unchanged where 512 fits: on an AMD Vega 3 (RADV) every op passes, 17 490 cases, and the
   device-parity gates run 2 069 nodes on it with no fallback.
-* Open on V3D, none on the VITS or Qwen3 path: `ARGSORT` from 1 023 columns (its large path), the fused
-  L2_NORM inside `GATED_DELTA_NET` (1.9e-6 against a 1e-7 tolerance), and `MUL_MAT_ID` Q8_0 in 7 of 80
-  cases (7e-4 against 5e-4).
+* Open on V3D, from the every-op sweep (Pi 4, 2026-10-28), none on the VITS or Qwen3 path:
+  * `ARGSORT` from 1 023 columns, its large path: 60 of 98 cases.
+  * The fused L2_NORM inside `GATED_DELTA_NET`: 2 of 36, 1.9e-6 against a 1e-7 tolerance.
+  * `MUL_MAT_ID` over tolerance in 36 cases, every one at n = 129 (m = 512, k = 256) and of a
+    32-element block type: q2_0 7, q4_0 8, q8_0 4, mxfp4 9, nvfp4 8 of 12 each, NMSE 5.6e-4 to 4.3e-3
+    against 5e-4. Every other shape passes, as do f32, f16, q1_0, q4_1, q4_K and iq2_xxs at n = 129,
+    and the same cases pass on RADV with the fit forced -- so it is V3D's arithmetic or Mesa's, not the
+    workgroup fit.
+  * Not covered: `MUL_MAT` (255 cases, none failing) and `MUL_MAT_ID` (887 passing) hit the sweep's
+    30-minute limit per op before their last cases.
