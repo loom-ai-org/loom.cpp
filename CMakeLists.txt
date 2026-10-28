@@ -14,6 +14,19 @@ option(LOOM_BUILD_TOOLS "Build the CLI/demo tools" ON)
 
 include(cmake/Dependencies.cmake)
 
+# The Pi Zero / Pi 1-3 QPUs as an accelerator beside the CPU (P4.44, ADR-088). ON by default where
+# such a board can be: 32-bit ARM Linux, the only userland its mailbox route exists in. Elsewhere it
+# builds (CI turns it on to compile it) and reports no device.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 4 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
+    set(LOOM_GGML_VC4_DEFAULT ON)
+else()
+    set(LOOM_GGML_VC4_DEFAULT OFF)
+endif()
+option(LOOM_GGML_VC4 "Build ggml-vc4, the VideoCore IV QPU backend (Pi Zero / Pi 1-3)" ${LOOM_GGML_VC4_DEFAULT})
+if(LOOM_GGML_VC4)
+    add_subdirectory(backends/ggml-vc4)
+endif()
+
 add_library(loom_engine
     src/core/backend.cpp
     src/core/gguf_model.cpp
@@ -79,6 +92,13 @@ target_link_libraries(loom_engine PUBLIC ggml nlohmann_json::nlohmann_json luaji
 # consumer of loom::engine sees none of them. Affordable only because cmake/GgmlPin.cmake pins ggml to
 # an exact revision; see that file's own comment in profile.cpp.
 target_include_directories(loom_engine PRIVATE $<BUILD_INTERFACE:${ggml_SOURCE_DIR}/src>)
+
+# ggml's registry registers only its own backends, so loom does it for ggml-vc4: by calling its reg
+# function when it is linked in, by loading libggml-vc4.so from the backend search path when it is a
+# GGML_BACKEND_DL module (src/core/backend.cpp, ensure_backends_loaded).
+if(LOOM_GGML_VC4 AND NOT GGML_BACKEND_DL)
+    target_compile_definitions(loom_engine PRIVATE LOOM_GGML_VC4_LINKED=1)
+endif()
 
 if(LOOM_BUILD_TOOLS)
     add_subdirectory(tools/loom_cli)

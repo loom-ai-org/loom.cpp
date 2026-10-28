@@ -61,14 +61,56 @@ bool& default_swept() {
 // on the registration pointer -- ggml_backend_registry::register_backend returns early for a reg it
 // already holds, and dlopen hands back the same handle for a path already open, so a directory swept
 // twice registers nothing twice.
+//
+// THE BACKENDS THIS REPO BUILDS ITSELF ARE NOT IN THAT SWEEP. ggml_backend_load_all[_from_path] tries
+// a fixed list of ggml's own names (`blas` ... `cpu`), so a libggml-vc4.so beside libggml-cpu.so is
+// never opened, and in a linked build nothing calls its reg function -- ggml's registry constructor
+// has an `#ifdef` per backend of its own and none for anyone else's. So each one is loaded here the
+// same two ways: by path from every directory ggml sweeps (a host's, then the executable's and the
+// current one, ggml's defaults), or registered directly when it is linked in (P4.44).
+#ifdef LOOM_GGML_VC4_LINKED
+extern "C" ggml_backend_reg_t ggml_backend_vc4_reg(void);
+#endif
+
+void load_loom_backends_from(const std::string& dir) {
+#if defined(GGML_BACKEND_DL) && defined(__linux__)
+    // A file that is not there is skipped silently rather than handed to ggml_backend_load, which
+    // logs an error for every path it cannot open -- and on every machine but a Pi Zero, none is.
+    for (const char* name : {"vc4"}) {
+        const std::string path = dir + "/libggml-" + name + ".so";
+        if (access(path.c_str(), R_OK) == 0) ggml_backend_load(path.c_str());
+    }
+#else
+    (void) dir;
+#endif
+}
+
+void load_loom_backends_default() {
+#ifdef LOOM_GGML_VC4_LINKED
+    ggml_backend_register(ggml_backend_vc4_reg());
+#endif
+#if defined(GGML_BACKEND_DL) && defined(__linux__)
+    char exe[4096];
+    const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+        std::string dir(exe, static_cast<size_t>(n));
+        dir.resize(dir.find_last_of('/') == std::string::npos ? 0 : dir.find_last_of('/'));
+        if (!dir.empty()) load_loom_backends_from(dir);
+    }
+    load_loom_backends_from(".");
+#endif
+}
+
 void ensure_backends_loaded() {
     std::lock_guard<std::mutex> lock(loader_mutex());
     for (const std::string& dir : pending_search_paths()) {
         ggml_backend_load_all_from_path(dir.c_str());
+        load_loom_backends_from(dir);
     }
     pending_search_paths().clear();
     if (!default_swept()) {
         ggml_backend_load_all();
+        load_loom_backends_default();
         default_swept() = true;
     }
 }
@@ -259,18 +301,28 @@ std::pair<int, int> tie_break(ggml_backend_dev_t dev) {
     return {confirmed, kind};
 }
 
-std::string gigabytes(size_t bytes) {
+// GB, or MB below one: a 64 MB pool against 63 MB of weights printed as "0.06 GB free and the weights
+// need 0.06 GB" (P4.44, ggml-vc4 on a Pi Zero).
+std::string human_size(size_t bytes) {
     char buf[32];
-    std::snprintf(buf, sizeof(buf), "%.2f GB", static_cast<double>(bytes) / 1e9);
+    if (bytes >= 1000000000) {
+        std::snprintf(buf, sizeof(buf), "%.2f GB", static_cast<double>(bytes) / 1e9);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%.1f MB", static_cast<double>(bytes) / 1e6);
+    }
     return buf;
 }
 
 // Whether `dev` reports less free memory than `weight_bytes`, writing what it reports to `free_out`.
-// Asked only of rank 0, a device with its own memory: the CPU and a host-memory accelerator share
-// the host's, where an allocation that cannot be met fails at the allocation, with a clear error. A
-// device that reports no memory at all (total 0) is unknown rather than full, and is never passed over.
+// Asked of the offload ranks, never of the CPU, which is never passed over. A device that reports no
+// memory at all (total 0) is unknown rather than full, and is never passed over either.
+//
+// RANK 1 IS ASKED TOO, which it was not until P4.44, when it had only BLAS: in host memory and
+// reporting total 0, so asking changed nothing. ggml-vc4 is also rank 1 -- host memory, CPU-mapped --
+// but its buffers come out of the GPU's contiguous pool (CMA, 64 MB by default on a Pi Zero), which it
+// reports. A model larger than that has to stay on the CPU and say why, not fail to allocate.
 bool lacks_room(ggml_backend_dev_t dev, size_t weight_bytes, size_t* free_out) {
-    if (weight_bytes == 0 || primary_rank(dev) != 0) return false;
+    if (weight_bytes == 0 || primary_rank(dev) > 1) return false;
     size_t free = 0, total = 0;
     ggml_backend_dev_memory(dev, &free, &total);
     *free_out = free;
@@ -293,7 +345,7 @@ ggml_backend_dev_t best_device_in_range(int best_allowed, int worst_allowed, siz
             if (note != nullptr) {
                 if (!note->empty()) *note += "; ";
                 *note += std::string(ggml_backend_dev_name(dev)) + " (" + ggml_backend_dev_description(dev) +
-                         ") has " + gigabytes(free) + " free and the weights need " + gigabytes(weight_bytes);
+                         ") has " + human_size(free) + " free and the weights need " + human_size(weight_bytes);
             }
             continue;
         }

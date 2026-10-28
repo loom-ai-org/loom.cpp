@@ -2000,3 +2000,31 @@ add_executable(test_fft_ops ci/test_fft_ops.cpp)
 target_link_libraries(test_fft_ops PRIVATE loom::engine)
 add_test(NAME test_fft_ops COMMAND test_fft_ops)
 set_tests_properties(test_fft_ops PROPERTIES LABELS ci)
+
+# P4.44 (ADR-088): ggml-vc4, the Pi Zero QPU backend. The kernels run in a QPU emulator that refuses
+# the hazards the reference guide warns about, so they are hermetic and run everywhere, whatever
+# LOOM_GGML_VC4 says: the encoder against a golden dump cross-checked with py-videocore, and both
+# GEMM kernels bit for bit against an fmul-then-fadd reference, each with a legal-but-wrong sabotage
+# that must fail. Header-only, so no ggml and no engine.
+set(LOOM_VC4_DIR ${PROJECT_SOURCE_DIR}/backends/ggml-vc4)
+add_executable(test_vc4_qpu_isa ci/test_vc4_qpu_isa.cpp)
+target_include_directories(test_vc4_qpu_isa PRIVATE ${LOOM_VC4_DIR})
+add_test(NAME test_vc4_qpu_isa COMMAND test_vc4_qpu_isa ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/vc4_qpu_golden.hex)
+set_tests_properties(test_vc4_qpu_isa PROPERTIES LABELS ci)
+foreach(t test_vc4_gemm_emu test_vc4_gemm_wt_emu)
+    add_executable(${t} ci/${t}.cpp)
+    target_include_directories(${t} PRIVATE ${LOOM_VC4_DIR})
+    add_test(NAME ${t} COMMAND ${t})
+    set_tests_properties(${t} PROPERTIES LABELS ci)
+endforeach()
+
+# The backend itself through ggml's scheduler on a board; exits 77 anywhere without a VC4 device.
+if(LOOM_GGML_VC4)
+    add_executable(test_vc4_backend gate/test_vc4_backend.cpp)
+    target_link_libraries(test_vc4_backend PRIVATE loom::engine)
+    add_test(NAME test_vc4_backend COMMAND test_vc4_backend)
+    set_tests_properties(test_vc4_backend PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+    add_test(NAME test_vc4_backend_cpu_only COMMAND test_vc4_backend cpu-only)
+    set_tests_properties(test_vc4_backend_cpu_only PROPERTIES LABELS ci)
+endif()
+
