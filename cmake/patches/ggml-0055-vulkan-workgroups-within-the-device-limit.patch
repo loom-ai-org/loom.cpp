@@ -1,0 +1,806 @@
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index fe1621c4..b6e37128 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -503,6 +503,116 @@ static bool ggml_vk_strip_decode_vector(const uint32_t * code, size_t word_count
+     return true;
+ }
+ 
++// The workgroup a shader whose default is `size` along dimension `dim` actually runs with on `device`:
++// `size` when the device allows it, else the largest power of two it does. ggml_vk_fit_workgroup_size
++// applies this to pipelines; a dispatch that counts WORKGROUPS rather than invocations (SET_ROWS)
++// must use it too.
++static uint32_t ggml_vk_fitted_workgroup(const vk_device & device, uint32_t size, int dim = 0) {
++    const uint32_t limit = std::min(device->properties.limits.maxComputeWorkGroupInvocations,
++                                    device->properties.limits.maxComputeWorkGroupSize[dim]);
++    if (size <= limit) {
++        return size;
++    }
++    uint32_t fitted = 1;
++    while (fitted * 2 <= limit) {
++        fitted *= 2;
++    }
++    return fitted;
++}
++
++// Fits a pipeline whose workgroup size is a specialization constant to a device that allows fewer
++// invocations than the shader's default, e.g. the Raspberry Pi 4's V3D (256; 32 shaders default to
++// 512). Exceeding maxComputeWorkGroupInvocations is invalid usage, and Mesa's V3DV compiles such a
++// pipeline without complaint and computes garbage, so this is a correctness fix rather than tuning.
++//
++// It reads the SPIR-V instead of trusting each call site: the one dimension whose size is a spec
++// constant, its SpecId and default come from the module, the value in effect is the caller's or that
++// default, and a value over the limit is fitted. That dimension's dispatch denominator follows by the
++// same factor when it is a multiple of the old size -- one element per invocation (512 -> 256) or two
++// (1024 -> 512) -- and is left alone otherwise (one workgroup per row, which the shaders reduce over
++// with a stride of the workgroup size). Spec constants the caller did not pass, up to the workgroup's
++// id, are filled with the module's own defaults so nothing else changes. A device that allows 1024
++// invocations -- the most any ggml shader asks for -- returns at once.
++static void ggml_vk_fit_workgroup_size(const vk_device & device, const std::string & name, const uint32_t * code,
++                                       size_t word_count, std::array<uint32_t, 3> & wg_denoms,
++                                       std::vector<uint32_t> & spec) {
++    const uint32_t limit = device->properties.limits.maxComputeWorkGroupInvocations;
++    if (limit >= 1024 || word_count < 5 || code[0] != spv::MagicNumber) {
++        return;
++    }
++    std::unordered_map<uint32_t, uint32_t> spec_id;        // result id -> SpecId
++    std::unordered_map<uint32_t, uint32_t> value;          // result id -> (default) scalar value
++    uint32_t wg_builtin = 0;
++    std::array<uint32_t, 3> wg_ids = {0, 0, 0};
++    std::array<uint32_t, 3> literal = {0, 0, 0};
++    for (size_t i = 5; i < word_count;) {
++        const uint32_t wc = code[i] >> spv::WordCountShift, op = code[i] & spv::OpCodeMask;
++        if (wc == 0 || i + wc > word_count) {
++            return;
++        }
++        if (op == spv::OpDecorate && wc >= 4 && code[i + 2] == spv::DecorationSpecId) {
++            spec_id[code[i + 1]] = code[i + 3];
++        } else if (op == spv::OpDecorate && wc >= 4 && code[i + 2] == spv::DecorationBuiltIn &&
++                   code[i + 3] == spv::BuiltInWorkgroupSize) {
++            wg_builtin = code[i + 1];
++        } else if ((op == spv::OpConstant || op == spv::OpSpecConstant) && wc >= 4) {
++            value[code[i + 2]] = code[i + 3];
++        } else if (op == spv::OpSpecConstantTrue && wc >= 3) {
++            value[code[i + 2]] = 1;
++        } else if (op == spv::OpSpecConstantFalse && wc >= 3) {
++            value[code[i + 2]] = 0;
++        } else if ((op == spv::OpSpecConstantComposite || op == spv::OpConstantComposite) && wc >= 6 &&
++                   code[i + 2] == wg_builtin) {
++            wg_ids = {code[i + 3], code[i + 4], code[i + 5]};
++        } else if (op == spv::OpExecutionMode && wc >= 6 && code[i + 2] == spv::ExecutionModeLocalSize) {
++            literal = {code[i + 3], code[i + 4], code[i + 5]};
++        }
++        i += wc;
++    }
++    // Exactly one dimension a spec constant, the other two literal 1s.
++    int dim = -1;
++    for (int d = 0; d < 3; d++) {
++        if (wg_ids[d] != 0 && spec_id.count(wg_ids[d])) {
++            if (dim >= 0) {
++                return;
++            }
++            dim = d;
++        } else if (wg_ids[d] != 0 && (!value.count(wg_ids[d]) || value[wg_ids[d]] != 1)) {
++            return;
++        }
++    }
++    if (dim < 0) {
++        // A literal size cannot be refitted; say so instead of letting the driver compute garbage.
++        if (literal[0] * std::max(literal[1], 1u) * std::max(literal[2], 1u) > limit) {
++            GGML_LOG_WARN("ggml_vulkan: %s needs %ux%ux%u invocations, the device allows %u\n", name.c_str(),
++                          literal[0], literal[1], literal[2], limit);
++        }
++        return;
++    }
++    const uint32_t id = spec_id[wg_ids[dim]];
++    const uint32_t current = id < spec.size() ? spec[id] : value[wg_ids[dim]];
++    const uint32_t fitted = ggml_vk_fitted_workgroup(device, current, dim);
++    if (fitted == current) {
++        return;
++    }
++    if (spec.size() <= id) {
++        std::unordered_map<uint32_t, uint32_t> default_of;  // SpecId -> default
++        for (const auto & [result, sid] : spec_id) {
++            if (value.count(result)) {
++                default_of[sid] = value[result];
++            }
++        }
++        for (uint32_t k = (uint32_t) spec.size(); k <= id; k++) {
++            spec.push_back(default_of.count(k) ? default_of[k] : 0);
++        }
++    }
++    spec[id] = fitted;
++    if (wg_denoms[dim] >= current && wg_denoms[dim] % current == 0) {
++        wg_denoms[dim] = wg_denoms[dim] / current * fitted;
++    }
++    VK_LOG_DEBUG("ggml_vk_fit_workgroup_size(" << name << "): " << current << " -> " << fitted << " (limit " << limit << ")");
++}
++
+ static bool ggml_vk_roll_bk_loop(const uint32_t * code, size_t word_count, std::vector<uint32_t> & out) {
+     if (word_count < 5) {
+         return false;
+@@ -1998,7 +2108,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 pipeline->name = name;
+                 pipeline->parameter_count = parameter_count;
+                 pipeline->push_constant_size = push_constant_size;
+-                pipeline->wg_denoms = wg_denoms;
++                // Fitted here rather than at compile time: some dispatches (ggml_vk_fill) size their
++                // grid from wg_denoms before they request the pipeline, which is what compiles it.
++                std::array<uint32_t, 3> fitted_denoms = wg_denoms;
++                std::vector<uint32_t> spec_unused = specialization_constants;
++                ggml_vk_fit_workgroup_size(device, pipeline->name, reinterpret_cast<const uint32_t *>(spv_data),
++                                           spv_size / sizeof(uint32_t), fitted_denoms, spec_unused);
++                pipeline->wg_denoms = fitted_denoms;
+                 pipeline->align = align;
+                 pipeline->initialized = true;
+ #if defined(VK_EXT_shader_64bit_indexing)
+@@ -2021,13 +2137,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+             if (!pipeline->compile_pending) {
+                 pipeline->compile_pending = true;
++                // The fit at initialization set the denominators; this one gives the compile its spec constants.
++                std::array<uint32_t, 3> fitted_denoms = wg_denoms;
++                std::vector<uint32_t> fitted_spec = specialization_constants;
++                ggml_vk_fit_workgroup_size(device, pipeline->name, reinterpret_cast<const uint32_t *>(spv_data),
++                                           spv_size / sizeof(uint32_t), fitted_denoms, fitted_spec);
+                 claimed_task.pipeline = pipeline;
+                 claimed_task.spv_size = spv_size;
+                 claimed_task.spv_data = spv_data;
+                 claimed_task.entrypoint = entrypoint;
+                 claimed_task.parameter_count = parameter_count;
+-                claimed_task.wg_denoms = wg_denoms;
+-                claimed_task.specialization_constants = specialization_constants;
++                claimed_task.wg_denoms = fitted_denoms;
++                claimed_task.specialization_constants = fitted_spec;
+                 claimed_task.disable_robustness = disable_robustness;
+                 claimed_task.require_full_subgroups = require_full_subgroups;
+                 claimed_task.required_subgroup_size = required_subgroup_size;
+@@ -5250,12 +5371,43 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher() {
+     return ggml_vk_default_dispatcher_instance;
+ }
+ 
++// V3D (Raspberry Pi 4/5) runs ggml's graphs correctly but far slower than the host CPU it shares
++// memory with. Measured on a Pi 4 against its four A72s: a VITS synthesis 64.9 s against 0.836 s
++// (the same audio to 1e-5), Qwen3-0.6B Q8_0 24 tokens 509 s against 4.2 s (the same tokens). Its
++// peak (32 GFLOPS, no FMA) is a third of theirs, so no tuning closes that. Offered by default it would
++// be chosen over the CPU by anything that prefers a GPU, so it is opt-in: name it in
++// GGML_VK_VISIBLE_DEVICES (loom patch ggml-0055).
++static bool ggml_vk_device_is_slower_than_host(const vk::PhysicalDevice & dev) {
++    vk::PhysicalDeviceProperties2 props;
++    vk::PhysicalDeviceDriverProperties driver;
++    props.pNext = &driver;
++    dev.getProperties2(&props);
++    return driver.driverID == vk::DriverId::eMesaV3Dv;
++}
++
+ void ggml_vk_instance_init() {
+     if (vk_instance_initialized) {
+         return;
+     }
+     VK_LOG_DEBUG("ggml_vk_instance_init()");
+ 
++#if defined(__linux__)
++    // Mesa's V3D compiler (Raspberry Pi 4/5, V3DV) does not finish compiling mul_mat_vec_f32_f32_f32 in
++    // its loop unroller -- over 14 minutes of CPU, never done -- and compiles it in 0.65 s with
++    // V3D_DEBUG=noloopunroll, with every MUL_MAT case correct. Only that driver reads the variable,
++    // and it reads it when the loader loads it, which is the first Vulkan call below, so this has to
++    // come first. A value the user set is extended, not replaced.
++    {
++        const char * v3d_debug = getenv("V3D_DEBUG");
++        if (v3d_debug == nullptr || *v3d_debug == '\0') {
++            setenv("V3D_DEBUG", "noloopunroll", 0);
++        } else if (strstr(v3d_debug, "noloopunroll") == nullptr) {
++            const std::string extended = std::string(v3d_debug) + ",noloopunroll";
++            setenv("V3D_DEBUG", extended.c_str(), 1);
++        }
++    }
++#endif
++
+     // See https://github.com/KhronosGroup/Vulkan-Hpp?tab=readme-ov-file#extensions--per-device-function-pointers-
+     ggml_vk_default_dispatcher_instance.init(vkGetInstanceProcAddr);
+ 
+@@ -5374,6 +5526,11 @@ void ggml_vk_instance_init() {
+             new_driver.pNext = &new_id;
+             devices[i].getProperties2(&new_props);
+ 
++            if (ggml_vk_device_is_slower_than_host(devices[i])) {
++                GGML_LOG_INFO("ggml_vulkan: %s (V3DV) is slower than the host CPU and is not used by default; "
++                              "set GGML_VK_VISIBLE_DEVICES=%zu to use it\n", new_props.properties.deviceName.data(), i);
++                continue;
++            }
+             if ((new_props.properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu || new_props.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu) && ggml_vk_device_is_supported(devices[i])) {
+                 // Check if there are two physical devices corresponding to the same GPU
+                 // This handles the case where the same GPU appears with different drivers (e.g., RADV + AMDVLK on Linux),
+@@ -5468,7 +5625,8 @@ void ggml_vk_instance_init() {
+         // If only CPU devices are available, return without devices.
+         if (vk_instance.device_indices.empty()) {
+             for (size_t i = 0; i < devices.size(); i++) {
+-                if (devices[i].getProperties().deviceType != vk::PhysicalDeviceType::eCpu) {
++                if (devices[i].getProperties().deviceType != vk::PhysicalDeviceType::eCpu &&
++                    !ggml_vk_device_is_slower_than_host(devices[i])) {
+                     vk_instance.device_indices.push_back(i);
+                     break;
+                 }
+@@ -9759,8 +9917,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+                 // quants run 32 threads each doing QUANT_K elements
+                 ne = CEIL_DIV(ne, 32 * ggml_blck_size(dst->type));
+             } else {
+-                // scalar types do one element per thread, running 512 threads
+-                ne = CEIL_DIV(ne, 512);
++                // scalar types do one element per thread, running 512 threads -- or fewer where the
++                // device allows fewer (copy_to_quant.comp's SET_ROWS workgroup is fitted)
++                ne = CEIL_DIV(ne, ggml_vk_fitted_workgroup(ctx->device, 512));
+             }
+             if (ne > 262144) {
+                 elements = { 512, 512, CEIL_DIV(ne, 262144) };
+diff --git a/src/ggml-vulkan/vulkan-shaders/acc.comp b/src/ggml-vulkan/vulkan-shaders/acc.comp
+index 6ba3d1d8..c9661ec3 100644
+--- a/src/ggml-vulkan/vulkan-shaders/acc.comp
++++ b/src/ggml-vulkan/vulkan-shaders/acc.comp
+@@ -6,7 +6,9 @@
+ // false for SET, true for ACC
+ layout(constant_id = 1) const bool ACC = true;
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
+ 
+ void main() {
+     const uint idx = gl_GlobalInvocationID.x;
+diff --git a/src/ggml-vulkan/vulkan-shaders/add_id.comp b/src/ggml-vulkan/vulkan-shaders/add_id.comp
+index 495249d5..a7f4bbb0 100644
+--- a/src/ggml-vulkan/vulkan-shaders/add_id.comp
++++ b/src/ggml-vulkan/vulkan-shaders/add_id.comp
+@@ -14,9 +14,11 @@ layout (push_constant) uniform parameter
+     uint s21;
+ } p;
+ 
+-#define BLOCK_SIZE 512
++#define BLOCK_SIZE gl_WorkGroupSize.x
+ 
+-layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
+ layout (binding = 1) readonly buffer Y {B_TYPE data_b[];};
+diff --git a/src/ggml-vulkan/vulkan-shaders/arange.comp b/src/ggml-vulkan/vulkan-shaders/arange.comp
+index f4936eea..7b9ecad7 100644
+--- a/src/ggml-vulkan/vulkan-shaders/arange.comp
++++ b/src/ggml-vulkan/vulkan-shaders/arange.comp
+@@ -3,7 +3,9 @@
+ #include "generic_head.glsl"
+ #include "types.glsl"
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) writeonly buffer D {D_TYPE data_d[];};
+ 
+diff --git a/src/ggml-vulkan/vulkan-shaders/concat.comp b/src/ggml-vulkan/vulkan-shaders/concat.comp
+index e4046983..6885a986 100644
+--- a/src/ggml-vulkan/vulkan-shaders/concat.comp
++++ b/src/ggml-vulkan/vulkan-shaders/concat.comp
+@@ -3,7 +3,9 @@
+ #include "types.glsl"
+ #include "generic_binary_head.glsl"
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+ 
+ void main() {
+     const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+diff --git a/src/ggml-vulkan/vulkan-shaders/conv2d_dw.comp b/src/ggml-vulkan/vulkan-shaders/conv2d_dw.comp
+index 70a30148..7c49e8b3 100644
+--- a/src/ggml-vulkan/vulkan-shaders/conv2d_dw.comp
++++ b/src/ggml-vulkan/vulkan-shaders/conv2d_dw.comp
+@@ -25,7 +25,9 @@ layout (binding = 0) readonly buffer A {A_TYPE knl_data[];};
+ layout (binding = 1) readonly buffer B {B_TYPE src_data[];};
+ layout (binding = 2) writeonly buffer D {D_TYPE dst_data[];};
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ FLOAT_TYPE conv_2d_dw_whcn(uint idx) {
+     uint i0 = idx / p.dst_w;
+diff --git a/src/ggml-vulkan/vulkan-shaders/copy.comp b/src/ggml-vulkan/vulkan-shaders/copy.comp
+index d55e1325..65dc4ff3 100644
+--- a/src/ggml-vulkan/vulkan-shaders/copy.comp
++++ b/src/ggml-vulkan/vulkan-shaders/copy.comp
+@@ -3,7 +3,9 @@
+ #include "types.glsl"
+ #include "generic_unary_head.glsl"
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ void main() {
+     const uint idx = get_idx();
+diff --git a/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp b/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp
+index 776e9b8a..e296e0b1 100644
+--- a/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp
++++ b/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp
+@@ -3,8 +3,10 @@
+ #include "types.glsl"
+ 
+ #if defined(SET_ROWS) && QUANT_K == 1
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+-const uint BLOCK_SIZE = 512;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
++#define BLOCK_SIZE gl_WorkGroupSize.x  // the index math below steps by the workgroup actually run
+ #else
+ layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+ const uint BLOCK_SIZE = 32;
+diff --git a/src/ggml-vulkan/vulkan-shaders/diag.comp b/src/ggml-vulkan/vulkan-shaders/diag.comp
+index 249e6b16..0e3a11c6 100644
+--- a/src/ggml-vulkan/vulkan-shaders/diag.comp
++++ b/src/ggml-vulkan/vulkan-shaders/diag.comp
+@@ -3,7 +3,9 @@
+ #include "types.glsl"
+ #include "generic_unary_head.glsl"
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ void main() {
+     const uint idx = get_idx();
+diff --git a/src/ggml-vulkan/vulkan-shaders/diag_mask_inf.comp b/src/ggml-vulkan/vulkan-shaders/diag_mask_inf.comp
+index 9cef8a8e..b7053884 100644
+--- a/src/ggml-vulkan/vulkan-shaders/diag_mask_inf.comp
++++ b/src/ggml-vulkan/vulkan-shaders/diag_mask_inf.comp
+@@ -12,7 +12,9 @@ layout (push_constant) uniform parameter
+ 
+ #include "types.glsl"
+ 
+-layout(local_size_x = 1, local_size_y = 512, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_y_id would default to 1.
++layout(local_size_x = 1, local_size_y = 512, local_size_y_id = 0, local_size_z = 1) in;
+ 
+ layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
+ layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+diff --git a/src/ggml-vulkan/vulkan-shaders/fill.comp b/src/ggml-vulkan/vulkan-shaders/fill.comp
+index b5cc3332..f0856e11 100644
+--- a/src/ggml-vulkan/vulkan-shaders/fill.comp
++++ b/src/ggml-vulkan/vulkan-shaders/fill.comp
+@@ -3,7 +3,9 @@
+ #include "generic_head.glsl"
+ #include "types.glsl"
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) writeonly buffer D {D_TYPE data_d[];};
+ 
+diff --git a/src/ggml-vulkan/vulkan-shaders/get_rows.comp b/src/ggml-vulkan/vulkan-shaders/get_rows.comp
+index e88bdd05..19578b06 100644
+--- a/src/ggml-vulkan/vulkan-shaders/get_rows.comp
++++ b/src/ggml-vulkan/vulkan-shaders/get_rows.comp
+@@ -3,7 +3,9 @@
+ #include "types.glsl"
+ #include "generic_binary_head.glsl"
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+ 
+ void main() {
+     const uint i00 = gl_GlobalInvocationID.x;
+diff --git a/src/ggml-vulkan/vulkan-shaders/get_rows_quant.comp b/src/ggml-vulkan/vulkan-shaders/get_rows_quant.comp
+index 19af30ac..b408b913 100644
+--- a/src/ggml-vulkan/vulkan-shaders/get_rows_quant.comp
++++ b/src/ggml-vulkan/vulkan-shaders/get_rows_quant.comp
+@@ -6,7 +6,9 @@
+ #include "generic_binary_head.glsl"
+ #include "dequant_funcs.glsl"
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+ 
+ void main() {
+     const uint i00 = (gl_GlobalInvocationID.x)*2;
+diff --git a/src/ggml-vulkan/vulkan-shaders/glu_head.glsl b/src/ggml-vulkan/vulkan-shaders/glu_head.glsl
+index fc2951ec..638dd230 100644
+--- a/src/ggml-vulkan/vulkan-shaders/glu_head.glsl
++++ b/src/ggml-vulkan/vulkan-shaders/glu_head.glsl
+@@ -3,7 +3,9 @@
+ #include "utils.glsl"
+ 
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+ layout (binding = 1) readonly buffer B {A_TYPE data_b[];};
+diff --git a/src/ggml-vulkan/vulkan-shaders/group_norm.comp b/src/ggml-vulkan/vulkan-shaders/group_norm.comp
+index bdf97dbb..9b965af5 100644
+--- a/src/ggml-vulkan/vulkan-shaders/group_norm.comp
++++ b/src/ggml-vulkan/vulkan-shaders/group_norm.comp
+@@ -4,9 +4,11 @@
+ #include "types.glsl"
+ 
+ #extension GL_EXT_control_flow_attributes : enable
+-#define BLOCK_SIZE 512
++#define BLOCK_SIZE gl_WorkGroupSize.x
+ 
+-layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
+ layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+@@ -30,7 +32,7 @@ void main() {
+ 
+     // tmp up partial tmps and write back result
+     barrier();
+-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
++    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+         if (tid < s) {
+             tmp[tid] += tmp[tid + s];
+         }
+@@ -50,7 +52,7 @@ void main() {
+ 
+     // sum up partial sums and write back result
+     barrier();
+-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
++    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+         if (tid < s) {
+             tmp[tid] += tmp[tid + s];
+         }
+diff --git a/src/ggml-vulkan/vulkan-shaders/l2_norm.comp b/src/ggml-vulkan/vulkan-shaders/l2_norm.comp
+index 9039ed1d..4ad73a2c 100644
+--- a/src/ggml-vulkan/vulkan-shaders/l2_norm.comp
++++ b/src/ggml-vulkan/vulkan-shaders/l2_norm.comp
+@@ -4,9 +4,11 @@
+ #include "types.glsl"
+ 
+ #extension GL_EXT_control_flow_attributes : enable
+-#define BLOCK_SIZE 512
++#define BLOCK_SIZE gl_WorkGroupSize.x
+ 
+-layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ shared FLOAT_TYPE sum[BLOCK_SIZE];
+ 
+@@ -26,7 +28,7 @@ void main() {
+ 
+     // sum up partial sums and write back result
+     barrier();
+-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
++    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+         if (tid < s) {
+             sum[tid] += sum[tid + s];
+         }
+diff --git a/src/ggml-vulkan/vulkan-shaders/log.comp b/src/ggml-vulkan/vulkan-shaders/log.comp
+index 3cda6a63..b9007fe5 100644
+--- a/src/ggml-vulkan/vulkan-shaders/log.comp
++++ b/src/ggml-vulkan/vulkan-shaders/log.comp
+@@ -3,7 +3,9 @@
+ #include "types.glsl"
+ #include "generic_unary_head.glsl"
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ void main() {
+     const uint idx = get_idx();
+diff --git a/src/ggml-vulkan/vulkan-shaders/norm.comp b/src/ggml-vulkan/vulkan-shaders/norm.comp
+index 792012d5..894addb4 100644
+--- a/src/ggml-vulkan/vulkan-shaders/norm.comp
++++ b/src/ggml-vulkan/vulkan-shaders/norm.comp
+@@ -4,9 +4,11 @@
+ #include "generic_unary_head.glsl"
+ 
+ #extension GL_EXT_control_flow_attributes : enable
+-#define BLOCK_SIZE 512
++#define BLOCK_SIZE gl_WorkGroupSize.x
+ 
+-layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ shared vec2 sum[BLOCK_SIZE];
+ 
+@@ -27,7 +29,7 @@ void main() {
+ 
+     // sum up partial sums and write back result
+     barrier();
+-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
++    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+         if (tid < s) {
+             sum[tid] += sum[tid + s];
+         }
+diff --git a/src/ggml-vulkan/vulkan-shaders/opt_step_adamw.comp b/src/ggml-vulkan/vulkan-shaders/opt_step_adamw.comp
+index 1f05f922..e991762e 100644
+--- a/src/ggml-vulkan/vulkan-shaders/opt_step_adamw.comp
++++ b/src/ggml-vulkan/vulkan-shaders/opt_step_adamw.comp
+@@ -5,7 +5,9 @@
+ 
+ #extension GL_EXT_control_flow_attributes : enable
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) buffer X {A_TYPE x[];};
+ layout (binding = 1) readonly buffer G {A_TYPE grad[];};
+diff --git a/src/ggml-vulkan/vulkan-shaders/opt_step_sgd.comp b/src/ggml-vulkan/vulkan-shaders/opt_step_sgd.comp
+index 1251f9cc..7939b16d 100644
+--- a/src/ggml-vulkan/vulkan-shaders/opt_step_sgd.comp
++++ b/src/ggml-vulkan/vulkan-shaders/opt_step_sgd.comp
+@@ -2,7 +2,9 @@
+ 
+ #include "generic_head.glsl"
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) buffer X {A_TYPE data_x[];};
+ layout (binding = 1) readonly buffer G {A_TYPE data_grad[];};
+diff --git a/src/ggml-vulkan/vulkan-shaders/pad.comp b/src/ggml-vulkan/vulkan-shaders/pad.comp
+index 5abd2f6f..fb62232a 100644
+--- a/src/ggml-vulkan/vulkan-shaders/pad.comp
++++ b/src/ggml-vulkan/vulkan-shaders/pad.comp
+@@ -26,7 +26,9 @@ uint wrap_around(int coord, uint size) {
+ layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+ layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ void main() {
+     const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+diff --git a/src/ggml-vulkan/vulkan-shaders/pad_reflect_1d.comp b/src/ggml-vulkan/vulkan-shaders/pad_reflect_1d.comp
+index 2389020f..39ae0cde 100644
+--- a/src/ggml-vulkan/vulkan-shaders/pad_reflect_1d.comp
++++ b/src/ggml-vulkan/vulkan-shaders/pad_reflect_1d.comp
+@@ -3,7 +3,9 @@
+ #include "types.glsl"
+ #include "generic_unary_head.glsl" // included to use functions like fastdiv etc.
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ void main() {
+ 
+diff --git a/src/ggml-vulkan/vulkan-shaders/pool1d.comp b/src/ggml-vulkan/vulkan-shaders/pool1d.comp
+index bb87631c..98742db1 100644
+--- a/src/ggml-vulkan/vulkan-shaders/pool1d.comp
++++ b/src/ggml-vulkan/vulkan-shaders/pool1d.comp
+@@ -15,12 +15,14 @@ layout(push_constant) uniform parameter {
+     int p0;
+ } p;
+ 
+-#define BLOCK_SIZE 512
++#define BLOCK_SIZE gl_WorkGroupSize.x
+ #define FLT_MAX 3.402823466e+38F
+ #define OP_POOL_MAX 0u
+ #define OP_POOL_AVG 1u
+ 
+-layout (local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout(binding = 0) readonly buffer X {A_TYPE data_a[];};
+ layout(binding = 1) writeonly buffer D {D_TYPE data_d[];};
+diff --git a/src/ggml-vulkan/vulkan-shaders/pool2d.comp b/src/ggml-vulkan/vulkan-shaders/pool2d.comp
+index d9d7166e..cd1a0227 100644
+--- a/src/ggml-vulkan/vulkan-shaders/pool2d.comp
++++ b/src/ggml-vulkan/vulkan-shaders/pool2d.comp
+@@ -15,12 +15,14 @@ layout(push_constant) uniform parameter {
+     int p0; int p1;
+ } p;
+ 
+-#define BLOCK_SIZE 512
++#define BLOCK_SIZE gl_WorkGroupSize.x
+ #define FLT_MAX 3.402823466e+38F
+ #define OP_POOL_MAX 0u
+ #define OP_POOL_AVG 1u
+ 
+-layout (local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout(binding = 0) readonly buffer X {A_TYPE data_a[];};
+ layout(binding = 1) writeonly buffer D {D_TYPE data_d[];};
+diff --git a/src/ggml-vulkan/vulkan-shaders/repeat.comp b/src/ggml-vulkan/vulkan-shaders/repeat.comp
+index 8f4b9a86..8f6284a6 100644
+--- a/src/ggml-vulkan/vulkan-shaders/repeat.comp
++++ b/src/ggml-vulkan/vulkan-shaders/repeat.comp
+@@ -3,7 +3,9 @@
+ #include "types.glsl"
+ #include "generic_unary_head.glsl"
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ uint src0_idx_mod(uint idx) {
+     const uint i13 = idx / (p.ne12*p.ne11*p.ne10);
+diff --git a/src/ggml-vulkan/vulkan-shaders/repeat_back.comp b/src/ggml-vulkan/vulkan-shaders/repeat_back.comp
+index 10f334d4..88640f09 100644
+--- a/src/ggml-vulkan/vulkan-shaders/repeat_back.comp
++++ b/src/ggml-vulkan/vulkan-shaders/repeat_back.comp
+@@ -3,7 +3,9 @@
+ #include "types.glsl"
+ #include "generic_unary_head.glsl"
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ void main() {
+     const uint idx = get_idx();
+diff --git a/src/ggml-vulkan/vulkan-shaders/rms_norm.comp b/src/ggml-vulkan/vulkan-shaders/rms_norm.comp
+index ee813842..c1b5be2e 100644
+--- a/src/ggml-vulkan/vulkan-shaders/rms_norm.comp
++++ b/src/ggml-vulkan/vulkan-shaders/rms_norm.comp
+@@ -39,14 +39,16 @@ layout (binding = 3) readonly buffer I {uvec2 data_i[];};
+ #endif
+ 
+ #extension GL_EXT_control_flow_attributes : enable
+-#define BLOCK_SIZE 512
++#define BLOCK_SIZE gl_WorkGroupSize.x
+ 
+ layout (constant_id = 1) const bool do_multiply = false;
+ #if RMS_NORM_ADD_FUSION
+ layout (constant_id = 2) const bool do_post_multiply = false;
+ #endif
+ 
+-layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 3, local_size_y = 1, local_size_z = 1) in;
+ 
+ shared FLOAT_TYPE sumsh[BLOCK_SIZE];
+ 
+@@ -87,7 +89,7 @@ void rms_norm(uint num_iters) {
+     sumsh[tid] = sum;
+     // sum up partial sums and write back result
+     barrier();
+-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
++    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+         if (tid < s) {
+             sum += sumsh[tid + s];
+             sumsh[tid] = sum;
+diff --git a/src/ggml-vulkan/vulkan-shaders/rms_norm_back.comp b/src/ggml-vulkan/vulkan-shaders/rms_norm_back.comp
+index 87707fc1..af959e4a 100644
+--- a/src/ggml-vulkan/vulkan-shaders/rms_norm_back.comp
++++ b/src/ggml-vulkan/vulkan-shaders/rms_norm_back.comp
+@@ -4,9 +4,11 @@
+ #include "types.glsl"
+ 
+ #extension GL_EXT_control_flow_attributes : enable
+-#define BLOCK_SIZE 512
++#define BLOCK_SIZE gl_WorkGroupSize.x
+ 
+-layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) readonly buffer G {A_TYPE data_a[];};
+ layout (binding = 1) readonly buffer X {B_TYPE data_b[];};
+@@ -34,7 +36,7 @@ void main() {
+ 
+     // sum up partial sums and write back result
+     barrier();
+-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
++    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+         if (tid < s) {
+             sum_xx[tid] += sum_xx[tid + s];
+             sum_xg[tid] += sum_xg[tid + s];
+diff --git a/src/ggml-vulkan/vulkan-shaders/roll.comp b/src/ggml-vulkan/vulkan-shaders/roll.comp
+index dae811ad..7a8ebea1 100644
+--- a/src/ggml-vulkan/vulkan-shaders/roll.comp
++++ b/src/ggml-vulkan/vulkan-shaders/roll.comp
+@@ -3,7 +3,9 @@
+ #include "types.glsl"
+ #include "generic_unary_head.glsl"
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ uint wrap_idx(int i, uint ne) {
+     if (i < 0) {
+diff --git a/src/ggml-vulkan/vulkan-shaders/silu_back.comp b/src/ggml-vulkan/vulkan-shaders/silu_back.comp
+index e5d949ff..4c7d7261 100644
+--- a/src/ggml-vulkan/vulkan-shaders/silu_back.comp
++++ b/src/ggml-vulkan/vulkan-shaders/silu_back.comp
+@@ -5,7 +5,9 @@
+ 
+ #extension GL_EXT_control_flow_attributes : enable
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) readonly buffer G {A_TYPE data_g[];};
+ layout (binding = 1) readonly buffer X {B_TYPE data_x[];};
+diff --git a/src/ggml-vulkan/vulkan-shaders/tri.comp b/src/ggml-vulkan/vulkan-shaders/tri.comp
+index 9def5dbc..ab9a5eea 100644
+--- a/src/ggml-vulkan/vulkan-shaders/tri.comp
++++ b/src/ggml-vulkan/vulkan-shaders/tri.comp
+@@ -8,7 +8,9 @@
+ #define GGML_TRI_TYPE_LOWER_DIAG 2
+ #define GGML_TRI_TYPE_LOWER      3
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ void main() {
+     const uint idx = get_idx();
+diff --git a/src/ggml-vulkan/vulkan-shaders/unary.comp b/src/ggml-vulkan/vulkan-shaders/unary.comp
+index 9ee7769b..37c20c24 100644
+--- a/src/ggml-vulkan/vulkan-shaders/unary.comp
++++ b/src/ggml-vulkan/vulkan-shaders/unary.comp
+@@ -16,7 +16,9 @@ layout(constant_id = 1) const bool op_on_b = false;
+ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+ const uint num_threads = 256;
+ #else
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
+ #endif
+ 
+ float op_abs(float x) {
+diff --git a/src/ggml-vulkan/vulkan-shaders/upscale.comp b/src/ggml-vulkan/vulkan-shaders/upscale.comp
+index f7d12a8d..1fc3e11e 100644
+--- a/src/ggml-vulkan/vulkan-shaders/upscale.comp
++++ b/src/ggml-vulkan/vulkan-shaders/upscale.comp
+@@ -12,7 +12,9 @@ layout (push_constant) uniform parameter
+ 
+ #include "types.glsl"
+ 
+-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++// The literal is the default; the id lets a device that allows fewer invocations run a smaller
++// workgroup (ggml-vulkan.cpp, ggml_vk_fit_workgroup_size). A bare local_size_x_id would default to 1.
++layout(local_size_x = 512, local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+ layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
