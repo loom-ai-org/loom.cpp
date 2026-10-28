@@ -110,4 +110,5 @@ end to end it is a wash: its Mimi convolutions dominate and stay on the CPU.
   board (exits 77 elsewhere; `cpu-only` checks the harness and the registration in CI).
 * Open (hub P4.44): Q8_0 / Q4_0 weights in the kernel (what the Pi Zero models ship as), convolutions
   as GEMM (the TMU gather can do the im2col addressing), and the tile order for large N (128x3656x384
-  ran at 2.2 GFLOPS).
+  ran at 2.2 GFLOPS). The convolutions and per-channel Q8_0 were taken up by P4.45:
+  [ADR-089](adr-089-the-qpus-take-convolutions-and-per-channel-int8.md).
