@@ -5,6 +5,11 @@
 // P4.46: Q4_0 / Q8_0 MUL_MATs, convolutions with the elementwise nodes the backend folds into them
 // (and one whose chain it must not fold), and a 1x1 convolution over a weight in VC4_Q8. Run it again
 // with GGML_VC4_FUSE=0 for the unfused times; GGML_VC4_STATS=1 says how many nodes were folded.
+// P4.47: HiFi-GAN's upsampling, a CONV_TRANSPOSE_1D between its LEAKY_RELU and its bias, as loom lowers
+// it (the bias [1, OC] broadcast, the padding cropped by a view), at VITS's two strides; and every case
+// again with the weights in VC4_HOST, ordinary memory, as loom loads them for this device.
+// With GGML_VC4_ARENA_MAX_KB=64 every QPU node is refused its arena and must run on the CPU instead,
+// with the same results (the placement is still the scheduler's: VC4).
 //
 // VC4 is found the way the engine finds it -- loom's backend sweep, which loads libggml-vc4.so or
 // registers the linked one -- so this also gates that loading. Exits 77 without a VC4 device: any
@@ -20,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <functional>
@@ -31,7 +37,7 @@ static double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.t
 
 struct Case {
     std::string name;
-    int on_vc4;  // how many of the graph's MUL_MATs and CONV_2Ds the scheduler must give the QPUs
+    int on_vc4;  // how many of the graph's MUL_MATs, CONV_2Ds and CONV_TRANSPOSE_1Ds the scheduler must give the QPUs
     // builds the graph from (ctx for weights, ctx for inputs); returns the output tensor
     std::function<ggml_tensor *(ggml_context *, ggml_context *, ggml_context *)> build;
     // P4.46: weights built in a fourth context, in VC4_Q8 on the VC4 arm (per-channel Q8_0)
@@ -69,8 +75,17 @@ static void fill(ggml_tensor * t, std::mt19937 & rng) {
 
 static ggml_backend_t g_vc4, g_cpu;
 static bool g_cpu_only = false;
+// P4.47: the VC4 arm's weights in the device's host buffer type (VC4_HOST, RAM), where loom puts them
+// (weights_buffer_type), instead of its own (the GPU's pool) -- every case runs both ways.
+static bool g_weights_host = false;
 
 static int run(const Case & c) {
+    // GGML_VC4_ARENA_MAX_KB: every QPU node is refused its memory and runs on the CPU (P4.47) -- all but
+    // one over a VC4_Q8 weight, whose layout the CPU cannot read, which fails by design.
+    if (c.build_q8 && getenv("GGML_VC4_ARENA_MAX_KB") != nullptr && !g_cpu_only) {
+        printf("%s%-36s skipped: a VC4_Q8 weight has no CPU fallback\n", g_weights_host ? "[host] " : "", c.name.c_str());
+        return 0;
+    }
     // Each arm builds its own contexts, buffers and graph from the same seed: a graph whose tensors a
     // freed scheduler had allocated cannot be handed to the next one (ASan: use-after-free).
     std::vector<float> res[2], ref;   // ref: f64 over dequantized weights, for a quantized MUL_MAT
@@ -83,7 +98,9 @@ static int run(const Case & c) {
         ggml_init_params gp = {512 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
         ggml_context * cg = ggml_init(gp);
         ggml_tensor * out = c.build_q8 ? c.build_q8(cw, cx, cg, cq) : c.build(cw, cx, cg);
-        ggml_backend_buffer_t bw = ggml_get_first_tensor(cw) ? ggml_backend_alloc_ctx_tensors_from_buft(cw, ggml_backend_get_default_buffer_type(g_vc4)) : nullptr;
+        ggml_backend_buffer_type_t wbt = ggml_backend_get_default_buffer_type(g_vc4);
+        if (arm == 0 && g_weights_host && !g_cpu_only) wbt = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(g_vc4));
+        ggml_backend_buffer_t bw = ggml_get_first_tensor(cw) ? ggml_backend_alloc_ctx_tensors_from_buft(cw, wbt) : nullptr;
         ggml_backend_buffer_t bx = ggml_backend_alloc_ctx_tensors_from_buft(cx, ggml_backend_cpu_buffer_type());
         ggml_backend_buffer_t bq = nullptr;
         if (ggml_get_first_tensor(cq)) {
@@ -101,7 +118,9 @@ static int run(const Case & c) {
         // ggml's CPU quantizes a MUL_MAT's activations to Q8_0 when the weight is quantized, so for
         // those the CPU is not the reference: an f64 product of the dequantized weight is, and the QPUs
         // (F32 activations) must be at least as close to it as the CPU (P4.46).
-        if (arm == 0 && !g_cpu_only && out->op == GGML_OP_MUL_MAT && out->src[0]->type != GGML_TYPE_F32) {
+        // (Not under GGML_VC4_ARENA_MAX_KB: there the CPU runs them and is the reference.)
+        if (arm == 0 && !g_cpu_only && out->op == GGML_OP_MUL_MAT && out->src[0]->type != GGML_TYPE_F32 &&
+            getenv("GGML_VC4_ARENA_MAX_KB") == nullptr) {
             const ggml_tensor * w = out->src[0], * x = out->src[1];
             const int64_t K = w->ne[0], M = w->ne[1], N = x->ne[1];
             std::vector<uint8_t> wq(ggml_nbytes(w));
@@ -127,7 +146,7 @@ static int run(const Case & c) {
         if (arm == 0)
             for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
                 ggml_tensor * n = ggml_graph_node(gf, i);
-                if (n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_CONV_2D) continue;
+                if (n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_CONV_2D && n->op != GGML_OP_CONV_TRANSPOSE_1D) continue;
                 ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched, n);
                 placement += std::string(placement.empty() ? "" : ",") + (b ? ggml_backend_name(b) : "?");
                 landed += b == g_vc4;
@@ -156,7 +175,7 @@ static int run(const Case & c) {
     const bool placed = g_cpu_only || landed == c.on_vc4;
     const double tol = ref.empty() ? 1e-4 : 1e-3;   // the int8 kernels' offset sums (qpu_gemm_q8.h)
     const bool ok = maxd <= tol * std::max(1.0, maxv) && std::isfinite(maxd) && placed && (ref.empty() || maxd <= cpu_d);
-    printf("%-36s on [%s]  max|d| %.3g (max|y| %.3g) %s%s | VC4+CPU %.2f ms, CPU %.2f ms (%.2fx)\n", c.name.c_str(),
+    printf("%s%-36s on [%s]  max|d| %.3g (max|y| %.3g) %s%s | VC4+CPU %.2f ms, CPU %.2f ms (%.2fx)\n", g_weights_host ? "[host] " : "", c.name.c_str(),
            placement.c_str(), maxd, maxv, ok ? "OK" : "WRONG", placed ? "" : " (placement)", best[0] * 1e3, best[1] * 1e3, best[1] / best[0]);
     if (!ref.empty()) printf("  (against f64 over the dequantized weight; the CPU, which quantizes the activations: max|d| %.3g)\n", cpu_d);
     return ok ? 0 : 1;
@@ -253,9 +272,37 @@ int main(int argc, char ** argv) {
              ggml_tensor * c = ggml_conv_2d_direct_packed(cg, w, x, 1, 1, 0, 0, 1, 1, 1, 1, 256);
              return ggml_mul(cg, ggml_relu(cg, ggml_add(cg, c, b)), m);
          }},
+        // P4.47
+        {"HiFi-GAN lrelu+convT s8 k16+bias+crop", 1, [](ggml_context * cw, ggml_context * cx, ggml_context * cg) {
+             ggml_tensor * k = ggml_new_tensor_3d(cw, GGML_TYPE_F32, 16, 128, 256);
+             ggml_tensor * b = ggml_new_tensor_2d(cw, GGML_TYPE_F32, 1, 128);
+             ggml_tensor * x = ggml_new_tensor_2d(cx, GGML_TYPE_F32, 300, 256);
+             ggml_tensor * y = ggml_add(cg, ggml_conv_transpose_1d(cg, k, ggml_leaky_relu(cg, x, 0.1f, false), 8, 0, 1), b);
+             return ggml_cont(cg, ggml_view_2d(cg, y, 300 * 8, 128, y->nb[1], 4 * 4));
+         }},
+        {"convT s2 k4+bias, 64->32, T 2400", 1, [](ggml_context * cw, ggml_context * cx, ggml_context * cg) {
+             ggml_tensor * k = ggml_new_tensor_3d(cw, GGML_TYPE_F32, 4, 32, 64);
+             ggml_tensor * b = ggml_new_tensor_2d(cw, GGML_TYPE_F32, 1, 32);
+             ggml_tensor * x = ggml_new_tensor_2d(cx, GGML_TYPE_F32, 2400, 64);
+             return ggml_add(cg, ggml_conv_transpose_1d(cg, k, x, 2, 0, 1), b);
+         }},
+        {"convT s3 (CPU: stride not a power of 2)", 0, [](ggml_context * cw, ggml_context * cx, ggml_context * cg) {
+             ggml_tensor * k = ggml_new_tensor_3d(cw, GGML_TYPE_F32, 6, 32, 64);
+             ggml_tensor * x = ggml_new_tensor_2d(cx, GGML_TYPE_F32, 400, 64);
+             return ggml_conv_transpose_1d(cg, k, x, 3, 0, 1);
+         }},
     };
     int fails = 0;
     for (auto & c : cases) fails += run(c);
+    if (!g_cpu_only) {
+        if (ggml_backend_dev_host_buffer_type(ggml_backend_get_device(g_vc4)) == nullptr) {
+            printf("FAIL: VC4 offers no host buffer type (P4.47)\n");
+            fails++;
+        } else {
+            g_weights_host = true;
+            for (auto & c : cases) fails += run(c);
+        }
+    }
     printf("%s\n", fails ? "FAILURES" : "ALL OK");
     ggml_backend_free(g_vc4);
     ggml_backend_free(g_cpu);
