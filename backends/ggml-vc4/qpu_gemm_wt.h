@@ -164,24 +164,19 @@ inline size_t gemm_wt_uniform_words(const std::vector<GemmWtProblem>& probs, int
     return size_t(nq) * (9 + 16) + tiles * 7;
 }
 
-// Write the per-QPU uniform streams for `probs` (all must share K) at `unif`, round-robin over
-// min(nq_max, tiles) QPUs. Returns the number of QPUs to launch; `starts` gets each stream's address.
+// Write the per-QPU uniform streams for `probs` (all must share K) at `unif`, tiles in gemm_tiles'
+// order, round-robin over min(nq_max, tiles) QPUs. Returns the number of QPUs to launch; `starts`
+// gets each stream's address.
 template <class CpuMap>
 int gemm_wt_uniforms(CpuMap cpu, uint32_t unif, const std::vector<GemmWtProblem>& probs, int nq_max,
-                     uint32_t done, uint32_t seq, std::vector<uint32_t>& starts) {
-    struct Tile { const GemmWtProblem* p; int m0, n0; };
-    std::vector<Tile> tiles;
-    // m-major: the tiles running at the same time share one 16-row block of W, which every QPU
-    // gathers through the TMU. n-major order (each QPU a different W block) ran 3.6x slower on the
-    // Pi Zero -- four 16-row working sets per slice's TMU cache instead of one.
-    for (auto& p : probs)
-        for (int m0 = 0; m0 < p.M; m0 += 16)
-            for (int n0 = 0; n0 < p.N; n0 += 16) tiles.push_back({&p, m0, n0});
+                     uint32_t done, uint32_t seq, std::vector<uint32_t>& starts, GemmOut out = GEMM_OUT_N,
+                     int panel = 0) {
+    std::vector<GemmTile> tiles;
+    for (size_t i = 0; i < probs.size(); i++) gemm_tiles(probs[i].M, probs[i].N, panel, int(i), tiles);
     const int nq = std::min<int>(nq_max, int(tiles.size()));
     starts.clear();
     if (nq == 0) return 0;
     const int K = probs[0].K, Kp = gemm_wt_kp(K);
-    const uint32_t vpm_hsetup = 1u << 12 | 1u << 11 | 2u << 8;
     const uint32_t done_vdw = 0x80000000u | 1u << 23 | 16u << 16 | 1u << 14;
     uint32_t at = unif;
     for (int q = 0; q < nq; q++) {
@@ -190,24 +185,25 @@ int gemm_wt_uniforms(CpuMap cpu, uint32_t unif, const std::vector<GemmWtProblem>
         int i = 0, mine = 0;
         for (size_t t = q; t < tiles.size(); t += nq) mine++;
         u[i++] = uint32_t(mine);
-        u[i++] = 0;  // W row stride: per problem, patched below (one stride per launch)
+        u[i++] = probs[0].w_stride;  // one W row stride per launch
         u[i++] = uint32_t(Kp / GEMM_U);
-        u[i++] = vpm_hsetup;
-        u[i++] = vpm_hsetup;
+        u[i++] = gemm_vpm_setup(out);
+        u[i++] = gemm_vpm_setup(GEMM_OUT_N);
         u[i++] = 0xc0000000u;
         u[i++] = done_vdw;
         u[i++] = done + q * 64;
         u[i++] = seq;
-        u[1] = probs[0].w_stride;
         for (size_t t = q; t < tiles.size(); t += nq) {
-            const Tile& T = tiles[t];
-            const GemmWtProblem& P = *T.p;
+            const GemmTile& T = tiles[t];
+            const GemmWtProblem& P = probs[T.p];
             const int mvalid = std::min(16, P.M - T.m0), nvalid = std::min(16, P.N - T.n0);
+            uint32_t stride_setup, vdw_setup, addr;
+            gemm_tile_vdw(out, P.c, P.c_stride, T.m0, T.n0, mvalid, nvalid, stride_setup, vdw_setup, addr);
             u[i++] = uint32_t(mvalid - 1);
             u[i++] = P.w + uint32_t(T.m0) * P.w_stride;
-            u[i++] = 0xc0000000u | (P.c_stride - uint32_t(mvalid) * 4);
-            u[i++] = 0x80000000u | uint32_t(nvalid) << 23 | uint32_t(mvalid) << 16 | 1u << 14;
-            u[i++] = P.c + uint32_t(T.n0) * P.c_stride + uint32_t(T.m0) * 4;
+            u[i++] = stride_setup;
+            u[i++] = vdw_setup;
+            u[i++] = addr;
             u[i++] = P.xpack + uint32_t(size_t(T.n0 / 16) * Kp * 16 * 4);
             u[i] = at + uint32_t(i + 1) * 4;
             i++;
