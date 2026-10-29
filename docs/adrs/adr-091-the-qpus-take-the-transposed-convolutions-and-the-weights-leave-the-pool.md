@@ -145,9 +145,16 @@ VITS F32 (62.6 MB of weights) and Moonshine F32 could not use the QPUs at all.
   its F32 output, and VC4's against the CPU's is 9.3 dB (Q8_0_PC: the QPU kernel keeps activations in
   float, the CPU's quantizes them) and 30.8 dB (F32). Whisper base transcribes all nine outputs --
   CPU and CPU+VC4 for each size and precision -- to the same sentence (the audio reversed does not).
-  7m and 2m moved by 2-5% in one run each, less than one run resolves on this board at that length,
-  though their prefill attention (16 MUL_MATs, ~0.07 GFLOP) is now the CPU's; the chart's three rounds
-  will say.
-* Open: the first inference of a model with many F32 matrices copies them into the pool (conformer-ctc
+  Three rounds (run `out4`, cold, median and range; the CPU arms equal the run before within 0.3%):
+
+  | | CPU s | CPU+VC4 before decision 9 s (`out3`) | CPU+VC4 s (`out4`) |
+  |---|---:|---:|---:|
+  | 18m Q8_0_PC / F32 | 23.30 / 31.27 | -- | 19.03 [18.92-19.42] / 25.38 [25.35-25.57] |
+  | 7m Q8_0_PC / F32 | 19.00 / 20.65 | 14.13 [14.11-14.13] / 15.05 [14.96-15.59] | 14.64 [14.50-14.68] / 15.34 [15.33-15.64] |
+  | 2m Q8_0_PC / F32 | 9.06 / 8.87 | 7.06 [7.06-7.07] / 6.70 [6.65-6.73] | 7.26 [7.22-7.48] / 6.80 [6.79-6.86] |
+
+  So decision 9 costs 7m and 2m 2-4%: their prefill attention (16 MUL_MATs) reads the KV cache, now in
+  RAM, so the CPU runs it. The other ten Pi Zero models are within 1-3% of the run before, either way.
+* Open: 7m / 2m's prefill attention back on the QPUs (a per-call copy of the cache, N >= 16); the first inference of a model with many F32 matrices copies them into the pool (conformer-ctc
   0.2 s); CONV_TRANSPOSE_1D with a stride that is not a power of two, or with a residual or mask after it,
   stays on the CPU; "auto" has no fallback when another process holds the pool.
