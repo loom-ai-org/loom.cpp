@@ -70,10 +70,14 @@ VITS F32 (62.6 MB of weights) and Moonshine F32 could not use the QPUs at all.
    28.1 MB compute buffer, under 1 MB of everything else, and squeezed out the arena: the decoder's
    convolutions, which 7m (an 8 MB cache, same codec) runs on the QPUs, went to the CPU. Not VC4_HOST: a
    copy of what the QPUs read there is cached by address, as for weights that never change, and a cache
-   changes every frame. In a CPU buffer the scheduler runs what reads the cache on the CPU (VC4 declines
-   an F32 MUL_MAT over a weight outside its buffers): attention, whose frame steps (N = 1) it declined
-   anyway. And VC4 declines a MUL_MAT or convolution whose result is already placed outside the pool --
-   the QPUs write it by bus address.
+   changes every frame. And VC4 declines a MUL_MAT or convolution whose result is already placed
+   outside the pool -- the QPUs write it by bus address.
+10. **An F32 MUL_MAT over host state is read through a copy made for each call** (`is_host_state`: a
+   host buffer neither this backend's nor weights), from 16 columns, as over VC4_HOST but never kept:
+   with the cache in RAM, Pocket 7m and 2m's prefill attention (16 products) went to the CPU and their
+   synthesis took 2-4% longer. A sabotaged build that kept the copy fails `test_vc4_backend`'s
+   attention case, whose cache is rewritten between computes (max|d| 13.7). The frame steps (N = 1)
+   stay on the CPU.
 
 ## Alternatives considered
 
@@ -145,16 +149,18 @@ VITS F32 (62.6 MB of weights) and Moonshine F32 could not use the QPUs at all.
   its F32 output, and VC4's against the CPU's is 9.3 dB (Q8_0_PC: the QPU kernel keeps activations in
   float, the CPU's quantizes them) and 30.8 dB (F32). Whisper base transcribes all nine outputs --
   CPU and CPU+VC4 for each size and precision -- to the same sentence (the audio reversed does not).
-  Three rounds (run `out4`, cold, median and range; the CPU arms equal the run before within 0.3%):
+  Three rounds (cold, median and range; the CPU arms of the three runs agree within 0.5%):
 
-  | | CPU s | CPU+VC4 before decision 9 s (`out3`) | CPU+VC4 s (`out4`) |
-  |---|---:|---:|---:|
-  | 18m Q8_0_PC / F32 | 23.30 / 31.27 | -- | 19.03 [18.92-19.42] / 25.38 [25.35-25.57] |
-  | 7m Q8_0_PC / F32 | 19.00 / 20.65 | 14.13 [14.11-14.13] / 15.05 [14.96-15.59] | 14.64 [14.50-14.68] / 15.34 [15.33-15.64] |
-  | 2m Q8_0_PC / F32 | 9.06 / 8.87 | 7.06 [7.06-7.07] / 6.70 [6.65-6.73] | 7.26 [7.22-7.48] / 6.80 [6.79-6.86] |
+  | | CPU s (`out5`) | CPU+VC4 before 9 s (`out3`) | 9 s (`out4`) | 9 + 10 s (`out5`) |
+  |---|---:|---:|---:|---:|
+  | 18m Q8_0_PC / F32 | 23.27 / 31.10 | 38.72 / 33.41 | 19.03 [18.92-19.42] / 25.38 [25.35-25.57] | 18.33 [18.22-18.45] / 24.98 [24.77-25.26] |
+  | 7m Q8_0_PC / F32 | 18.91 / 20.70 | 14.13 [14.11-14.13] / 15.05 [14.96-15.59] | 14.64 [14.50-14.68] / 15.34 [15.33-15.64] | 14.04 [14.04-14.13] / 14.91 [14.90-14.92] |
+  | 2m Q8_0_PC / F32 | 9.07 / 8.85 | 7.06 [7.06-7.07] / 6.70 [6.65-6.73] | 7.26 [7.22-7.48] / 6.80 [6.79-6.86] | 7.08 [7.05-7.10] / 6.66 [6.63-6.79] |
 
-  So decision 9 costs 7m and 2m 2-4%: their prefill attention (16 MUL_MATs) reads the KV cache, now in
-  RAM, so the CPU runs it. The other ten Pi Zero models are within 1-3% of the run before, either way.
-* Open: 7m / 2m's prefill attention back on the QPUs (a per-call copy of the cache, N >= 16); the first inference of a model with many F32 matrices copies them into the pool (conformer-ctc
+  (`out3` ran the since-removed pool budget; one run without it, `poolmap`, gave 7m Q8_0_PC 14.08 s and 2m 7.08.) Decision 9 alone cost
+  7m and 2m 2-4%, which decision 10 takes back; 18m gains 0.4-0.7 s more. With both, 7m and 2m's
+  outputs against the CPU's are `out3`'s to the tenth of a dB (18.8 / 16.4, 16.8 / 53.1 dB). The other
+  ten Pi Zero models (`bench4`, decision 9) are within 1-3% of the run before, either way.
+* Open: the first inference of a model with many F32 matrices copies them into the pool (conformer-ctc
   0.2 s); CONV_TRANSPOSE_1D with a stride that is not a power of two, or with a residual or mask after it,
   stays on the CPU; "auto" has no fallback when another process holds the pool.
