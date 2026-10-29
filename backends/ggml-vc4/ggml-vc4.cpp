@@ -159,15 +159,19 @@ struct Runtime {
     std::map<std::tuple<const void *, int, size_t>, Packed> packed;
     std::shared_ptr<vc4::GpuBuffer> slab;   // the slab packed_weights fills now, `slab_used` bytes of it
     size_t slab_used = 0;
-    // P4.47: VC4_Q8 weights back in ggml's Q8_0 layout, in VC4_HOST, for the CPU to run a node over one
-    // when the pool refuses its call (q8_cpu_copy); dropped with the VC4_Q8 buffer.
+    // P4.47: VC4_Q8 weights back in ggml's Q8_0 layout, in CPU_ARMV6_I8 or VC4_HOST, for the CPU to run
+    // a node over one when the pool refuses its call (q8_cpu_copy); dropped with the VC4_Q8 buffer.
     struct CpuCopy {
         ggml_context * ctx;
         ggml_backend_buffer_t buf;
         ggml_tensor * t;
         ggml_backend_buffer_t owner;
     };
-    std::map<std::tuple<const void *, int, size_t>, CpuCopy> cpu_copies;
+    std::map<std::tuple<const void *, ggml_backend_buffer_type_t, size_t>, CpuCopy> cpu_copies;
+    // The smallest arena the pool refused since it last got a block back (GpuBuffer::frees() was
+    // `refused_frees` then): see ensure_arena.
+    size_t refused_need = SIZE_MAX;
+    uint64_t refused_frees = 0;
     // The CPU backend the nodes this backend claims but cannot fold into a convolution run on (P4.46).
     ggml_backend_t cpu = nullptr;
     uint32_t ctrl = 0, done = 0, code = 0;
@@ -511,17 +515,34 @@ void launch_and_wait(Runtime & rt, int nq, const std::vector<uint32_t> & starts,
 // one this call is using (`keep`) are let go and it is tried again at exactly the size needed.
 // GGML_VC4_ARENA_MAX_KB caps it, so the board test can make the pool refuse a call and check that the
 // node runs on the CPU instead (P4.47).
+//
+// A refusal is remembered: until the pool gets a block back, a call needing at least what it refused
+// is refused at once. Each refusal had cost four failed dma-heap requests and every packed weight but
+// one: Pocket TTS 18m Q8_0_PC, whose scheduler buffers hold 63.5 of the 64 MB, had ~158 nodes a run
+// refused that way, frame after frame (P4.47). Past the retries GpuBuffer makes for pages the kernel
+// is still migrating, room comes back only with a block given back: what the arena held goes before a
+// request, so the pool is as it was when it refused, and whatever this backend has allocated since
+// only took more of it.
 void ensure_arena(Runtime & rt, size_t need, const void * keep = nullptr) {
     static const size_t cap = [] { const char * e = getenv("GGML_VC4_ARENA_MAX_KB"); return e ? size_t(atoll(e)) << 10 : SIZE_MAX; }();
     if (need > cap) throw std::runtime_error("arena of " + std::to_string(need) + " bytes above GGML_VC4_ARENA_MAX_KB");
     if (rt.arena && rt.arena->size() >= need) return;
+    if (need >= rt.refused_need && vc4::GpuBuffer::frees() == rt.refused_frees)
+        throw std::runtime_error("the pool refused an arena of " + std::to_string(rt.refused_need) + " bytes and has had nothing back since");
     rt.arena.reset();
     try {
         rt.arena = std::make_unique<vc4::GpuBuffer>(uint32_t((need + need / 4 + 65535) & ~size_t(65535)), /*cached=*/true);
     } catch (const std::exception &) {
         for (auto it = rt.packed.begin(); it != rt.packed.end();) it = std::get<0>(it->first) == keep ? std::next(it) : rt.packed.erase(it);
         rt.slab.reset();
-        rt.arena = std::make_unique<vc4::GpuBuffer>(uint32_t((need + 65535) & ~size_t(65535)), /*cached=*/true);
+        try {
+            rt.arena = std::make_unique<vc4::GpuBuffer>(uint32_t((need + 65535) & ~size_t(65535)), /*cached=*/true);
+        } catch (const std::exception &) {
+            const uint64_t frees = vc4::GpuBuffer::frees();   // after what was let go above
+            rt.refused_need = frees == rt.refused_frees ? std::min(rt.refused_need, need) : need;
+            rt.refused_frees = frees;
+            throw;
+        }
     }
 }
 
@@ -1655,10 +1676,11 @@ void conv_run(const Fusion & f) {
     g_stats.fused += (f.act != nullptr) + (f.bias != nullptr) + (f.residual != nullptr) + f.relu + (f.mask != nullptr);
 }
 
-// A VC4_Q8 weight back in ggml's layout (gemm_q8_unpack: exact), for the CPU backend; made once.
-ggml_tensor * q8_cpu_copy(const ggml_tensor * w) {
+// A VC4_Q8 weight back in ggml's layout (gemm_q8_unpack: exact), for the CPU backend; made once per
+// buffer type: `buft` (the CPU's int8 one, which repacks it in set_tensor) or, null, VC4_HOST.
+ggml_tensor * q8_cpu_copy(const ggml_tensor * w, ggml_backend_buffer_type_t buft) {
     Runtime & rt = runtime();
-    const auto key = pack_key(w, PACK_QB);
+    const auto key = std::make_tuple(weight_data(w), buft, ggml_nbytes(w));
     {
         std::lock_guard<std::mutex> lock(rt.mu);
         auto it = rt.cpu_copies.find(key);
@@ -1668,14 +1690,17 @@ ggml_tensor * q8_cpu_copy(const ggml_tensor * w) {
     ggml_context * ctx = ggml_init(ip);
     ggml_tensor * t = ggml_dup_tensor(ctx, w);
     ggml_set_name(t, ggml_get_name(w));
-    ggml_backend_buffer_t buf = host_buft_alloc_buffer(vc4_host_buffer_type(), ggml_nbytes(t));
+    ggml_backend_buffer_t buf = buft != nullptr ? ggml_backend_buft_alloc_buffer(buft, ggml_backend_buft_get_alloc_size(buft, t))
+                                                : host_buft_alloc_buffer(vc4_host_buffer_type(), ggml_nbytes(t));
     if (buf == nullptr) {
         ggml_free(ctx);
         throw std::runtime_error("no memory for a CPU copy of a VC4_Q8 weight");
     }
     GGML_ASSERT(ggml_backend_tensor_alloc(buf, t, ggml_backend_buffer_get_base(buf)) == GGML_STATUS_SUCCESS);
+    std::vector<BlockQ8_0> blocks(ggml_nbytes(t) / sizeof(BlockQ8_0));
     vc4::gemm_q8_unpack(static_cast<const uint8_t *>(w->data), int(w->ne[1]), int(w->ne[0]), [](float d) { return ggml_fp32_to_fp16(d); },
-                        static_cast<BlockQ8_0 *>(t->data));
+                        blocks.data());
+    ggml_backend_tensor_set(t, blocks.data(), 0, ggml_nbytes(t));
     std::lock_guard<std::mutex> lock(rt.mu);
     rt.cpu_copies.emplace(key, Runtime::CpuCopy{ctx, buf, t, w->buffer});
     return t;
@@ -1698,6 +1723,23 @@ ggml_backend_dev_t cpu_device() {
     if (f == nullptr) f = dlsym(RTLD_DEFAULT, "ggml_backend_dev_by_type");   // a build that links ggml in
     return f ? reinterpret_cast<dev_by_type_t>(f)(GGML_BACKEND_DEVICE_TYPE_CPU) : nullptr;
 }
+// The CPU's per-channel int8 buffer type (ggml-0041/0043: MUL_MAT and pointwise CONV_2D), where a
+// VC4_Q8 weight's CPU copy goes: in VC4_HOST, as plain Q8_0, ggml's generic kernel ran Pocket TTS 18m
+// Q8_0_PC's refused nodes, and CPU+VC4 took 38.9 s to the CPU's 23.3 (P4.47). Null when this ggml has
+// none (not ARMv6, or GGML_CPU_ARMV6_I8=0). Not CPU_NEON_I8: it takes no CONV_2D.
+ggml_backend_buffer_type_t cpu_int8_buffer_type() {
+    static ggml_backend_buffer_type_t buft = [] {
+        ggml_backend_dev_t dev = cpu_device();
+        if (dev == nullptr) return ggml_backend_buffer_type_t(nullptr);
+        auto get_extra = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_dev_get_extra_bufts"));
+        for (ggml_backend_buffer_type_t * p = get_extra ? get_extra(dev) : nullptr; p != nullptr && *p != nullptr; ++p)
+            if (strcmp(ggml_backend_buft_name(*p), "CPU_ARMV6_I8") == 0) return *p;
+        return ggml_backend_buffer_type_t(nullptr);
+    }();
+    return buft;
+}
+
 ggml_backend_t cpu_backend(Runtime & rt) {
     if (rt.cpu == nullptr) {
         ggml_backend_dev_t dev = cpu_device();
@@ -1763,7 +1805,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph * cgraph) {
     // chain folded into it: VITS Q8_0_PC with its upsampling on the QPUs and its 29 MB of weights still
     // in the 64 MB pool failed the whole synthesis there ("dma_heap alloc: Cannot allocate memory").
     // Everything this backend allocates is before its first launch, so nothing was half written. A
-    // VC4_Q8 weight, which only the QPUs can read, is given to the CPU as its Q8_0 copy (q8_cpu_copy).
+    // VC4_Q8 weight, which only the QPUs can read, is given to the CPU as its Q8_0 copy (q8_cpu_copy):
+    // in the CPU's int8 buffer type when the CPU device takes the node from there, else plain.
     auto on_cpu = [&](int first, int last, const std::exception & e) {
         static std::atomic<bool> said{false};
         if (!said.exchange(true) || debug_on())
@@ -1773,10 +1816,11 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph * cgraph) {
         for (int j = first; j <= last; j++)
             for (int k = 0; k < GGML_MAX_SRC; k++) {
                 ggml_tensor *& src = cgraph->nodes[j]->src[k];
-                if (src != nullptr && is_vc4_q8_buffer(src->buffer)) {
-                    swapped.emplace_back(&src, src);
-                    src = q8_cpu_copy(src);
-                }
+                if (src == nullptr || !is_vc4_q8_buffer(src->buffer)) continue;
+                swapped.emplace_back(&src, src);
+                ggml_backend_buffer_type_t i8 = cpu_int8_buffer_type();
+                src = q8_cpu_copy(src, i8);
+                if (i8 != nullptr && !ggml_backend_dev_supports_op(cpu_device(), cgraph->nodes[j])) src = q8_cpu_copy(swapped.back().second, nullptr);
             }
         run0 = first;
         flush_cpu(last + 1);
