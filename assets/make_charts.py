@@ -21,18 +21,21 @@ PI4 = [  # model, task, F32 vs onnxruntime FP32, Q8_0_PC vs onnxruntime int8
 ]
 
 # docs/BENCHMARKS.md, "Raspberry Pi Zero W: CPU against CPU+VC4": real-time factor of each device's
-# faster precision, 2026-10-29 (P4.47). CPU is the ARM11 alone; CPU+VC4 adds the GPU's 12 QPUs (ggml-vc4, "auto").
+# faster precision, 2026-10-29/30 (P4.47, loom.cpp #106 at 6ffd561). CPU is the ARM11 alone; CPU+VC4 adds the GPU's 12 QPUs (ggml-vc4, "auto").
 PIZERO = [  # model, task, CPU RTF, CPU+VC4 RTF
     ("WakeHuBERT tiny", "wake word", 0.17, 0.12),
     ("Silero VAD", "VAD", 0.18, 0.16),
     ("sanoTTS heartnano", "TTS", 0.22, 0.19),
-    ("sanoTTS heart", "TTS", 0.53, 0.29),
+    ("sanoTTS heart", "TTS", 0.54, 0.29),
     ("Citrinet-256", "ASR", 0.65, 0.31),
     ("sanoTTS thorsten (de)", "TTS", 0.72, 0.35),
-    ("sanoTTS amy", "TTS", 2.29, 0.69),
-    ("Moonshine tiny", "ASR", 1.80, 1.18),
-    ("Conformer-CTC small", "ASR", 1.96, 1.39),
-    ("VITS piper (miro)", "TTS", 5.85, 1.73),
+    ("sanoTTS amy", "TTS", 2.30, 0.69),
+    ("Moonshine tiny", "ASR", 1.80, 1.17),
+    ("Conformer-CTC small", "ASR", 1.90, 1.39),
+    ("Pocket TTS 2m", "TTS", 1.84, 1.39),
+    ("VITS piper (miro)", "TTS", 5.83, 1.74),
+    ("Pocket TTS 7m", "TTS", 3.94, 2.92),
+    ("Pocket TTS 18m", "TTS", 4.85, 3.82),
 ]
 
 THEMES = {
@@ -88,7 +91,7 @@ def pi4_chart(t):
 
 
 def pizero_chart(t):
-    w, left, right, row, top, scale = 760, 200, 56, 46, 96, 3.0
+    w, left, right, row, top, scale = 760, 200, 56, 46, 96, 6.0   # Pocket TTS 18m's CPU bar is 4.85, VITS's 5.85
     h = top + row * len(PIZERO) + 40
     span = w - left - right
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
@@ -100,7 +103,7 @@ def pizero_chart(t):
         x = 20 + k * 110
         out.append(f'<rect x="{x}" y="66" width="12" height="12" rx="2" fill="{color}"/>')
         out.append(text(x + 18, 76, label, t["fg"], 12))
-    for k in [0, 0.5, 1, 1.5, 2, 2.5, 3]:
+    for k in range(int(scale) + 1):
         gx = left + span * k / scale
         out.append(f'<line x1="{gx:.1f}" y1="{top - 4}" x2="{gx:.1f}" y2="{h - 34}" stroke="{t["grid"]}" stroke-width="1"/>')
         out.append(text(gx, h - 16, f"{k:g}", t["muted"], 11, "middle"))
