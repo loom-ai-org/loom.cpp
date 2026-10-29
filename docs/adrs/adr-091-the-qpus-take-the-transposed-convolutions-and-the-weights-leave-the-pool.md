@@ -50,6 +50,19 @@ VITS F32 (62.6 MB of weights) and Moonshine F32 could not use the QPUs at all.
    QPUs read, goes as its Q8_0 blocks rebuilt in RAM (`gemm_q8_unpack`: exact, since each row had one
    fp16 scale), made once and dropped with the VC4_Q8 buffer. `GGML_VC4_ARENA_MAX_KB` caps the arena,
    so the board test forces that path.
+6. **VC4_Q8 buffers are RAM too**, the QPUs reading a slab copy of a weight (`q8_weight`) kept like a
+   packed one, or made per call into the arena's first bytes. In the pool, Pocket TTS 18m Q8_0_PC's
+   per-channel weights left no room for the scheduler's 15-29 MB buffers and its graph failed to
+   allocate -- for matrices most of whose products are frame-by-frame N = 1 steps the QPUs decline.
+7. **An F32 MUL_MAT over a VC4_HOST weight is taken from 16 columns**, as the int8 kernels are: Pocket
+   18m's 512 x 1 x 512 decode products copied a 1 MB weight into the pool per call, 2700 times a run
+   (QPU 6.9 s, host 18 s), where the CPU does the product in less than the copy.
+8. **The CPU copy of a refused VC4_Q8 weight goes in CPU_ARMV6_I8** when the CPU device takes the node
+   from there (MUL_MAT, pointwise CONV_2D), else in VC4_HOST as plain Q8_0: in VC4_HOST, ggml's generic
+   Q8_0 kernel ran Pocket 18m's refused nodes and CPU+VC4 took 38.9 s to the CPU's 23.3. And a refused
+   arena is remembered: until some GPU block is freed (`GpuBuffer::frees()`), a call needing at least
+   what was refused goes to the CPU at once, instead of four failed dma-heap requests and every packed
+   weight dropped, for each of the ~158 nodes the full pool refuses in two 18m inferences.
 
 ## Alternatives considered
 
@@ -65,6 +78,9 @@ VITS F32 (62.6 MB of weights) and Moonshine F32 could not use the QPUs at all.
   by nodes of both kinds, and the graph does not exist at load time. With every QPU read a copy, there
   is nothing to route.
 * **Freeing the ggml-layout bytes once packed**: one CMA allocation cannot be partly freed.
+* **A first-come pool budget for packed copies, reserved at supports_op time**: VITS's text encoder
+  took the budget, its vocoder's convolutions were declined, and VITS CPU+VC4 went from 5.86 to 15.5 s.
+  Which nodes deserve the pool is not known in the order the scheduler asks.
 
 ## Consequences
 
@@ -101,6 +117,12 @@ VITS F32 (62.6 MB of weights) and Moonshine F32 could not use the QPUs at all.
   weights in the fake host buffer type; it fails with the function returning the device's own.
 * No other ggml device is affected: the CPU, BLAS and Metal offer no host buffer type, and the GPU
   backends that do have buffers of their own that are not host memory.
-* Open: the first inference of a model with many F32 matrices copies them into the pool (conformer-ctc
+* Pocket TTS 18m (60 frames, 4.80 s of audio, run `q18`, one process an arm, two inferences): Q8_0_PC
+  CPU 23.28 / 23.25 s, CPU+VC4 22.72 / 22.06 s (38.9 s before decision 8); F32 CPU 31.08 / 30.97,
+  CPU+VC4 30.09 / 31.04. Its scheduler buffers take 63.5 of the 64 MB, so the QPUs run only 112 of its
+  MUL_MATs (0.27 s) and the rest is the CPU's: break-even is what the pool allows. Against the CPU arm,
+  SNR 24.0 dB (Q8_0_PC) and 30.2 dB (F32): the latent loop amplifies rounding (not yet teacher-forced).
+* Open: Pocket 18m F32 on CPU+VC4 gives a first inference different from its second (which nodes the
+  pool takes depends on what it holds); the first inference of a model with many F32 matrices copies them into the pool (conformer-ctc
   0.2 s); CONV_TRANSPOSE_1D with a stride that is not a power of two, or with a residual or mask after it,
   stays on the CPU; "auto" has no fallback when another process holds the pool.
