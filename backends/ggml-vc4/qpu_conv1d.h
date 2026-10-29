@@ -15,6 +15,10 @@
 // The QPUs take the INTERIOR -- every t whose KW taps all land inside x -- and the host computes the
 // few padded positions at each end (conv1d_interior), so no lane ever needs a bounds test.
 //
+// Epilogue (P4.46, qpu_gemm.h's Epilogue): the bias is where the accumulators start, 16 uniforms per
+// tile in place of 16 zeroing ldi -- free; the residual is one TMU request per output channel, 2
+// instructions a channel, ~1% of a VITS vocoder tile; the mask one TMU read a tile.
+//
 // Output: an accumulator is one output channel's 16 positions, one horizontal VPM row. When dst's
 // rows are close enough for the VDW stride field (13 bits: T_out up to ~2048) the tile is one DMA of
 // nvalid rows, as in the GEMM kernel (CONV1D_OUT_BLOCK); a VITS vocoder row is 300 KB, so there each
@@ -28,6 +32,7 @@
 #include "qpu_gemm.h"  // GEMM_TMU_AHEAD, Program
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 namespace vc4 {
@@ -67,7 +72,8 @@ enum Conv1dOut { CONV1D_OUT_ROWS, CONV1D_OUT_BLOCK };
 
 inline bool conv1d_block_ok(uint32_t dst_row) { return dst_row <= 8191 + 4; }
 
-inline Program conv1d_f32_kernel(int KW, int tail, Conv1dOut out = CONV1D_OUT_ROWS) {
+
+inline Program conv1d_f32_kernel(int KW, int tail, Conv1dOut out = CONV1D_OUT_ROWS, unsigned epi = 0) {
     const int ahead = GEMM_TMU_AHEAD, G = conv1d_group(KW);
     Program p;
     auto unif_to_a = [&](uint32_t ra) { p.mov(ra, 0, MUX_A, R_UNIFORM); };
@@ -88,8 +94,9 @@ inline Program conv1d_f32_kernel(int KW, int tail, Conv1dOut out = CONV1D_OUT_RO
 
     const size_t tile_loop = p.here();
     // Tile params: valid lanes - 1, x address of lane 0's first tap, VDW setup, weight block, where
-    // the epilogue's own params are -- they follow (16 row addresses, or a VDW stride setup and the
-    // tile's dst address), read after the k loop, and the next tile's params follow them.
+    // the epilogue's own params are, and with EPI_BIAS the 16 channels' biases. The epilogue's params
+    // follow (16 residual row addresses, a mask address, then 16 row addresses or a VDW stride setup
+    // and the tile's dst address), read after the k loop, and the next tile's params follow them.
     unif_to_b(9);
     p.mov(W_R0, 0, MUX_A, R_UNIFORM);
     unif_to_b(8);
@@ -100,8 +107,13 @@ inline Program conv1d_f32_kernel(int KW, int tail, Conv1dOut out = CONV1D_OUT_RO
     { Alu a; a.op_mul = M_MUL24; a.waddr_mul = W_R3; a.cond_mul = C_ALWAYS; a.mul_a = MUX_R3; a.mul_b = MUX_B;
       a.raddr_b = 0; p.alu(a); }
     { Alu a; a.op_add = A_ADD; a.waddr_add = W_R2; a.cond_add = C_ALWAYS; a.add_a = MUX_R0; a.add_b = MUX_R3; p.alu(a); }
-    p.mov(W_UNIFORMS_ADDR, 0, MUX_A, 16);
-    for (uint32_t r = 0; r < 16; r++) p.raw(ldi(r, 0, 0));
+    if (epi & EPI_BIAS) {  // read before the uniform stream moves to the weights: the same 16 instructions
+        for (uint32_t r = 0; r < 16; r++) unif_to_a(r);
+        p.mov(W_UNIFORMS_ADDR, 0, MUX_A, 16);
+    } else {
+        p.mov(W_UNIFORMS_ADDR, 0, MUX_A, 16);
+        for (uint32_t r = 0; r < 16; r++) p.raw(ldi(r, 0, 0));
+    }
     p.raw(ldi(W_R1, 0, 0));
     // A TMU request for the tap whose kernel column is kx, then the step to the next tap's address.
     auto tmu_req = [&](int kx) {
@@ -143,6 +155,63 @@ inline Program conv1d_f32_kernel(int KW, int tail, Conv1dOut out = CONV1D_OUT_RO
 
     // Back to the tile params: the epilogue's come next.
     p.mov(W_UNIFORMS_ADDR, 0, MUX_B, R_NOP, 6);
+    if (epi & (EPI_RESIDUAL | EPI_MASK)) {
+        // r3 <- lane l's byte offset along a [.][T_out] row, min(l, valid - 1) * 4 (the three
+        // instructions also cover the uniform read after the switch)
+        { Alu a; a.op_add = A_MIN; a.waddr_add = W_R3; a.cond_add = C_ALWAYS; a.add_a = MUX_A; a.add_b = MUX_B;
+          a.raddr_a = R_ELEMENT_NUMBER; a.raddr_b = 9; p.alu(a); }
+        { Alu a; a.sig = SIG_SMALL_IMM; a.op_add = A_SHL; a.waddr_add = W_R3; a.cond_add = C_ALWAYS; a.add_a = MUX_R3;
+          a.add_b = MUX_B; a.raddr_b = small_int(2); p.alu(a); }
+        p.nop();
+    }
+    // r0 <- the next uniform (an address) + r3; the TMU request for it goes in the instruction after.
+    auto addr = [&](Alu & a) {
+        a.op_add = A_ADD; a.waddr_add = W_R0; a.cond_add = C_ALWAYS; a.add_a = MUX_A; a.raddr_a = R_UNIFORM;
+        a.add_b = MUX_R3;
+    };
+    auto request = [&](Alu & a) {
+        a.op_mul = M_V8MIN; a.waddr_mul = W_TMU0_S; a.cond_mul = C_ALWAYS; a.mul_a = MUX_R0; a.mul_b = MUX_R0;
+    };
+    if (epi & EPI_RESIDUAL) {
+        // ra_r += residual[oc0 + r][t0 + l]: four requests in flight, never a pop and a TMU write in
+        // one instruction (qpu_gemm.h).
+        { Alu a; addr(a); p.alu(a); }
+        for (int r = 0; r < 4; r++) { Alu a; request(a); if (r < 3) addr(a); p.alu(a); }
+        for (uint32_t r = 0; r < 16; r++) {
+            { Alu a; a.sig = SIG_LDTMU0; if (r + 4 < 16) addr(a); p.alu(a); }
+            { Alu a; a.op_add = A_FADD; a.waddr_add = r; a.cond_add = C_ALWAYS; a.add_a = MUX_A; a.raddr_a = r;
+              a.add_b = MUX_R4; if (r + 4 < 16) request(a); p.alu(a); }
+        }
+    }
+    if (epi & EPI_MASK) {
+        { Alu a; addr(a); p.alu(a); }
+        { Alu a; request(a); p.alu(a); }
+        p.nop(SIG_LDTMU0);
+    }
+    if ((epi & EPI_RELU) && (epi & EPI_MASK)) {
+        // r1 <- max(ra_i, 0) ; ra_(i-1) <- r1 * mask, the mul writing regfile A (ws = 1)
+        for (uint32_t i = 0; i <= 16; i++) {
+            Alu a; a.ws = 1;
+            if (i < 16) {
+                a.sig = SIG_SMALL_IMM; a.op_add = A_FMAX; a.waddr_add = W_R1; a.cond_add = C_ALWAYS; a.add_a = MUX_A;
+                a.raddr_a = i; a.add_b = MUX_B; a.raddr_b = small_int(0);
+            }
+            if (i > 0) { a.op_mul = M_FMUL; a.waddr_mul = i - 1; a.cond_mul = C_ALWAYS; a.mul_a = MUX_R1; a.mul_b = MUX_R4; }
+            p.alu(a);
+        }
+    } else if (epi & EPI_RELU) {
+        for (uint32_t r = 0; r < 16; r++) {
+            Alu a; a.sig = SIG_SMALL_IMM; a.op_add = A_FMAX; a.waddr_add = r; a.cond_add = C_ALWAYS; a.add_a = MUX_A;
+            a.raddr_a = r; a.add_b = MUX_B; a.raddr_b = small_int(0);
+            p.alu(a);
+        }
+    } else if (epi & EPI_MASK) {
+        for (uint32_t r = 0; r < 16; r++) {
+            Alu a; a.ws = 1; a.op_mul = M_FMUL; a.waddr_mul = r; a.cond_mul = C_ALWAYS; a.mul_a = MUX_A; a.raddr_a = r;
+            a.mul_b = MUX_R4;
+            p.alu(a);
+        }
+    }
     p.mutex_acquire();
     p.mov(W_VPMVCD_SETUP, 1, MUX_B, R_NOP, 2);
     for (uint32_t r = 0; r < 16; r++) p.mov(W_VPM, 0, MUX_A, r);
@@ -212,7 +281,17 @@ struct Conv1dProblem {
     uint32_t x, x_row, dst, dst_row, wpack, discard;
 };
 
-constexpr int CONV1D_GLOBAL_WORDS = 11, CONV1D_TILE_WORDS = 5 + 16;  // ROWS; BLOCK uses 5 + 2
+// What the epilogue reads, for one launch: the biases (OC floats, host memory: they go into the
+// uniform stream), the residual's row 0 at this launch's t = 0 and the bytes between its rows, the
+// mask's element at t = 0 (bus addresses).
+struct Conv1dEpi {
+    unsigned flags = 0;
+    const float * bias = nullptr;
+    uint32_t residual = 0, residual_row = 0;
+    uint32_t mask = 0;
+};
+
+constexpr int CONV1D_GLOBAL_WORDS = 11, CONV1D_TILE_WORDS = 5 + 16 + 16 + 16 + 1;  // ROWS, every epilogue; BLOCK uses 5 + 2
 
 inline size_t conv1d_uniform_words(const Conv1dProblem & P, int nq) {
     int lo, hi;
@@ -225,7 +304,7 @@ inline size_t conv1d_uniform_words(const Conv1dProblem & P, int nq) {
 // one weight block). Returns the number of QPUs to launch (0: no interior); `starts` gets each stream.
 template <class CpuMap>
 int conv1d_uniforms(CpuMap cpu, uint32_t unif, const Conv1dProblem & P, int nq_max, uint32_t done, uint32_t seq,
-                    std::vector<uint32_t> & starts, Conv1dOut out = CONV1D_OUT_ROWS) {
+                    std::vector<uint32_t> & starts, Conv1dOut out = CONV1D_OUT_ROWS, const Conv1dEpi & epi = {}) {
     const Conv1dShape & c = P.c;
     const int K = c.IC * c.KW, G = conv1d_group(c.KW), tail = conv1d_tail(c.IC, c.KW);
     int lo, hi;
@@ -264,8 +343,17 @@ int conv1d_uniforms(CpuMap cpu, uint32_t unif, const Conv1dProblem & P, int nq_m
             u[i++] = P.x + uint32_t(T.t0 * c.s - c.p) * 4;
             u[i++] = 0x80000000u | rows << 23 | uint32_t(mvalid) << 16 | 1u << 14;
             u[i++] = P.wpack + uint32_t(size_t(T.b) * K * 16 * 4);
-            u[i] = at + uint32_t(i + 1) * 4;
+            u[i] = at + uint32_t(i + 1 + (epi.flags & EPI_BIAS ? 16 : 0)) * 4;
             i++;
+            if (epi.flags & EPI_BIAS)
+                for (int r = 0; r < 16; r++) {
+                    const float b = T.b * 16 + r < c.OC ? epi.bias[T.b * 16 + r] : 0.f;
+                    memcpy(&u[i++], &b, 4);
+                }
+            if (epi.flags & EPI_RESIDUAL)  // a channel past OC reads the last one's row (and is discarded)
+                for (int r = 0; r < 16; r++)
+                    u[i++] = epi.residual + uint32_t(std::min(T.b * 16 + r, c.OC - 1)) * epi.residual_row + uint32_t(T.t0) * 4;
+            if (epi.flags & EPI_MASK) u[i++] = epi.mask + uint32_t(T.t0) * 4;
             if (out == CONV1D_OUT_BLOCK) {
                 u[i++] = 0xc0000000u | (P.dst_row - uint32_t(mvalid) * 4);
                 u[i++] = P.dst + uint32_t(T.b * 16) * P.dst_row + uint32_t(T.t0) * 4;
