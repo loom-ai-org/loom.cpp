@@ -242,7 +242,12 @@ void release_owned(ggml_backend_buffer_t buffer) {
         ggml_free(c.ctx);
     }
 }
+// GGML_VC4_POOL_LOG=1: each pool buffer allocated and freed, with what the process holds of the pool
+// then (P4.47: told that a 32 MB KV cache and the codec's 28 MB compute buffer filled it for Pocket 18m).
 void buffer_free(ggml_backend_buffer_t buffer) {
+    if (getenv("GGML_VC4_POOL_LOG"))
+        fprintf(stderr, "vc4-pool: free %.3f MB usage %d, live %.3f MB\n", mem_of(buffer).size() / 1048576.0, int(buffer->usage),
+                (vc4::GpuBuffer::live_bytes() - mem_of(buffer).size()) / 1048576.0);
     release_owned(buffer);
     delete static_cast<BufferCtx *>(buffer->context);
 }
@@ -330,6 +335,8 @@ ggml_backend_buffer_t buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t 
         g_stats.buffers++;
         g_stats.buffer_bytes += double(size);
         g_stats.alloc_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (getenv("GGML_VC4_POOL_LOG"))
+            fprintf(stderr, "vc4-pool: alloc %.3f MB, live %.3f MB\n", ctx->mem->size() / 1048576.0, vc4::GpuBuffer::live_bytes() / 1048576.0);
         return ggml_backend_buffer_init(buft, buffer_iface, ctx.release(), size);
     } catch (const std::exception & e) {
         note_refused();
@@ -1985,9 +1992,18 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor * op) {
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE: return true;
-        case GGML_OP_MUL_MAT: return mul_mat_supported(op);
-        case GGML_OP_CONV_2D: return conv_supported(op);
-        case GGML_OP_CONV_TRANSPOSE_1D: return convt_supported(op);
+        default: break;
+    }
+    // The QPUs write a result by its bus address, so it must be in the pool: not a node whose memory is
+    // already placed elsewhere -- a view into the KV cache or output store loom keeps in RAM beside this
+    // device (state_buffer_type, P4.47). The elementwise nodes may: the CPU backend runs them, or one
+    // folded into a convolution leaves its result in the convolution's tensor and is copied out.
+    const ggml_backend_buffer_t placed = op->view_src ? op->view_src->buffer : op->buffer;
+    const bool qpu_dst_ok = placed == nullptr || is_vc4_buffer(placed);
+    switch (op->op) {
+        case GGML_OP_MUL_MAT: return qpu_dst_ok && mul_mat_supported(op);
+        case GGML_OP_CONV_2D: return qpu_dst_ok && conv_supported(op);
+        case GGML_OP_CONV_TRANSPOSE_1D: return qpu_dst_ok && convt_supported(op);
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_UNARY:
         case GGML_OP_ADD:
