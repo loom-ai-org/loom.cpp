@@ -20,16 +20,19 @@ PI4 = [  # model, task, F32 vs onnxruntime FP32, Q8_0_PC vs onnxruntime int8
     ("Citrinet-256", "ASR", 0.65, 9.31),
 ]
 
-# docs/BENCHMARKS.md, "Raspberry Pi Zero W": real-time factor of the faster precision, 1.0.0-rc18.
-PIZERO = [  # model, task, RTF
-    ("WakeHuBERT tiny", "wake word", 0.19),
-    ("Silero VAD", "VAD", 0.20),
-    ("sanoTTS heartnano", "TTS", 0.28),
-    ("sanoTTS heart", "TTS", 0.64),
-    ("Citrinet-256", "ASR", 0.74),
-    ("sanoTTS thorsten (de)", "TTS", 0.79),
-    ("Moonshine tiny", "ASR", 2.21),
-    ("Conformer-CTC small", "ASR", 2.22),
+# docs/BENCHMARKS.md, "Raspberry Pi Zero W: CPU against CPU+VC4": real-time factor of each device's
+# faster precision, 2026-10-29 (P4.47). CPU is the ARM11 alone; CPU+VC4 adds the GPU's 12 QPUs (ggml-vc4, "auto").
+PIZERO = [  # model, task, CPU RTF, CPU+VC4 RTF
+    ("WakeHuBERT tiny", "wake word", 0.17, 0.12),
+    ("Silero VAD", "VAD", 0.18, 0.16),
+    ("sanoTTS heartnano", "TTS", 0.22, 0.19),
+    ("sanoTTS heart", "TTS", 0.53, 0.29),
+    ("Citrinet-256", "ASR", 0.65, 0.31),
+    ("sanoTTS thorsten (de)", "TTS", 0.72, 0.35),
+    ("sanoTTS amy", "TTS", 2.29, 0.69),
+    ("Moonshine tiny", "ASR", 1.80, 1.18),
+    ("Conformer-CTC small", "ASR", 1.96, 1.39),
+    ("VITS piper (miro)", "TTS", 5.85, 1.73),
 ]
 
 THEMES = {
@@ -85,30 +88,39 @@ def pi4_chart(t):
 
 
 def pizero_chart(t):
-    w, left, right, row, top = 760, 200, 40, 34, 78
-    h = top + row * len(PIZERO) + 44
-    span, scale = w - left - right, 2.5
+    w, left, right, row, top, scale = 760, 200, 56, 46, 96, 3.0
+    h = top + row * len(PIZERO) + 40
+    span = w - left - right
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
            f'<rect width="{w}" height="{h}" rx="10" fill="{t["bg"]}"/>',
-           text(20, 30, "Raspberry Pi Zero W — one 1 GHz ARM11 core, 512 MB", t["fg"], 17, weight="600"),
+           text(20, 30, "Raspberry Pi Zero W — one 1 GHz ARM11 core, and its GPU's 12 QPUs", t["fg"], 17, weight="600"),
            text(20, 52, "real-time factor: seconds of compute per second of audio · lower is better · "
                         "left of the line is faster than real time", t["muted"], 12)]
-    for k in [0, 0.5, 1, 1.5, 2, 2.5]:
+    for k, (label, color) in enumerate([("CPU", t["muted"]), ("CPU + VC4", t["good"])]):
+        x = 20 + k * 110
+        out.append(f'<rect x="{x}" y="66" width="12" height="12" rx="2" fill="{color}"/>')
+        out.append(text(x + 18, 76, label, t["fg"], 12))
+    for k in [0, 0.5, 1, 1.5, 2, 2.5, 3]:
         gx = left + span * k / scale
-        out.append(f'<line x1="{gx:.1f}" y1="{top - 4}" x2="{gx:.1f}" y2="{h - 36}" stroke="{t["grid"]}" stroke-width="1"/>')
-        out.append(text(gx, h - 18, f"{k:g}", t["muted"], 11, "middle"))
+        out.append(f'<line x1="{gx:.1f}" y1="{top - 4}" x2="{gx:.1f}" y2="{h - 34}" stroke="{t["grid"]}" stroke-width="1"/>')
+        out.append(text(gx, h - 16, f"{k:g}", t["muted"], 11, "middle"))
     one = left + span / scale
-    out.append(f'<line x1="{one:.1f}" y1="{top - 8}" x2="{one:.1f}" y2="{h - 36}" stroke="{t["ref"]}" '
+    out.append(f'<line x1="{one:.1f}" y1="{top - 8}" x2="{one:.1f}" y2="{h - 34}" stroke="{t["ref"]}" '
                f'stroke-width="1.5" stroke-dasharray="4 3"/>')
     out.append(text(one + 6, top - 10, "real time", t["ref"], 11))
-    for i, (name, task, v) in enumerate(PIZERO):
+    for i, (name, task, cpu, vc4) in enumerate(PIZERO):
         y = top + 4 + i * row
-        bw = span * v / scale
-        color = t["good"] if v < 1 else t["a"]
-        out.append(f'<rect x="{left}" y="{y:.1f}" width="{bw:.1f}" height="20" rx="4" fill="{color}"/>')
-        out.append(text(left + bw + 6, y + 15, f"{v:.2f}", t["fg"], 12, weight="600"))
-        out.append(text(left - 12, y + 15, f'{name} <tspan fill="{t["muted"]}" font-size="11">· {task}</tspan>',
-                        t["fg"], 13, "end", "600"))
+        for k, (v, color) in enumerate([(cpu, t["muted"]), (vc4, t["good"])]):
+            yy = y + k * 18
+            bw = span * min(v, scale) / scale
+            out.append(f'<rect x="{left}" y="{yy:.1f}" width="{bw:.1f}" height="15" rx="3" fill="{color}"/>')
+            label = f"{v:.2f}" + (" ›" if v > scale else "")
+            if v > scale:
+                out.append(text(left + bw - 6, yy + 12, label, t["bg"], 11, "end", "600"))
+            else:
+                out.append(text(left + bw + 6, yy + 12, label, t["fg"], 11, weight="600"))
+        out.append(text(left - 12, y + 15, name, t["fg"], 13, "end", "600"))
+        out.append(text(left - 12, y + 29, task, t["muted"], 11, "end"))
     out.append("</svg>")
     return "\n".join(out)
 
