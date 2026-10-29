@@ -780,7 +780,7 @@ ggml_tensor* GgufModel::primary_copy(ggml_tensor* w) {
     ggml_context_ptr ctx(ggml_init(ggml_init_params{ggml_tensor_overhead() + 256, nullptr, /*no_alloc=*/true}));
     ggml_tensor* copy = ggml_dup_tensor(ctx.get(), w);
     ggml_set_name(copy, ggml_get_name(w));
-    // The pool such a buffer comes from is small (ggml-vc4: the GPU's 64 MB CMA); a copy it cannot hold
+    // Such a buffer may come from a small pool (ggml-vc4's did, the GPU's 64 MB, until P4.47); a copy it cannot hold
     // leaves the CPU's repacked weight in place for these uses, which is what ran before.
     ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), primary_extra_buft_));
     if (!buf) {
