@@ -10,7 +10,9 @@
 // again with the weights in VC4_HOST, ordinary memory, as loom loads them for this device.
 // With GGML_VC4_ARENA_MAX_KB=64 every QPU node is refused its arena and must run on the CPU instead,
 // with the same results (the placement is still the scheduler's: VC4) -- over a VC4_Q8 weight too,
-// which the CPU reads as its Q8_0 copy.
+// which the CPU reads as its Q8_0 copy. And attention over a KV cache loom keeps in RAM beside this
+// device (state_buffer_type): the cache in a CPU buffer, rewritten between computes, which the QPUs
+// must read afresh each call.
 //
 // VC4 is found the way the engine finds it -- loom's backend sweep, which loads libggml-vc4.so or
 // registers the linked one -- so this also gates that loading. Exits 77 without a VC4 device: any
@@ -43,6 +45,8 @@ struct Case {
     std::function<ggml_tensor *(ggml_context *, ggml_context *, ggml_context *)> build;
     // P4.46: weights built in a fourth context, in VC4_Q8 on the VC4 arm (per-channel Q8_0)
     std::function<ggml_tensor *(ggml_context *, ggml_context *, ggml_context *, ggml_context *)> build_q8;
+    // P4.47: state built in a fifth context, in a CPU buffer on both arms, refilled before a last compute
+    std::function<ggml_tensor *(ggml_context *, ggml_context *, ggml_context *, ggml_context *)> build_state;
 };
 
 // Random values a tensor of any of the types here can hold: quantized ones through ggml's quantizer
@@ -89,10 +93,10 @@ static int run(const Case & c) {
     int landed = 0;
     for (int arm = 0; arm < 2; arm++) {
         ggml_init_params wp = {64 * ggml_tensor_overhead(), nullptr, true};
-        ggml_context * cw = ggml_init(wp), * cx = ggml_init(wp), * cq = ggml_init(wp);
+        ggml_context * cw = ggml_init(wp), * cx = ggml_init(wp), * cq = ggml_init(wp), * cs = ggml_init(wp);
         ggml_init_params gp = {512 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
         ggml_context * cg = ggml_init(gp);
-        ggml_tensor * out = c.build_q8 ? c.build_q8(cw, cx, cg, cq) : c.build(cw, cx, cg);
+        ggml_tensor * out = c.build_state ? c.build_state(cw, cx, cg, cs) : c.build_q8 ? c.build_q8(cw, cx, cg, cq) : c.build(cw, cx, cg);
         ggml_backend_buffer_type_t wbt = ggml_backend_get_default_buffer_type(g_vc4);
         if (arm == 0 && g_weights_host && !g_cpu_only) wbt = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(g_vc4));
         ggml_backend_buffer_t bw = ggml_get_first_tensor(cw) ? ggml_backend_alloc_ctx_tensors_from_buft(cw, wbt) : nullptr;
@@ -107,8 +111,9 @@ static int run(const Case & c) {
             }
             bq = ggml_backend_alloc_ctx_tensors_from_buft(cq, qb);
         }
+        ggml_backend_buffer_t bs = ggml_get_first_tensor(cs) ? ggml_backend_alloc_ctx_tensors_from_buft(cs, ggml_backend_cpu_buffer_type()) : nullptr;
         std::mt19937 rng(42);
-        for (ggml_context * ctx : {cw, cx, cq})
+        for (ggml_context * ctx : {cw, cx, cq, cs})
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) fill(t, rng);
         // ggml's CPU quantizes a MUL_MAT's activations to Q8_0 when the weight is quantized, so for
         // those the CPU is not the reference: an f64 product of the dequantized weight is, and the QPUs
@@ -151,13 +156,19 @@ static int run(const Case & c) {
             if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) { printf("compute failed\n"); return 1; }
             best[arm] = std::min(best[arm], now() - t0);
         }
+        if (bs) {   // the cache changes, as between two frames: a copy kept from the calls above is stale
+            std::mt19937 rng2(7);
+            for (ggml_tensor * t = ggml_get_first_tensor(cs); t; t = ggml_get_next_tensor(cs, t)) fill(t, rng2);
+            if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) { printf("compute failed\n"); return 1; }
+        }
         res[arm].resize(ggml_nelements(out));
         ggml_backend_tensor_get(out, res[arm].data(), 0, ggml_nbytes(out));
         ggml_backend_sched_free(sched);
         if (bw) ggml_backend_buffer_free(bw);
         ggml_backend_buffer_free(bx);
         if (bq) ggml_backend_buffer_free(bq);
-        ggml_free(cw); ggml_free(cx); ggml_free(cq); ggml_free(cg);
+        if (bs) ggml_backend_buffer_free(bs);
+        ggml_free(cw); ggml_free(cx); ggml_free(cq); ggml_free(cs); ggml_free(cg);
     }
     double maxd = 0, maxv = 0, cpu_d = 0;
     const std::vector<float> & want = ref.empty() ? res[1] : ref;
@@ -223,6 +234,14 @@ int main(int argc, char ** argv) {
              ggml_tensor * w = ggml_new_tensor_3d(cw, GGML_TYPE_F32, 64, 48, 2);
              ggml_tensor * x = ggml_new_tensor_3d(cx, GGML_TYPE_F32, 64, 40, 4);
              return ggml_mul_mat(cg, w, x);
+         }},
+        // P4.47: a prefill's K^T Q over a KV cache in RAM ([n_embd, kv_size], 4 heads of 64, 48 cells
+        // used): each head a strided view of the cache, read through a per-call copy
+        {"attention K^T Q, KV cache in RAM", 1, nullptr, nullptr, [](ggml_context *, ggml_context * cx, ggml_context * cg, ggml_context * cs) {
+             ggml_tensor * cache = ggml_new_tensor_2d(cs, GGML_TYPE_F32, 64 * 4, 256);
+             ggml_tensor * k = ggml_view_3d(cg, cache, 64, 48, 4, cache->nb[1], 64 * sizeof(float), 0);
+             ggml_tensor * q = ggml_new_tensor_3d(cx, GGML_TYPE_F32, 64, 32, 4);
+             return ggml_mul_mat(cg, k, q);
          }},
         // P4.46
         {"Q4_0 176x76x704 (conformer)", 1, [](ggml_context * cw, ggml_context * cx, ggml_context * cg) {

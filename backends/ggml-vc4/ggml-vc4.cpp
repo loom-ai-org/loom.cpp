@@ -363,6 +363,12 @@ bool is_vc4_host_buffer(const ggml_backend_buffer_t b);
 // A weight this backend packs from: in its pool (vc4) or in its RAM (VC4_HOST). Either way a buffer of
 // this backend's, whose free drops the packed copies.
 bool holds_weights(const ggml_backend_buffer_t b) { return is_vc4_buffer(b) || is_vc4_host_buffer(b); }
+// What loom keeps in RAM beside this device (state_buffer_type, P4.47) -- the KV cache an attention
+// product reads -- in ordinary host memory that is neither this backend's nor weights: read through a
+// copy made for each call, never kept, since it changes between calls.
+bool is_host_state(const ggml_backend_buffer_t b) {
+    return b != nullptr && !holds_weights(b) && ggml_backend_buffer_is_host(b) && b->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
 
 // Where a weight lives. A view of one has no buffer of its own until the allocator initialises it,
 // which is after the scheduler has asked supports_op -- so every reshaped kernel read as "not
@@ -662,11 +668,14 @@ bool mul_mat_supported(const ggml_tensor * op) {
     if (w->type == GGML_TYPE_Q8_0 || w->type == GGML_TYPE_Q4_0) return mul_mat_qb_supported(op);
     if (w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
     // The weights must be a leaf (or a view of one) in a vc4 buffer, where the QPUs read them in place
-    // -- only leaves carry the tail the TMU reads past the last row -- or in VC4_HOST, read through a
-    // copy in the pool.
-    if (!holds_weights(weight_buffer(w))) return false;
+    // -- only leaves carry the tail the TMU reads past the last row -- or in VC4_HOST or a host state
+    // buffer, read through a copy in the pool. Pocket TTS 7m and 2m's prefill attention, 16 products
+    // over the KV cache, went to the CPU when the cache left the pool, and their synthesis took 2-4%
+    // longer (P4.47).
+    const bool state = is_host_state(weight_buffer(w));
+    if (!holds_weights(weight_buffer(w)) && !state) return false;
     if ((w->view_src ? w->view_src->op : w->op) != GGML_OP_NONE) return false;
-    if (is_vc4_host_buffer(weight_buffer(w))) {
+    if (is_vc4_host_buffer(weight_buffer(w)) || state) {
         // A copy is only worth making for a product of many columns: Pocket TTS 18m's frame-by-frame
         // 512 x 1 x 512 products, 2700 of them with the 1 MB weight copied each call, made its
         // synthesis slower on the QPUs than on the CPU (and pushed 3090 nodes out of a full pool). The
@@ -674,7 +683,7 @@ bool mul_mat_supported(const ggml_tensor * op) {
         if (x->ne[1] < 16 || w->nb[0] != 4 || w->nb[1] % 4) return false;
         Runtime & rt = runtime();
         std::lock_guard<std::mutex> lock(rt.mu);
-        if (rt.packed.count(pack_key(w, PACK_WT_PAD)) == 0) {
+        if (state || rt.packed.count(pack_key(w, PACK_WT_PAD)) == 0) {
             size_t free_bytes = 0, total = 0;
             pool_memory(&free_bytes, &total);
             const size_t have = free_bytes + (rt.arena ? rt.arena->size() : 0);
@@ -695,8 +704,10 @@ void mul_mat(ggml_tensor * dst) {
     const auto t_host0 = std::chrono::steady_clock::now();
     const ggml_tensor * w = dst->src[0];
     const ggml_tensor * x = dst->src[1];
-    // in the pool, read in place; or in VC4_HOST (P4.47), read through a copy (`copied` below)
+    // in the pool, read in place; or in VC4_HOST or a host state buffer (P4.47), read through a copy
+    // (`copied` below), never kept for the latter
     vc4::GpuBuffer * wmem = is_vc4_buffer(weight_buffer(w)) ? &mem_of(weight_buffer(w)) : nullptr;
+    const bool state = is_host_state(weight_buffer(w));
     vc4::GpuBuffer & cmem = mem_of(dst->buffer);
     const int K = int(w->ne[0]), M = int(w->ne[1]), N = int(x->ne[1]);
     const int64_t r2 = x->ne[2] / w->ne[2], r3 = x->ne[3] / w->ne[3];
@@ -720,7 +731,7 @@ void mul_mat(ggml_tensor * dst) {
             }
         memset(o + size_t(slices) * sbytes, 0, vc4::gemm_wt_tail_bytes());
     };
-    Packed * pk = pad ? packed_weights(rt, w, PACK_WT_PAD, pbytes, copy_padded) : nullptr;
+    Packed * pk = pad && !state ? packed_weights(rt, w, PACK_WT_PAD, pbytes, copy_padded) : nullptr;
     const size_t wcall = pad && pk == nullptr && (pbytes <= (size_t(1) << 20) || wmem == nullptr) ? (pbytes + 63) & ~size_t(63) : 0;
     const bool copied = pk != nullptr || wcall != 0;
 
