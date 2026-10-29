@@ -46,8 +46,10 @@ VITS F32 (62.6 MB of weights) and Moonshine F32 could not use the QPUs at all.
    them in place (its second, equal). A slab goes with the last copy in it.
 5. **A node the pool refuses memory at compute time runs on the CPU** -- the arena for its staged input
    and per-call weights is grown on demand, after the scheduler's buffers took their share (Retro-102).
-   The node and the chain folded into it go to the CPU backend; a VC4_Q8 weight, which the CPU cannot
-   read, still fails. `GGML_VC4_ARENA_MAX_KB` caps the arena, so the board test forces that path.
+   The node and the chain folded into it go to the CPU backend. A VC4_Q8 weight, whose layout only the
+   QPUs read, goes as its Q8_0 blocks rebuilt in RAM (`gemm_q8_unpack`: exact, since each row had one
+   fp16 scale), made once and dropped with the VC4_Q8 buffer. `GGML_VC4_ARENA_MAX_KB` caps the arena,
+   so the board test forces that path.
 
 ## Alternatives considered
 
@@ -100,6 +102,5 @@ VITS F32 (62.6 MB of weights) and Moonshine F32 could not use the QPUs at all.
 * No other ggml device is affected: the CPU, BLAS and Metal offer no host buffer type, and the GPU
   backends that do have buffers of their own that are not host memory.
 * Open: the first inference of a model with many F32 matrices copies them into the pool (conformer-ctc
-  0.2 s); a VC4_Q8 weight has no CPU fallback when the pool refuses its call's memory;
-  CONV_TRANSPOSE_1D with a stride that is not a power of two, or with a residual or mask after it,
+  0.2 s); CONV_TRANSPOSE_1D with a stride that is not a power of two, or with a residual or mask after it,
   stays on the CPU; "auto" has no fallback when another process holds the pool.

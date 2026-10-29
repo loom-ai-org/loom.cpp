@@ -159,6 +159,15 @@ struct Runtime {
     std::map<std::tuple<const void *, int, size_t>, Packed> packed;
     std::shared_ptr<vc4::GpuBuffer> slab;   // the slab packed_weights fills now, `slab_used` bytes of it
     size_t slab_used = 0;
+    // P4.47: VC4_Q8 weights back in ggml's Q8_0 layout, in VC4_HOST, for the CPU to run a node over one
+    // when the pool refuses its call (q8_cpu_copy); dropped with the VC4_Q8 buffer.
+    struct CpuCopy {
+        ggml_context * ctx;
+        ggml_backend_buffer_t buf;
+        ggml_tensor * t;
+        ggml_backend_buffer_t owner;
+    };
+    std::map<std::tuple<const void *, int, size_t>, CpuCopy> cpu_copies;
     // The CPU backend the nodes this backend claims but cannot fold into a convolution run on (P4.46).
     ggml_backend_t cpu = nullptr;
     uint32_t ctrl = 0, done = 0, code = 0;
@@ -203,12 +212,22 @@ vc4::GpuBuffer & mem_of(ggml_backend_buffer_t buffer) { return *static_cast<Buff
 
 void buffer_free(ggml_backend_buffer_t buffer) {
     Runtime & rt = runtime();
+    std::vector<Runtime::CpuCopy> gone;
     {
         std::lock_guard<std::mutex> lock(rt.mu);
         for (auto it = rt.packed.begin(); it != rt.packed.end();) {
             it = it->second.owner == buffer ? rt.packed.erase(it) : std::next(it);
         }
         rt.slab.reset();   // a slab goes with the last copy in it; the next copy starts another
+        for (auto it = rt.cpu_copies.begin(); it != rt.cpu_copies.end();) {
+            if (it->second.owner != buffer) { ++it; continue; }
+            gone.push_back(it->second);
+            it = rt.cpu_copies.erase(it);
+        }
+    }
+    for (auto & c : gone) {   // outside the lock: freeing a VC4_HOST buffer takes it
+        ggml_backend_buffer_free(c.buf);
+        ggml_free(c.ctx);
     }
     delete static_cast<BufferCtx *>(buffer->context);
 }
@@ -1596,6 +1615,32 @@ void conv_run(const Fusion & f) {
     g_stats.fused += (f.act != nullptr) + (f.bias != nullptr) + (f.residual != nullptr) + f.relu + (f.mask != nullptr);
 }
 
+// A VC4_Q8 weight back in ggml's layout (gemm_q8_unpack: exact), for the CPU backend; made once.
+ggml_tensor * q8_cpu_copy(const ggml_tensor * w) {
+    Runtime & rt = runtime();
+    const auto key = pack_key(w, PACK_QB);
+    {
+        std::lock_guard<std::mutex> lock(rt.mu);
+        auto it = rt.cpu_copies.find(key);
+        if (it != rt.cpu_copies.end()) return it->second.t;
+    }
+    ggml_init_params ip = {ggml_tensor_overhead(), nullptr, /*no_alloc=*/true};
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * t = ggml_dup_tensor(ctx, w);
+    ggml_set_name(t, ggml_get_name(w));
+    ggml_backend_buffer_t buf = host_buft_alloc_buffer(vc4_host_buffer_type(), ggml_nbytes(t));
+    if (buf == nullptr) {
+        ggml_free(ctx);
+        throw std::runtime_error("no memory for a CPU copy of a VC4_Q8 weight");
+    }
+    GGML_ASSERT(ggml_backend_tensor_alloc(buf, t, ggml_backend_buffer_get_base(buf)) == GGML_STATUS_SUCCESS);
+    vc4::gemm_q8_unpack(static_cast<const uint8_t *>(w->data), int(w->ne[1]), int(w->ne[0]), [](float d) { return ggml_fp32_to_fp16(d); },
+                        static_cast<BlockQ8_0 *>(t->data));
+    std::lock_guard<std::mutex> lock(rt.mu);
+    rt.cpu_copies.emplace(key, Runtime::CpuCopy{ctx, buf, t, w->buffer});
+    return t;
+}
+
 // ---- backend ----
 
 const char * backend_get_name(ggml_backend_t) { return "VC4"; }
@@ -1677,13 +1722,25 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph * cgraph) {
     // weights packed for one call, grown on demand -- runs on the CPU backend instead, the node and any
     // chain folded into it: VITS Q8_0_PC with its upsampling on the QPUs and its 29 MB of weights still
     // in the 64 MB pool failed the whole synthesis there ("dma_heap alloc: Cannot allocate memory").
-    // Everything this backend allocates is before its first launch, so nothing was half written.
+    // Everything this backend allocates is before its first launch, so nothing was half written. A
+    // VC4_Q8 weight, which only the QPUs can read, is given to the CPU as its Q8_0 copy (q8_cpu_copy).
     auto on_cpu = [&](int first, int last, const std::exception & e) {
         static std::atomic<bool> said{false};
         if (!said.exchange(true) || debug_on())
             GGML_LOG_WARN("ggml-vc4: %s on the CPU: the GPU pool refused its memory (%s)\n", ggml_op_desc(cgraph->nodes[first]), e.what());
+        // a VC4_Q8 weight is not in ggml's layout: the CPU reads its Q8_0 copy, for this run
+        std::vector<std::pair<ggml_tensor **, ggml_tensor *>> swapped;
+        for (int j = first; j <= last; j++)
+            for (int k = 0; k < GGML_MAX_SRC; k++) {
+                ggml_tensor *& src = cgraph->nodes[j]->src[k];
+                if (src != nullptr && is_vc4_q8_buffer(src->buffer)) {
+                    swapped.emplace_back(&src, src);
+                    src = q8_cpu_copy(src);
+                }
+            }
         run0 = first;
         flush_cpu(last + 1);
+        for (auto & sw : swapped) *sw.first = sw.second;
         g_stats.refused++;
     };
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -1696,14 +1753,11 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph * cgraph) {
         switch (node->op) {
             case GGML_OP_MUL_MAT:
                 flush_cpu(i);
-                // a VC4_Q8 weight is not in ggml's layout: the CPU could not read it, and its kernel
-                // allocates only the arena for the packed activations
                 try {
                     if (is_vc4_q8_buffer(weight_buffer(node->src[0]))) mul_mat_q8(node);
                     else if (node->src[0]->type == GGML_TYPE_F32) mul_mat(node);
                     else mul_mat_qb(node);
                 } catch (const std::exception & e) {
-                    if (is_vc4_q8_buffer(weight_buffer(node->src[0]))) throw;
                     on_cpu(i, i, e);
                 }
                 break;
@@ -1714,7 +1768,6 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph * cgraph) {
                 try {
                     conv_run(f);
                 } catch (const std::exception & e) {
-                    if (is_vc4_q8_buffer(weight_buffer(f.conv->src[0]))) throw;
                     on_cpu(i, f.last, e);
                 }
                 i = f.last;
