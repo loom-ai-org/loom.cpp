@@ -1,8 +1,8 @@
 ---
 type: reference
 domain: performance
-tags: [benchmarks, onnxruntime, raspberry-pi, pi-4, pi-zero, x86, methodology]
-last_updated: 2026-10-24
+tags: [benchmarks, onnxruntime, raspberry-pi, pi-4, pi-zero, vc4, qpu, x86, methodology]
+last_updated: 2026-10-29
 ---
 
 # Benchmarks: loom against onnxruntime, and on the Raspberry Pis
@@ -12,6 +12,7 @@ onnxruntime build) and caveats of each. Moved here from the README on 2026-10-24
 was arrived at, and what changed it over time, is [Epic-05](epics/epic-05-edge-performance.md).
 
 * [Raspberry Pi 4: F32 and Q8_0_PC against onnxruntime](#raspberry-pi-4) (2026-10-23/24, the newest)
+* [Raspberry Pi Zero W: CPU against CPU+VC4](#raspberry-pi-zero-w-cpu-against-cpuvc4) (2026-10-29, P4.47)
 * [Raspberry Pi Zero W: F32 against Q8_0_PC](#raspberry-pi-zero-w) (1.0.0-rc18)
 * [Three tasks on three machines](#three-tasks-on-three-machines) (x86 and the Pi 4, 2026-09-02, an older engine)
 * [What these numbers are not](#what-these-numbers-are-not): the methodology every table here follows
@@ -97,6 +98,41 @@ of them, so they have no onnxruntime cells. Their own F32/Q8_0_PC ratios are in 
   "grey"). The GGUFs are fresh exports on loom-exporter main `89750ac`, whose Mimi decoder attends over a window
   (P4.41), so they are not the Pi Zero rows' files and are not on the Hub yet: md5 `4564c993`/`740ec54f` (18m),
   `45aabdb0`/`f0b44c07` (7m) and `8a2ff5e2`/`d4d4e23c` (2m), F32/Q8_0_PC.
+
+## Raspberry Pi Zero W: CPU against CPU+VC4
+
+The Pi Zero W's GPU, a VideoCore IV with 12 QPUs, as an accelerator beside its one ARM11 core
+([ADR-088](adrs/adr-088-the-pi-zero-qpus-are-an-accelerator-beside-the-cpu.md) to
+[ADR-091](adrs/adr-091-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md)): on a board booted
+without `vc4-kms-v3d`, `device="auto"` runs the convolutions, transposed convolutions and matrix products ggml-vc4 takes
+on the QPUs and every other node on the CPU. Measured on 2026-10-29 with the P4.47 build (loom.cpp #106, not released),
+the CPU arm (`LOOM_DEVICE=cpu`) on the same build: the [table below](#raspberry-pi-zero-w)'s models and inputs, each at
+F32 and Q8_0_PC on both devices, one inference per process (its first call, after loading), 3 rounds with the four arms'
+order reversed every other round, a 3 s settle between launches, median per arm, nothing polling the board. Seconds, RTF
+in brackets; each device's faster precision in bold, and the speedup is between those two.
+
+| Raspberry Pi Zero W | CPU F32 | CPU Q8_0_PC | CPU+VC4 F32 | CPU+VC4 Q8_0_PC | speedup |
+|---|---|---|---|---|---|
+| sanoTTS amy en 1.46M (TTS, 5.90 s of audio) | 13.57 s (2.30) | **13.50 s (2.29)** | 4.09 s (0.69) | **4.06 s (0.69)** | 3.32x |
+| sanoTTS de thorsten 0.51M (TTS, 4.40 s of audio) | 3.19 s (0.72) | **3.18 s (0.72)** | **1.54 s (0.35)** | 1.55 s (0.35) | 2.07x |
+| sanoTTS heart (TTS, 3.18 s of audio) | 1.99 s (0.63) | **1.70 s (0.53)** | **0.92 s (0.29)** | 0.95 s (0.30) | 1.86x |
+| sanoTTS heartnano (TTS, 3.06 s of audio) | 0.68 s (0.22) | **0.68 s (0.22)** | **0.57 s (0.19)** | 0.57 s (0.19) | 1.18x |
+| VITS piper en-GB miro (TTS, 3.39 s of audio) | **19.84 s (5.85)** | 19.90 s (5.87) | **5.86 s (1.73)** | 6.76 s (1.99) | 3.39x |
+| Citrinet-256-ls (ASR, jfk 11.0 s) | 9.87 s (0.90) | **7.16 s (0.65)** | **3.41 s (0.31)** | 3.90 s (0.35) | 2.10x |
+| Moonshine tiny (ASR, jfk 11.0 s) | 25.70 s (2.34) | **19.76 s (1.80)** | 16.73 s (1.52) | **12.96 s (1.18)** | 1.53x |
+| Conformer-CTC small (ASR, 3.0 s of jfk) | **5.89 s (1.96)** | 5.90 s (1.97) | 4.23 s (1.41) | **4.17 s (1.39)** | 1.41x |
+| Silero VAD (jfk 11.0 s) | 2.39 s (0.22) | **2.01 s (0.18)** | 2.16 s (0.20) | **1.80 s (0.16)** | 1.12x |
+| WakeHuBERT tiny (wake word, jfk 11.0 s) | 2.14 s (0.19) | **1.89 s (0.17)** | **1.35 s (0.12)** | 1.39 s (0.13) | 1.40x |
+
+* **Every arm's output hashed the same in all three rounds**, and the CPU+VC4 arms' outputs against the CPU's are
+  [ADR-091](adrs/adr-091-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md)'s: transcripts
+  identical, Citrinet's CTC ids with one near-tie, TTS within 50-98 dB SNR (the QPUs' float rounding is not IEEE).
+* **The CPU column is faster than the rc18 table below** (amy 13.50 s against 14.95 s, Moonshine 19.76 s against
+  24.32 s), on a build three weeks newer than that release's wheel; the rc18 table is kept as it was measured.
+* **What the QPUs do not take stays at the CPU's speed**: Silero VAD's LSTM and Moonshine's decoder are most of their
+  time, hence 1.12x and 1.53x; VITS and amy are almost all convolutions, hence 3.3-3.4x.
+* **A first inference pays for packing the weights into the QPUs' layouts** (kept in the GPU's 64 MB pool while it has
+  room): Conformer-CTC's second inference is 3.55 s (ADR-091's run) against this table's 4.17 s.
 
 ## Raspberry Pi Zero W
 
