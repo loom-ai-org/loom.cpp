@@ -24,6 +24,19 @@
 // nvalid rows, as in the GEMM kernel (CONV1D_OUT_BLOCK); a VITS vocoder row is 300 KB, so there each
 // row is its own DMA, addressed by a uniform, a discard area for a channel past OC (CONV1D_OUT_ROWS).
 //
+// Transposed (P4.47, CONV1D_OUT_PHASES): a stride-s transposed convolution with K = J*s taps is s
+// ordinary J-tap convolutions, one per output phase p, over x padded by J - 1 zeros a side (ggml-0038's
+// polyphase form):
+//
+//     y[oc][q*s + p] = sum_ic sum_j w[ic][oc][p + (J-1-j)*s] * xpad[ic][q + j],   xpad[m] = x[m - (J-1)]
+//
+// so it runs as this kernel over OC*s virtual channels v = oc*s + p (conv1d_pack_wt), each tile 16/s
+// real channels' s phases. Only the output differs: the accumulators go into the VPM vertically, so
+// VPM row l holds position q0 + l's 16 virtual channels, and real channel oc's 16*s outputs
+// (q0*s .. (q0+16)*s - 1, contiguous in dst) are columns oc*s .. oc*s + s - 1 of rows 0..15 -- one DMA
+// of mvalid rows x s words a channel, its VPM column the setup's X. Interleaving the phases on the
+// host instead is a pass over the whole output -- 9.8 MB at three of VITS's four upsampling stages.
+//
 // TMU pipeline: GEMM_TMU_AHEAD requests ahead, as in gemm_f32_wt_kernel, but never past the last k:
 // the last P = ceil(ahead / KW) input channels are a peeled tail that issues no request beyond it,
 // so nothing reads past x's last row and no drain is needed.
@@ -33,6 +46,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 namespace vc4 {
@@ -65,16 +79,22 @@ inline bool conv1d_kernel_ok(int IC, int KW) { return KW >= 1 && IC - conv1d_pee
 //   ra0..ra15 accumulators   ra16 weight block address   ra18 tiles left   ra19 seq
 //   rb0 lane stride s*4   rb1 loop count   rb2 VPM horizontal setup   rb4 next-channel step
 //   rb5 tap step d*4      rb6 tile row addresses   rb8 tile VDW setup (row 0)   rb9 valid lanes - 1
-//   rb10 constant 128
+//   rb10 the VDW setup's step from one DMA to the next: 128 (Y + 1, a row) or, transposed, s << 3 (X + s)
 //   rb11/12/13/14 done marker setups and address
 //   r0 x address / VDW setup   r1 product   r2 TMU address   r3 scratch / loop counter   r4 TMU data
-enum Conv1dOut { CONV1D_OUT_ROWS, CONV1D_OUT_BLOCK };
+enum Conv1dOut { CONV1D_OUT_ROWS, CONV1D_OUT_BLOCK, CONV1D_OUT_PHASES };
+inline bool conv1d_phases_ok(int s) { return s == 1 || s == 2 || s == 4 || s == 8 || s == 16; }
 
 inline bool conv1d_block_ok(uint32_t dst_row) { return dst_row <= 8191 + 4; }
 
 
-inline Program conv1d_f32_kernel(int KW, int tail, Conv1dOut out = CONV1D_OUT_ROWS, unsigned epi = 0) {
+// `phases`: the stride s of a transposed convolution, with CONV1D_OUT_PHASES only.
+inline Program conv1d_f32_kernel(int KW, int tail, Conv1dOut out = CONV1D_OUT_ROWS, unsigned epi = 0, int phases = 1) {
     const int ahead = GEMM_TMU_AHEAD, G = conv1d_group(KW);
+    if (out != CONV1D_OUT_PHASES) phases = 1;
+    // the residual and the mask are read per lane along one channel's row, which a phase tile is not
+    if (out == CONV1D_OUT_PHASES && (!conv1d_phases_ok(phases) || (epi & (EPI_RESIDUAL | EPI_MASK))))
+        throw std::invalid_argument("conv1d_f32_kernel: phases must be 1, 2, 4, 8 or 16, with no residual or mask");
     Program p;
     auto unif_to_a = [&](uint32_t ra) { p.mov(ra, 0, MUX_A, R_UNIFORM); };
     auto unif_to_b = [&](uint32_t rb) { p.mov(rb, 1, MUX_A, R_UNIFORM); };
@@ -82,7 +102,7 @@ inline Program conv1d_f32_kernel(int KW, int tail, Conv1dOut out = CONV1D_OUT_RO
     unif_to_a(18);  // tiles
     unif_to_b(0);   // lane stride
     unif_to_b(1);   // loop count
-    unif_to_b(2);   // VPM horizontal write setup, row 0
+    unif_to_b(2);   // VPM write setup, row 0: horizontal, or vertical for CONV1D_OUT_PHASES
     unif_to_b(11);  // done: VPM setup
     unif_to_b(13);  // done: VDW stride setup
     unif_to_b(12);  // done: VDW setup
@@ -90,7 +110,7 @@ inline Program conv1d_f32_kernel(int KW, int tail, Conv1dOut out = CONV1D_OUT_RO
     unif_to_a(19);  // seq
     unif_to_b(5);   // tap step
     unif_to_b(4);   // next-channel step
-    p.raw(ldi(10, 1, 128));
+    p.raw(ldi(10, 1, out == CONV1D_OUT_PHASES ? uint32_t(phases) << 3 : 128u));
 
     const size_t tile_loop = p.here();
     // Tile params: valid lanes - 1, x address of lane 0's first tap, VDW setup, weight block, where
@@ -226,7 +246,7 @@ inline Program conv1d_f32_kernel(int KW, int tail, Conv1dOut out = CONV1D_OUT_RO
         // Pi Zero 12 QPUs then hung where one QPU on one tile did not (2026-10-28).
         p.mov(W_VPMVCD_SETUP, 1, MUX_B, R_NOP, 13);  // VDW stride 0, for every row DMA below
         p.mov(W_R0, 0, MUX_B, R_NOP, 8);
-        for (uint32_t r = 0; r < 16; r++) {
+        for (int r = 0; r < 16 / phases; r++) {
             p.mov(W_VPMVCD_SETUP, 1, MUX_R0);
             { Alu a; a.op_add = A_ADD; a.waddr_add = W_R0; a.cond_add = C_ALWAYS; a.add_a = MUX_R0; a.add_b = MUX_B;
               a.raddr_b = 10; p.alu(a); }
@@ -268,6 +288,36 @@ inline void conv1d_pack_w(const float * w, int OC, int K, float * out) {
             }
 }
 
+// A transposed convolution's weights, ggml's [IC][OC][K] (K = J*s), in the block layout of its OC*s
+// virtual channels v = oc*s + p over k = ic*J + j: W'[v][k] = w[ic][oc][p + (J-1-j)*s]. Written in
+// output order, as conv1d_pack_w; the 16 virtual channels of a block read 16/s rows of K floats. The
+// offsets of a block's 16 are worked out once: with the divisions in the inner loop it took 100 ns a
+// weight on the Pi Zero (218 ms for VITS's 512 -> 256 stage).
+inline void conv1d_pack_wt(const float * w, int IC, int OC, int K, int s, float * out) {
+    const int J = K / s, OCv = OC * s;
+    for (int b = 0; b < (OCv + 15) / 16; b++) {
+        int64_t off[16];   // v's offset in an input channel's [OC][K], -1 past OC*s
+        for (int r = 0; r < 16; r++) {
+            const int v = b * 16 + r;
+            off[r] = v < OCv ? int64_t(v / s) * K + v % s : -1;
+        }
+        for (int ic = 0; ic < IC; ic++) {
+            const float * wi = w + size_t(ic) * OC * K;
+            for (int j = 0; j < J; j++) {
+                const float * wt = wi + (J - 1 - j) * s;
+                for (int r = 0; r < 16; r++) *out++ = off[r] >= 0 ? wt[off[r]] : 0.f;
+            }
+        }
+    }
+}
+
+// The shape a transposed convolution runs as: J taps, stride 1, J - 1 zeros of padding a side, T_in + J - 1
+// positions q (ggml's output length (T_in - 1)*s + K is (T_in + J - 1)*s), OC*s virtual channels.
+inline Conv1dShape conv1d_transposed(int IC, int OC, int K, int s, int T_in) {
+    const int J = K / s;
+    return {IC, J, 1, 1, J - 1, T_in, T_in + J - 1, OC * s};
+}
+
 // Right padding that makes every output position interior once x is staged as
 // [p zeros | x | pr zeros]: the last tap of the last position lands inside.
 inline int conv1d_pad_right(const Conv1dShape & c) {
@@ -275,14 +325,18 @@ inline int conv1d_pad_right(const Conv1dShape & c) {
     return std::max(0, last + 1 - (c.p + c.T_in));
 }
 
-// One launch's addresses (bus): x row 0 / dst row 0 / the packed weights / a 64-byte discard area.
+// One launch's addresses (bus): x row 0 / dst row 0 / the packed weights / a discard area of
+// conv1d_discard_bytes. Transposed (phases = s, CONV1D_OUT_PHASES): c is conv1d_transposed's shape,
+// dst_row the bytes between real channels' rows, and dst is where position q = 0 of channel 0 goes.
 struct Conv1dProblem {
     Conv1dShape c;
     uint32_t x, x_row, dst, dst_row, wpack, discard;
+    int phases = 1;
 };
+inline uint32_t conv1d_discard_bytes(int phases) { return 64u * uint32_t(phases); }  // one DMA: 16 rows x s words
 
 // What the epilogue reads, for one launch: the biases (OC floats, host memory: they go into the
-// uniform stream), the residual's row 0 at this launch's t = 0 and the bytes between its rows, the
+// uniform stream; transposed, OC*s, one per virtual channel), the residual's row 0 at this launch's t = 0 and the bytes between its rows, the
 // mask's element at t = 0 (bus addresses).
 struct Conv1dEpi {
     unsigned flags = 0;
@@ -317,6 +371,9 @@ int conv1d_uniforms(CpuMap cpu, uint32_t unif, const Conv1dProblem & P, int nq_m
     starts.clear();
     if (nq == 0) return 0;
     const uint32_t vpm_hsetup = 1u << 12 | 1u << 11 | 2u << 8;
+    const bool ph = out == CONV1D_OUT_PHASES;
+    const int s = ph ? P.phases : 1;
+    const uint32_t vpm_wsetup = ph ? gemm_vpm_setup(GEMM_OUT_M) : vpm_hsetup;
     const uint32_t done_vdw = 0x80000000u | 1u << 23 | 16u << 16 | 1u << 14;
     uint32_t at = unif;
     for (int q = 0; q < nq; q++) {
@@ -327,7 +384,7 @@ int conv1d_uniforms(CpuMap cpu, uint32_t unif, const Conv1dProblem & P, int nq_m
         u[i++] = uint32_t(mine);
         u[i++] = uint32_t(c.s) * 4;
         u[i++] = uint32_t((c.IC - tail) / G);
-        u[i++] = vpm_hsetup;
+        u[i++] = vpm_wsetup;
         u[i++] = vpm_hsetup;
         u[i++] = 0xc0000000u;
         u[i++] = done_vdw;
@@ -341,7 +398,9 @@ int conv1d_uniforms(CpuMap cpu, uint32_t unif, const Conv1dProblem & P, int nq_m
             const uint32_t rows = out == CONV1D_OUT_BLOCK ? uint32_t(nvalid) : 1u;
             u[i++] = uint32_t(mvalid - 1);
             u[i++] = P.x + uint32_t(T.t0 * c.s - c.p) * 4;
-            u[i++] = 0x80000000u | rows << 23 | uint32_t(mvalid) << 16 | 1u << 14;
+            // transposed: mvalid VPM rows of s words from column X = 0, which the kernel steps by s
+            u[i++] = ph ? 0x80000000u | uint32_t(mvalid) << 23 | uint32_t(s) << 16 | 1u << 14
+                        : 0x80000000u | rows << 23 | uint32_t(mvalid) << 16 | 1u << 14;
             u[i++] = P.wpack + uint32_t(size_t(T.b) * K * 16 * 4);
             u[i] = at + uint32_t(i + 1 + (epi.flags & EPI_BIAS ? 16 : 0)) * 4;
             i++;
@@ -357,6 +416,11 @@ int conv1d_uniforms(CpuMap cpu, uint32_t unif, const Conv1dProblem & P, int nq_m
             if (out == CONV1D_OUT_BLOCK) {
                 u[i++] = 0xc0000000u | (P.dst_row - uint32_t(mvalid) * 4);
                 u[i++] = P.dst + uint32_t(T.b * 16) * P.dst_row + uint32_t(T.t0) * 4;
+            } else if (ph) {
+                for (int r = 0; r < 16 / s; r++) {
+                    const int oc = (T.b * 16) / s + r;
+                    u[i++] = oc < c.OC / s ? P.dst + uint32_t(oc) * P.dst_row + uint32_t(T.t0 * s) * 4 : P.discard;
+                }
             } else {
                 for (int r = 0; r < 16; r++) {
                     const int oc = T.b * 16 + r;
