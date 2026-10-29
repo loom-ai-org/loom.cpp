@@ -105,6 +105,14 @@ struct DeviceInfo {
 // harmless. Has no effect on a build with backends linked in: those register themselves.
 void add_backend_search_path(const std::string& dir);
 
+// The buffer type a model's weights go in on `dev` (P4.47): the device's own, except on a device whose
+// tensors are host memory and which also offers a host buffer type -- ggml-vc4, whose own buffers are
+// the GPU's 64 MB pool and whose kernels read weights only through copies in their own layouts, kept in
+// that pool while it has room. Its weights then stay in RAM and take none of the pool. No other ggml
+// device has both: the CPU, BLAS and Metal offer no host buffer type, and the GPU backends that do
+// (Vulkan, CUDA, SYCL) have buffers of their own that are not host memory.
+ggml_backend_buffer_type_t weights_buffer_type(ggml_backend_dev_t dev);
+
 // Every registered device, in ggml's own registration order. Safe to call before any Device exists --
 // it is what initializes the backend registry.
 std::vector<DeviceInfo> available_devices();
