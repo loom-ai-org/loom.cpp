@@ -726,7 +726,13 @@ void GraphBuilder::allocate_scheduled(ggml_cgraph* gf) {
         ggml_backend_sched_reset(sched_.get());
     }
     if (!ggml_backend_sched_alloc_graph(sched_.get(), gf)) {
-        throw Error("GraphBuilder::build: ggml_backend_sched_alloc_graph failed");
+        // Once more, re-split: a backend whose pool refused a buffer may take fewer nodes when asked again
+        // (P4.46: ggml-vc4 stops claiming the elementwise nodes it folds into convolutions, whose results
+        // its 64 MB pool then has to hold, and lets its cached weights go).
+        ggml_backend_sched_reset(sched_.get());
+        if (!ggml_backend_sched_alloc_graph(sched_.get(), gf)) {
+            throw Error("GraphBuilder::build: ggml_backend_sched_alloc_graph failed");
+        }
     }
 }
 

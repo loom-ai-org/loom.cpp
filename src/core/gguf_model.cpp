@@ -699,7 +699,9 @@ void GgufModel::route_repacked_uses(ggml_cgraph* gf) {
             // so for it supports_op is the whole test: with these rules applied to it, every one of
             // Citrinet's pointwise kernels was routed to a plain copy and the int8 path never ran.
             // CPU_NEON_I8 (P4.37) checks its own layouts the same way.
-            if (j == 0 && t->op == GGML_OP_MUL_MAT && primary_takes(t, s)) {
+            // P4.46: and a CONV_2D the same way -- ggml-vc4 runs a 1x1 one over a VC4_Q8 weight as an int8
+            // GEMM (Citrinet's pointwise kernels, which CPU_ARMV6_I8 held: 4.8 s of a 7.1 s clip on the CPU).
+            if (j == 0 && (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_CONV_2D) && primary_takes(t, s)) {
                 if (ggml_tensor* copy = primary_copy(s)) {
                     t->src[0] = copy;
                     continue;
