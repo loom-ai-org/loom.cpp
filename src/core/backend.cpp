@@ -146,6 +146,14 @@ ggml_backend_buffer_type_t weights_buffer_type(ggml_backend_dev_t dev) {
     return host != nullptr && ggml_backend_buft_is_host(host) ? host : own;
 }
 
+ggml_backend_buffer_type_t state_buffer_type(ggml_backend_t backend) {
+    ggml_backend_buffer_type_t own = ggml_backend_get_default_buffer_type(backend);
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || weights_buffer_type(dev) == ggml_backend_dev_buffer_type(dev)) return own;
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    return cpu != nullptr ? ggml_backend_dev_buffer_type(cpu) : own;
+}
+
 namespace {
 
 // HOW "auto" RANKS DEVICES (BACKLOG.md P4.8b, corrected by P4.8e). Lower is preferred; 3 is never

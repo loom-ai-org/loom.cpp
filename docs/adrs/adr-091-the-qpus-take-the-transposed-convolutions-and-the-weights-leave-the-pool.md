@@ -63,6 +63,17 @@ VITS F32 (62.6 MB of weights) and Moonshine F32 could not use the QPUs at all.
    arena is remembered: until some GPU block is freed (`GpuBuffer::frees()`), a call needing at least
    what was refused goes to the CPU at once, instead of four failed dma-heap requests and every packed
    weight dropped, for each of the ~158 nodes the full pool refuses in two 18m inferences.
+9. **The pool holds compute buffers only** (`state_buffer_type`): on a device whose weights
+   `weights_buffer_type` moved to RAM, loom allocates the KV and conv-state caches, retained outputs and
+   declared inputs in the CPU's buffer type. Measured with `GGML_VC4_POOL_LOG` and a buffer log in loom,
+   Pocket 18m Q8_0_PC's pool at its peak held a 32.0 MB KV cache (allocated first), the Mimi decoder's
+   28.1 MB compute buffer, under 1 MB of everything else, and squeezed out the arena: the decoder's
+   convolutions, which 7m (an 8 MB cache, same codec) runs on the QPUs, went to the CPU. Not VC4_HOST: a
+   copy of what the QPUs read there is cached by address, as for weights that never change, and a cache
+   changes every frame. In a CPU buffer the scheduler runs what reads the cache on the CPU (VC4 declines
+   an F32 MUL_MAT over a weight outside its buffers): attention, whose frame steps (N = 1) it declined
+   anyway. And VC4 declines a MUL_MAT or convolution whose result is already placed outside the pool --
+   the QPUs write it by bus address.
 
 ## Alternatives considered
 
@@ -81,6 +92,9 @@ VITS F32 (62.6 MB of weights) and Moonshine F32 could not use the QPUs at all.
 * **A first-come pool budget for packed copies, reserved at supports_op time**: VITS's text encoder
   took the budget, its vocoder's convolutions were declined, and VITS CPU+VC4 went from 5.86 to 15.5 s.
   Which nodes deserve the pool is not known in the order the scheduler asks.
+* **Weights at Q4_0** for Pocket 18m: the pool held no weights (decisions 3 and 6); F32 and Q8_0_PC
+  filled it identically, 19 buffers and 63.5 MB.
+* **A larger CMA pool** (`dtoverlay=cma,cma-128`): a board setting, not a default install's.
 
 ## Consequences
 
@@ -117,12 +131,23 @@ VITS F32 (62.6 MB of weights) and Moonshine F32 could not use the QPUs at all.
   weights in the fake host buffer type; it fails with the function returning the device's own.
 * No other ggml device is affected: the CPU, BLAS and Metal offer no host buffer type, and the GPU
   backends that do have buffers of their own that are not host memory.
-* Pocket TTS 18m (60 frames, 4.80 s of audio, run `q18`, one process an arm, two inferences): Q8_0_PC
-  CPU 23.28 / 23.25 s, CPU+VC4 22.72 / 22.06 s (38.9 s before decision 8); F32 CPU 31.08 / 30.97,
-  CPU+VC4 30.09 / 31.04. Its scheduler buffers take 63.5 of the 64 MB, so the QPUs run only 112 of its
-  MUL_MATs (0.27 s) and the rest is the CPU's: break-even is what the pool allows. Against the CPU arm,
-  SNR 24.0 dB (Q8_0_PC) and 30.2 dB (F32): the latent loop amplifies rounding (not yet teacher-forced).
-* Open: Pocket 18m F32 on CPU+VC4 gives a first inference different from its second (which nodes the
-  pool takes depends on what it holds); the first inference of a model with many F32 matrices copies them into the pool (conformer-ctc
+* Pocket TTS 18m (60 frames, 4.80 s of audio, one process an arm, two inferences, one run each):
+
+  | | CPU s | decision 8 only s (`q18`) | + decision 9 s (`poolmap2`) | pool peak | QPU work |
+  |---|---:|---:|---:|---:|---|
+  | 18m Q8_0_PC | 23.28 / 23.25 | 22.72 / 22.06 | 18.80 / 18.29 | 61.2 -> 47.9 MB | 112 -> 240 MUL_MATs, 2 -> 14 CONV_2D, 0 -> 2 convT; 158 -> 0 refused |
+  | 18m F32 | 31.08 / 30.97 | 30.09 / 31.04 | 25.86 / 24.85 | -> 41.9 MB | 56 -> 240 MUL_MATs, 2 -> 18 CONV_2D, 0 -> 2 convT; 162 -> 0 refused |
+  | 7m Q8_0_PC | | 14.08 / 13.55 | 14.80 / 13.91 | ~38 -> 39.9 MB | 258 -> 242 MUL_MATs (attention to the CPU) |
+  | 2m Q8_0_PC | | 7.08 / 6.74 | 7.24 / 6.92 | ~26 -> 28.8 MB | 160 -> 144 MUL_MATs |
+
+  The F32 arm's two inferences are now identical (they were not when the pool decided placement). The
+  latent loop samples, so waveforms are no oracle: the CPU's own Q8_0_PC output is at -1.4 dB against
+  its F32 output, and VC4's against the CPU's is 9.3 dB (Q8_0_PC: the QPU kernel keeps activations in
+  float, the CPU's quantizes them) and 30.8 dB (F32). Whisper base transcribes all nine outputs --
+  CPU and CPU+VC4 for each size and precision -- to the same sentence (the audio reversed does not).
+  7m and 2m moved by 2-5% in one run each, less than one run resolves on this board at that length,
+  though their prefill attention (16 MUL_MATs, ~0.07 GFLOP) is now the CPU's; the chart's three rounds
+  will say.
+* Open: the first inference of a model with many F32 matrices copies them into the pool (conformer-ctc
   0.2 s); CONV_TRANSPOSE_1D with a stride that is not a power of two, or with a residual or mask after it,
   stays on the CPU; "auto" has no fallback when another process holds the pool.
