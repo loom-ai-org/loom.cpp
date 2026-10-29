@@ -9,7 +9,8 @@
 // it (the bias [1, OC] broadcast, the padding cropped by a view), at VITS's two strides; and every case
 // again with the weights in VC4_HOST, ordinary memory, as loom loads them for this device.
 // With GGML_VC4_ARENA_MAX_KB=64 every QPU node is refused its arena and must run on the CPU instead,
-// with the same results (the placement is still the scheduler's: VC4).
+// with the same results (the placement is still the scheduler's: VC4) -- over a VC4_Q8 weight too,
+// which the CPU reads as its Q8_0 copy.
 //
 // VC4 is found the way the engine finds it -- loom's backend sweep, which loads libggml-vc4.so or
 // registers the linked one -- so this also gates that loading. Exits 77 without a VC4 device: any
@@ -80,12 +81,6 @@ static bool g_cpu_only = false;
 static bool g_weights_host = false;
 
 static int run(const Case & c) {
-    // GGML_VC4_ARENA_MAX_KB: every QPU node is refused its memory and runs on the CPU (P4.47) -- all but
-    // one over a VC4_Q8 weight, whose layout the CPU cannot read, which fails by design.
-    if (c.build_q8 && getenv("GGML_VC4_ARENA_MAX_KB") != nullptr && !g_cpu_only) {
-        printf("%s%-36s skipped: a VC4_Q8 weight has no CPU fallback\n", g_weights_host ? "[host] " : "", c.name.c_str());
-        return 0;
-    }
     // Each arm builds its own contexts, buffers and graph from the same seed: a graph whose tensors a
     // freed scheduler had allocated cannot be handed to the next one (ASan: use-after-free).
     std::vector<float> res[2], ref;   // ref: f64 over dequantized weights, for a quantized MUL_MAT
