@@ -2015,3 +2015,49 @@ add_executable(test_fft_ops ci/test_fft_ops.cpp)
 target_link_libraries(test_fft_ops PRIVATE loom::engine)
 add_test(NAME test_fft_ops COMMAND test_fft_ops)
 set_tests_properties(test_fft_ops PROPERTIES LABELS ci)
+
+# P4.44 (ADR-090): ggml-vc4, the Pi Zero QPU backend. The kernels run in a QPU emulator that refuses
+# the hazards the reference guide warns about, so they are hermetic and run everywhere, whatever
+# LOOM_GGML_VC4 says: the encoder against a golden dump cross-checked with py-videocore, and both
+# GEMM kernels bit for bit against an fmul-then-fadd reference, each with a legal-but-wrong sabotage
+# that must fail. Header-only, so no ggml and no engine. P4.45 adds the 1-D convolution and the
+# per-channel int8 GEMM (r4's byte unpack modelled as measured on the board); P4.46 the block-scaled
+# int8 GEMM (Q8_0, Q4_0), the convolution and int8 epilogues, transposed output and panel tile orders.
+set(LOOM_VC4_DIR ${PROJECT_SOURCE_DIR}/backends/ggml-vc4)
+add_executable(test_vc4_qpu_isa ci/test_vc4_qpu_isa.cpp)
+target_include_directories(test_vc4_qpu_isa PRIVATE ${LOOM_VC4_DIR})
+add_test(NAME test_vc4_qpu_isa COMMAND test_vc4_qpu_isa ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/vc4_qpu_golden.hex)
+set_tests_properties(test_vc4_qpu_isa PROPERTIES LABELS ci)
+foreach(t test_vc4_gemm_emu test_vc4_gemm_wt_emu test_vc4_conv1d_emu test_vc4_gemm_q8_emu test_vc4_gemm_qb_emu)
+    add_executable(${t} ci/${t}.cpp)
+    target_include_directories(${t} PRIVATE ${LOOM_VC4_DIR})
+    add_test(NAME ${t} COMMAND ${t})
+    set_tests_properties(${t} PROPERTIES LABELS ci)
+endforeach()
+
+# The backend itself through ggml's scheduler on a board; exits 77 anywhere without a VC4 device.
+if(LOOM_GGML_VC4)
+    add_executable(test_vc4_backend gate/test_vc4_backend.cpp)
+    target_link_libraries(test_vc4_backend PRIVATE loom::engine)
+    add_test(NAME test_vc4_backend COMMAND test_vc4_backend)
+    set_tests_properties(test_vc4_backend PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+    add_test(NAME test_vc4_backend_cpu_only COMMAND test_vc4_backend cpu-only)
+    set_tests_properties(test_vc4_backend_cpu_only PROPERTIES LABELS ci)
+    # P4.46: as a DL module it may need nothing from outside libggml-base.so (see the script).
+    if(GGML_BACKEND_DL)
+        add_test(NAME test_vc4_module_symbols
+                 COMMAND ${CMAKE_COMMAND} -DNM=${CMAKE_NM} -DMODULE=$<TARGET_FILE:ggml-vc4> -DBASE=$<TARGET_FILE:ggml-base>
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/ci/vc4_module_symbols.cmake)
+        set_tests_properties(test_vc4_module_symbols PROPERTIES LABELS ci)
+    endif()
+endif()
+
+# P4.44: a host-memory primary (ggml-vc4, BLAS) lowers ops as its CPU fallback would; P4.47: and keeps
+# its weights in its host buffer type when it offers one. ggml's private backend header for the fake
+# device it builds; safe because cmake/GgmlPin.cmake pins ggml.
+add_executable(test_host_primary_lowering ci/test_host_primary_lowering.cpp)
+target_link_libraries(test_host_primary_lowering PRIVATE loom::engine)
+target_include_directories(test_host_primary_lowering PRIVATE ${ggml_SOURCE_DIR}/src)
+target_compile_definitions(test_host_primary_lowering PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_host_primary_lowering COMMAND test_host_primary_lowering)
+set_tests_properties(test_host_primary_lowering PROPERTIES LABELS ci FIXTURES_REQUIRED minimal_gguf_fixture)

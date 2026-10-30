@@ -1,7 +1,9 @@
 #include "loom/core/output_store.h"
 
+#include "loom/core/backend.h"
 #include "loom/loom_errors.h"
 
+#include <ggml-alloc.h>
 #include <ggml-backend.h>
 
 #include <string>
@@ -48,7 +50,7 @@ const std::vector<ggml_tensor*>& OutputStore::reshape(const std::vector<ggml_ten
         slots_.push_back(slot);
     }
 
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(store_ctx_.get(), backend_);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(store_ctx_.get(), state_buffer_type(backend_));
     if (!buf) {
         throw Error("OutputStore: failed to allocate the persistent output backend buffer");
     }

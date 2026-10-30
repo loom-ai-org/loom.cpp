@@ -88,7 +88,8 @@ struct PrimitiveContext {
 
 // Whether the backend this graph will run on can execute `node` as built. False only when a real device
 // backend lacks the op -- a CPU backend implements everything, and a PrimitiveContext with no backend
-// (a hand-built one) answers true, which is the pre-P4.7e behaviour.
+// (a hand-built one) answers true, which is the pre-P4.7e behaviour. A primary whose tensors are host
+// memory (ggml-vc4, BLAS) also answers for its CPU fallback, which runs on the same memory (P4.44).
 bool backend_can_run(const PrimitiveContext& pc, const ggml_tensor* node);
 
 // PAD_1D_REFLECT's fallback lowering, built from views and concatenations -- what `op_pad_1d_reflect`

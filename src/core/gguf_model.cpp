@@ -257,15 +257,19 @@ std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, Backends bac
     // ggml_backend_alloc_ctx_tensors will allocate: each tensor's size as the buffer type pads it.
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    // P4.47: the weights' own buffer type, which for ggml-vc4 is RAM (weights_buffer_type) -- the room
+    // check below then never applies, since a host buffer type is not checked.
+    ggml_backend_buffer_type_t wbuft = dev != nullptr ? weights_buffer_type(dev) : buft;
+    model->weights_buft_ = wbuft;
     if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
-        !ggml_backend_buft_is_host(buft)) {
+        !ggml_backend_buft_is_host(wbuft)) {
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(dev, &free, &total);
-        const size_t align = ggml_backend_buft_get_alignment(buft);
+        const size_t align = ggml_backend_buft_get_alignment(wbuft);
         size_t needed = 0;
         for (ggml_tensor* t = ggml_get_first_tensor(model->meta_ctx_.get()); t != nullptr;
              t = ggml_get_next_tensor(model->meta_ctx_.get(), t)) {
-            needed += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+            needed += GGML_PAD(ggml_backend_buft_get_alloc_size(wbuft, t), align);
         }
         if (total != 0 && needed > free) {
             char numbers[160];
@@ -278,18 +282,38 @@ std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, Backends bac
         }
     }
 
-    // Extra-buffer placement (route_repacked_uses has the why). Only on a plain CPU primary: a hybrid
-    // build goes through the scheduler, which plans its copies from each weight's buffer and would
-    // have to read a repacked one back.
+    // Extra-buffer placement (route_repacked_uses has the why). These are the CPU's buffer types, so
+    // only where the CPU is what reads those weights: a plain CPU primary, or the CPU fallback beside a
+    // primary whose tensors are host memory (P4.44: ggml-vc4 on a Pi Zero, where "auto" made every
+    // Q8_0_PC model lose CPU_ARMV6_I8). Such a primary cannot claim a repacked weight -- the buffer type
+    // is not host memory, so its supports_buft says no -- and the scheduler gives those nodes to the CPU.
+    // A primary with its own memory gets none: the scheduler plans its copies from each weight's
+    // buffer and would have to read a repacked one back.
     model->path_ = path;
+    ggml_backend_t repack_backend = !backends.hybrid() ? backend
+                                    : ggml_backend_buft_is_host(buft) ? backends.fallback : nullptr;
+    model->repack_backend_ = repack_backend;
+    // P4.45: the primary's own extra buffer type, when it is the host-memory one a fallback repacks
+    // beside -- the place route_repacked_uses can give a MUL_MAT the primary takes (ggml-vc4: VC4_Q8).
+    if (backends.hybrid() && repack_backend == backends.fallback) {
+        ggml_backend_dev_t pdev = ggml_backend_get_device(backend);
+        auto get_extra = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(pdev), "ggml_backend_dev_get_extra_bufts"));
+        ggml_backend_buffer_type_t* extra = get_extra ? get_extra(pdev) : nullptr;
+        if (extra != nullptr && *extra != nullptr) {
+            model->primary_extra_buft_ = *extra;
+            model->primary_probe_buf_.reset(ggml_backend_buft_alloc_buffer(*extra, 64));
+            if (!model->primary_probe_buf_) model->primary_extra_buft_ = nullptr;
+        }
+    }
     std::vector<ggml_tensor*> to_repack;
-    ggml_backend_buffer_type_t repack_buft = backends.hybrid() ? nullptr : requested_extra_buffer_type(backend);
+    ggml_backend_buffer_type_t repack_buft = repack_backend == nullptr ? nullptr : requested_extra_buffer_type(repack_backend);
     std::unordered_set<std::string> per_channel;
-    if (repack_buft == nullptr && !backends.hybrid()) {
-        repack_buft = per_channel_buffer_type(backend, model->gguf_ctx_.get(), model->meta_ctx_.get(), per_channel);
+    if (repack_buft == nullptr && repack_backend != nullptr) {
+        repack_buft = per_channel_buffer_type(repack_backend, model->gguf_ctx_.get(), model->meta_ctx_.get(), per_channel);
     }
     if (repack_buft != nullptr) {
-        to_repack = extra_buffer_candidates(model->meta_ctx_.get(), backend, repack_buft);
+        to_repack = extra_buffer_candidates(model->meta_ctx_.get(), repack_backend, repack_buft);
         if (!per_channel.empty()) {
             to_repack.erase(std::remove_if(to_repack.begin(), to_repack.end(),
                                            [&](ggml_tensor* t) { return per_channel.count(ggml_get_name(t)) == 0; }),
@@ -298,7 +322,7 @@ std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, Backends bac
     }
     ggml_backend_buffer_t buf = nullptr;
     if (to_repack.empty()) {
-        buf = ggml_backend_alloc_ctx_tensors(model->meta_ctx_.get(), backend);
+        buf = ggml_backend_alloc_ctx_tensors_from_buft(model->meta_ctx_.get(), wbuft);
     } else {
         std::vector<ggml_tensor*> plain;
         for (ggml_tensor* t = ggml_get_first_tensor(model->meta_ctx_.get()); t != nullptr;
@@ -317,11 +341,19 @@ std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, Backends bac
         }
         std::fprintf(stderr, "loom: %zu weights (%.1f MB) in %s\n", to_repack.size(), bytes / 1e6,
                      ggml_backend_buft_name(repack_buft));
-        buf = alloc_tensors(buft, plain);
+        buf = alloc_tensors(wbuft, plain);
     }
     if (!buf) {
         throw LoadError("GgufModel::load: failed to allocate a backend buffer for weights in '" + path + "'");
     }
+    // Marked as weights so ggml_backend_sched runs an op on the backend holding its weights whenever
+    // that backend supports it (the rule llama.cpp relies on). Unmarked, an op reading a weight was
+    // placed only by the scheduler's expansion passes, where the CPU -- which supports everything --
+    // spreads to whatever it reaches first: with ggml-vc4 primary, VITS's vocoder convolutions landed
+    // on the QPUs and Moonshine's encoder convolution, the same op over the same kind of buffer, on
+    // the CPU (P4.45).
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    if (model->repack_buf_) ggml_backend_buffer_set_usage(model->repack_buf_.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     model->weights_buf_.reset(buf);
 
     std::ifstream file(path, std::ios::binary);
@@ -671,6 +703,14 @@ void GgufModel::route_repacked_uses(ggml_cgraph* gf) {
             // so for it supports_op is the whole test: with these rules applied to it, every one of
             // Citrinet's pointwise kernels was routed to a plain copy and the int8 path never ran.
             // CPU_NEON_I8 (P4.37) checks its own layouts the same way.
+            // P4.46: and a CONV_2D the same way -- ggml-vc4 runs a 1x1 one over a VC4_Q8 weight as an int8
+            // GEMM (Citrinet's pointwise kernels, which CPU_ARMV6_I8 held: 4.8 s of a 7.1 s clip on the CPU).
+            if (j == 0 && (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_CONV_2D) && primary_takes(t, s)) {
+                if (ggml_tensor* copy = primary_copy(s)) {
+                    t->src[0] = copy;
+                    continue;
+                }
+            }
             const ggml_tensor* act = t->src[1];
             const char* buft_name = s->buffer != nullptr ? ggml_backend_buft_name(ggml_backend_buffer_get_type(s->buffer)) : "";
             const bool own_checks = std::strcmp(buft_name, "CPU_ARMV6_I8") == 0 || std::strcmp(buft_name, "CPU_NEON_I8") == 0;
@@ -678,7 +718,7 @@ void GgufModel::route_repacked_uses(ggml_cgraph* gf) {
                                    ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_GET_ROWS) && act != nullptr &&
                                     act->ne[3] == 1 && (t->op != GGML_OP_MUL_MAT || act->nb[0] == sizeof(float)));
             const bool served = j == 0 && layout_ok &&
-                                ggml_backend_dev_supports_op(ggml_backend_get_device(backend_), t);
+                                ggml_backend_dev_supports_op(ggml_backend_get_device(repack_backend_), t);
             if (!served) {
                 if (repacked_.at(s).plain == nullptr) {
                     std::fprintf(stderr, "loom: plain copy of '%s' for %s\n", ggml_get_name(s), ggml_op_desc(t));
@@ -696,11 +736,13 @@ ggml_tensor* GgufModel::plain_copy(ggml_tensor* w) {
     ggml_context_ptr ctx(ggml_init(ggml_init_params{ggml_tensor_overhead() + 256, nullptr, /*no_alloc=*/true}));
     ggml_tensor* copy = ggml_dup_tensor(ctx.get(), w);
     ggml_set_name(copy, ggml_get_name(w));
-    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend_));
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(
+        ctx.get(), weights_buft_ != nullptr ? weights_buft_ : ggml_backend_get_default_buffer_type(backend_)));
     if (!buf) {
         throw LoadError("GgufModel: failed to allocate a plain copy of repacked weight '" +
                         std::string(ggml_get_name(w)) + "'");
     }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     std::vector<uint8_t> bytes(ggml_nbytes(w));
     std::ifstream file(path_, std::ios::binary);
     file.seekg(static_cast<std::streamoff>(r.file_offset));
@@ -713,6 +755,51 @@ ggml_tensor* GgufModel::plain_copy(ggml_tensor* w) {
     plain_ctxs_.push_back(std::move(ctx));
     plain_bufs_.push_back(std::move(buf));
     r.plain = copy;
+    return copy;
+}
+
+// Asked with a stand-in for the weight placed in the primary's extra buffer type, so the primary's own
+// supports_op decides -- the same question the scheduler will ask of the copy.
+bool GgufModel::primary_takes(const ggml_tensor* node, const ggml_tensor* w) const {
+    if (primary_extra_buft_ == nullptr) return false;
+    const auto it = repacked_.find(w);
+    if (it != repacked_.end() && it->second.primary_failed) return false;
+    ggml_tensor stand_in = *w;
+    stand_in.buffer = primary_probe_buf_.get();
+    stand_in.data = ggml_backend_buffer_get_base(primary_probe_buf_.get());
+    stand_in.view_src = nullptr;
+    stand_in.extra = nullptr;
+    ggml_tensor probe = *node;
+    probe.src[0] = &stand_in;
+    return ggml_backend_dev_supports_op(ggml_backend_get_device(backend_), &probe);
+}
+
+ggml_tensor* GgufModel::primary_copy(ggml_tensor* w) {
+    Repacked& r = repacked_.at(w);
+    if (r.primary != nullptr || r.primary_failed) return r.primary;
+    ggml_context_ptr ctx(ggml_init(ggml_init_params{ggml_tensor_overhead() + 256, nullptr, /*no_alloc=*/true}));
+    ggml_tensor* copy = ggml_dup_tensor(ctx.get(), w);
+    ggml_set_name(copy, ggml_get_name(w));
+    // Such a buffer may come from a small pool (ggml-vc4's did, the GPU's 64 MB, until P4.47); a copy it cannot hold
+    // leaves the CPU's repacked weight in place for these uses, which is what ran before.
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), primary_extra_buft_));
+    if (!buf) {
+        r.primary_failed = true;
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<uint8_t> bytes(ggml_nbytes(w));
+    std::ifstream file(path_, std::ios::binary);
+    file.seekg(static_cast<std::streamoff>(r.file_offset));
+    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!file) {
+        throw LoadError("GgufModel: failed to re-read weight '" + std::string(ggml_get_name(w)) + "' from '" +
+                        path_ + "' for its copy in " + ggml_backend_buft_name(primary_extra_buft_));
+    }
+    ggml_backend_tensor_set(copy, bytes.data(), 0, bytes.size());
+    plain_ctxs_.push_back(std::move(ctx));
+    primary_bufs_.push_back(std::move(buf));
+    r.primary = copy;
     return copy;
 }
 

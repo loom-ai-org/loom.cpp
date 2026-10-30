@@ -1,5 +1,6 @@
 #include "loom/core/kv_cache.h"
 
+#include "loom/core/backend.h"
 #include "loom/core/gguf_model.h"
 #include "loom/loom_errors.h"
 
@@ -31,7 +32,7 @@ KvCache::KvCache(uint32_t n_layer, uint32_t n_embd_k, uint32_t n_embd_v, uint32_
         v_layers_[il] = v;
     }
 
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(store_ctx_.get(), backend);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(store_ctx_.get(), state_buffer_type(backend));
     if (!buf) {
         throw Error("KvCache: failed to allocate the persistent K/V backend buffer");
     }
