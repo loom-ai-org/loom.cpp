@@ -827,7 +827,24 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Backends & accelerators
 
-* [ ] **P4.44: `ggml-vc4`, the Pi Zero's 12 QPUs as an accelerator used with the CPU (user, 2026-10-28).** Built in scratch and verified on the board, not yet in this repo: an F32 `MUL_MAT` kernel that reads the weights in place (6.8-8.9x ggml's CPU on VITS-sized shapes through `ggml_backend_sched`), an `ACCEL` device whose buffer type is cached host memory from the GPU's pool, and loom's `"auto"` already picks CPU+VC4 (rank 1) with no engine change. Left: loading it (loom's sweep only knows ggml's backend names), the room check for a rank-1 device that reports memory (the pool is 64 MB by default), the ARMv6 wheel, then Q8_0/Q4_0 weights and convolutions, which are what the Pi Zero models actually run. Requires the legacy firmware graphics (no `vc4-kms-v3d`). *Context: [ADR-089](../adrs/adr-089-v3dv-is-correct-and-opt-in.md) for why the Pi 4's GPU went the other way, [Epic-04](../epics/epic-04-backends-and-accelerators.md)*
+* [ ] **ggml-vc4 (P4.44-P4.47), what the Pi Zero's QPUs still leave to the CPU.** A model's first inference
+  copies its F32 matrices into the pool (conformer-ctc 0.2 s); `CONV_TRANSPOSE_1D` with a stride that is
+  not a power of two, or a residual or mask after it, is the CPU's; packing weights into the QPUs'
+  layouts is slow (Q8_0 `to_float` ~50 ns an element); Moonshine pays the scheduler per decode step; a
+  LEAKY_RELU above the arena cap and the largest TTS layers' residual streams stayed on the CPU before
+  P4.47 moved the weights and caches out of the pool, not re-measured since. *Context:
+  [ADR-093](../adrs/adr-093-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md), [Epic-04 §8](../epics/epic-04-backends-and-accelerators.md#8-p444-p447-ggml-vc4-the-pi-zeros-qpus-beside-the-cpu-2026-10-28-to-30)*
+* [ ] **ggml-vc4: `"auto"` has no fallback when another process holds the GPU's pool.** The weights need
+  none of it since P4.47, so nothing checks it at load; if the scheduler's compute buffers then do not
+  fit, the call fails (loom re-splits once, then throws) instead of running the graph on the CPU. *Context: [ADR-093](../adrs/adr-093-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md), [Epic-04 §8](../epics/epic-04-backends-and-accelerators.md#8-p444-p447-ggml-vc4-the-pi-zeros-qpus-beside-the-cpu-2026-10-28-to-30)*
+* [ ] **The ARMv6 wheel with `libggml-vc4.so`.** loom-py's build ships it from `runtime/` beside the
+  engine, but no wheel has been built and installed from a loom.cpp with ggml-vc4 in it: bump loom-py's
+  submodule, build the armv6l wheel, check `device="auto"` finds VC4 on the board. Then loom-py #70 (the
+  README's Pi Zero chart) can merge. *Context: [Epic-04 §8](../epics/epic-04-backends-and-accelerators.md#8-p444-p447-ggml-vc4-the-pi-zeros-qpus-beside-the-cpu-2026-10-28-to-30)*
+* [ ] **V3DV (P4.43), the ops still wrong on the Pi 4's GPU**, none on VITS's or Qwen3's path: `ARGSORT`
+  from 1 023 columns (its large path), `GATED_DELTA_NET`'s fused L2_NORM (precision), 36 `MUL_MAT_ID` cases
+  at n = 129 over tolerance; the `MUL_MAT` / `MUL_MAT_ID` sweeps did not finish in 30 minutes. Opt-in only.
+  *Context: [ADR-089](../adrs/adr-089-v3dv-is-correct-and-opt-in.md), [Epic-04 §7](../epics/epic-04-backends-and-accelerators.md#7-p443-v3dv-on-the-raspberry-pi-4-2026-10-28)*
 * [ ] **NPUs.** Open, and the shape of the problem is known: no NPU registers as a `ggml` device type
   the engine can resolve, so `"npu"` throws by design. CoreML (the Neural Engine, which Metal is not)
   and RKNPU2 are out of tree and cost more, licence check included. *Context:
