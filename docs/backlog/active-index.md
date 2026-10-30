@@ -154,6 +154,9 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   [TigreGotico/orthography2ipa#1721](https://github.com/TigreGotico/orthography2ipa/issues/1721). *Context:
   [Epic-03](../epics/epic-03-model-coverage.md#vaniq-edge-and-auroratts-100k-two-more-small-english-voices),
   [ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md)*
+* [ ] **Nemotron-Labs-Unified-ASR 0.6B: publish** (built 2026-10-30, F32 + Q8_0,
+  `nemotron-labs-unified-asr-0.6b-loom`, staged in `hf-models-rc20/`). Runs on the released rc19; exported
+  from NeMo 3.0 (the `nemo3` venv), offline mode only. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **Vaniq-Edge and AuroraTTS-100K: publish** (built 2026-10-25, F32 + `Q8_0_PC` each,
   `vaniq-edge-loom` and `auroratts-100k-loom`). Vaniq-Edge runs on the released 1.0.0-rc19; AuroraTTS
   needs the engine's GRU cells ([ADR-087](../adrs/adr-087-a-recurrent-cell-declares-the-state-it-carries.md))
