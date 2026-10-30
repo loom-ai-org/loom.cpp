@@ -8,7 +8,7 @@ tags: [vc4, qpu, emulator, vpm, mutex, concurrency, raspberry-pi-zero, hang]
 # Retro-097: An Emulator That Runs the QPUs One at a Time
 
 Serves [Epic-04](../epics/epic-04-backends-and-accelerators.md) (P4.45); the decision is
-[ADR-089](../adrs/adr-089-the-qpus-take-convolutions-and-per-channel-int8.md). The trap before it is
+[ADR-091](../adrs/adr-091-the-qpus-take-convolutions-and-per-channel-int8.md). The trap before it is
 [Retro-095](retro-095-an-emulator-that-allows-what-the-hardware-breaks.md).
 
 ## Issue

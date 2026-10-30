@@ -8,7 +8,7 @@ tags: [vc4, device-selection, hybrid, repack, lowering, raspberry-pi-zero, quant
 # Retro-096: An Accelerator Primary Rewrote the Graphs It Did Not Touch
 
 Serves [Epic-04](../epics/epic-04-backends-and-accelerators.md) (P4.44); the decisions are 6 and 7 of
-[ADR-088](../adrs/adr-088-the-pi-zero-qpus-are-an-accelerator-beside-the-cpu.md).
+[ADR-090](../adrs/adr-090-the-pi-zero-qpus-are-an-accelerator-beside-the-cpu.md).
 
 ## Issue
 
