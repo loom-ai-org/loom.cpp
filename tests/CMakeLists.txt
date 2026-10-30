@@ -1853,6 +1853,21 @@ set_tests_properties(test_e2e_granite_speech_mil_export PROPERTIES SKIP_RETURN_C
 
 # --- `kv_cache_scope: "private"`: two decode streams of one model, and the shared-cache arm that
 #     proves the check can fail. See ci/test_private_kv_cache.cpp. ---
+# --- The recurrent sweep's second cell shape: a GRU's (`h_prev` in, `h_new` out, no cell state), against
+#     a float64 numpy GRU in both directions and through the bidirectional binding. ---
+add_test(NAME gen_gru_sweep_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_gru_sweep_gguf.py
+            ${LOOM_FIXTURE_DIR}/gru_sweep.gguf
+)
+set_tests_properties(gen_gru_sweep_gguf_fixture PROPERTIES FIXTURES_SETUP gru_sweep_gguf_fixture)
+set_tests_properties(gen_gru_sweep_gguf_fixture PROPERTIES LABELS ci)
+add_executable(test_gru_sweep ci/test_gru_sweep.cpp)
+target_link_libraries(test_gru_sweep PRIVATE loom::engine)
+target_compile_definitions(test_gru_sweep PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_gru_sweep COMMAND test_gru_sweep)
+set_tests_properties(test_gru_sweep PROPERTIES LABELS ci)
+set_tests_properties(test_gru_sweep PROPERTIES FIXTURES_REQUIRED gru_sweep_gguf_fixture)
+
 # --- `loom.seed_kv`: a saved attention state written into a module's KV cache (ADR-043). A bare
 #     two-layer ATTENTION module whose q/k/v are inputs, so the seeded rows alone decide the output. ---
 add_test(NAME gen_seed_kv_gguf_fixture
