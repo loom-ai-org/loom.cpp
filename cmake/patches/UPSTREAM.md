@@ -2070,6 +2070,69 @@ byte-identical to the direct and phase-major kernels (loom's `test_conv_1d_stage
 (`scripts/bench67.cpp`); end to end VITS (piper) F32 **1.301x** (1.041 -> 0.799 s) and its Q8_0 1.284x, the
 audio identical; Citrinet-256 1.070x, Pocket-TTS 1.03-1.07x; Moonshine tiny (no direct convolution) 1.002x.
 
+## PR 50 — `vulkan`: a type whose matmul tile does not fit shared memory loses its matmul, not the device
+
+*(`cmake/patches/ggml-0054-vulkan-small-shmem-per-type-matmul.patch`)*
+
+**Problem.** `ggml_vk_load_shaders` throws "Shared memory size too small for matrix multiplication" if
+ANY type's smallest mmq tile misses `maxComputeSharedMemorySize`. On a 16 KB device (Broadcom V3D 4.2,
+the Raspberry Pi 4/5's GPU under Mesa's V3DV) IQ2_S's lookup table makes its small tile 16 640 bytes,
+while F32 needs 8 448, so the whole device fails to initialise over a type no model on it uses.
+
+**Change.** A type whose small tile does not fit gets all three tile sizes disabled and `supports_op`
+declines its `MUL_MAT`, so the scheduler runs it on the CPU; only F32 not fitting still throws.
+
+**Measured** (Pi 4): the device initialises; the IQ2/IQ3 matmuls fall back; every other type unchanged.
+
+## PR 51 — `vulkan`: workgroups that fit a device allowing fewer than 512 invocations
+
+*(`cmake/patches/ggml-0055-vulkan-workgroups-within-the-device-limit.patch`; after PR 50)*
+
+**Problem.** Thirty-two shaders hard-code a 512-invocation workgroup (`local_size_x = 512`,
+`#define BLOCK_SIZE 512`, the GLU header, `diag_mask_inf`'s y: unary, copy, get_rows, repeat, concat,
+pad, conv2d_dw, the norms, the GLUs, ...).
+`maxComputeWorkGroupInvocations` is 256 on V3D. Exceeding it is invalid usage that Mesa compiles
+without complaint into wrong results: 123 of 506 test-backend-ops cases failed, and VITS on the GPU
+produced a wrong number of samples (CONV_2D_DW). Separately, Mesa's V3D compiler never finishes
+`mul_mat_vec_f32_f32_f32` in its loop unroller (over 14 minutes of CPU, abandoned).
+
+**Change.** (1) Each of the thirty-two declares its size as a specialization constant WITH the old
+literal as the default -- `layout(local_size_x = 512, local_size_x_id = N)`, because a bare
+`local_size_x_id` defaults to 1 in glslang -- and the BLOCK_SIZE shaders read `gl_WorkGroupSize.x`. (2)
+`ggml_vk_fit_workgroup_size` reads the spec-sized dimensions, their SpecIds and defaults from the
+SPIR-V and, only when the workgroup in effect exceeds the device limit, specializes them to the largest
+powers of two that fit -- the outer dimensions first, so x keeps its width (`ssm_conv`'s 32x16 becomes
+32x8) -- scales each fitted dimension's dispatch denominator by the same factor when it is a multiple
+of the old size, and pads unpassed spec constants with the module's own defaults. Literal dimensions
+count against the limit, and a workgroup still over it is logged, never skipped silently: a first
+version that fitted only one-dimensional workgroups passed over `ssm_conv`, and SSM_CONV failed all 45
+cases on V3D. The denominators are
+fitted when the pipeline is first initialised, not at compile time: `ggml_vk_fill` sizes its grid from
+them before it requests the pipeline. A device allowing 1024 invocations returns at once. (3) SET_ROWS, whose dispatch
+counts workgroups rather than invocations, uses the same rule (`ggml_vk_fitted_workgroup`). (4)
+`V3D_DEBUG=noloopunroll` is set (extended, never replaced) before the first Vulkan call, which is when
+the loader loads Mesa. (5) V3DV is left out of the default device list (see below); naming it in
+`GGML_VK_VISIBLE_DEVICES` opts in.
+
+**Numerics.** Unchanged on any device that allows 512 invocations: no spec value changes there (RADV,
+Vega 3: every op test-backend-ops has, 17 490 cases, 0 failures). The fit itself was checked by forcing it
+on that GPU (limit pretended 256): 17 032 of 17 102 pass, and the 70 are ARGSORT and SOLVE_TRI, which size
+their own blocks from the real limit and so are never fitted on a device that needs it. On V3D: 30 ops VITS and Qwen3 use pass, VITS
+matches the CPU to 1e-5 and Qwen3-0.6B Q8_0 produces the CPU's tokens; every op of the converted shaders
+and SSM_CONV passes (57 ops), and an every-op sweep fails only ARGSORT's large path, GATED_DELTA_NET's
+fused L2_NORM (precision) and 36 `MUL_MAT_ID` cases at n = 129, which also pass on RADV with the fit
+forced, so they are V3D's, not the fit's.
+
+**Why V3DV is not offered by default.** It is correct and far slower than the CPU it shares memory with:
+on a Pi 4, VITS 64.9 s against 0.836 s, Qwen3-0.6B Q8_0 509 s against 4.2 s for 24 tokens; its peak (32
+GFLOPS, no FMA) is a third of four A72s'. Listed by default it is what a GPU-preferring caller picks.
+Upstream may prefer a softer form (a log line, or a lower score), but the patch keeps llama.cpp-style
+callers from silently getting a 100x slowdown.
+
+**Measured out.** A V3D-specific conv2d tile (256 invocations, `TS_K = 2`, the 64x32 shape) halved the
+TMU register spills and was 1.5% SLOWER end to end (VITS 65.93 s against 64.92 s, interleaved), so it
+is not in the patch.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
