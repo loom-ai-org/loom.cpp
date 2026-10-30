@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-10-23
+last_updated: 2026-10-25
 ---
 
 # Epic-03: Model Coverage
@@ -47,8 +47,8 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **ASR — composition** | Qwen3-ASR-0.6B, Granite-Speech-4.0-1B, LFM2.5-Audio-1.5B (speech to text; the first hybrid conv/attention LM in the family) | `speech_lm_export.py`, `lfm25_audio_export.py` |
 | **ASR — streaming decoder over codec codes** | Kyutai STT 1B en-fr (run as Kyutai's `moshi` runs it, [ADR-068](../adrs/adr-068-kyutai-stt-follows-moshi-not-the-transformers-port.md); a ring KV cache, [ADR-066](../adrs/adr-066-a-uniform-sliding-window-is-a-ring-kv-cache.md)) | `kyutai_stt_export.py` |
 | **TTS — flow matching** | Matcha-TTS, SupertonicTTS, F5-TTS | `flow_matching_export.py`, `f5_tts_export.py` |
-| **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
-| **TTS — tiny distilled students** | sanoTTS: 26 piperlite voices (0.51M-1.83M, 14 languages) and 2 nano voices (heart, heart-nano), from upstream's GPL scripts in a pinned clone ([ADR-070](../adrs/adr-070-a-gpl-upstream-is-a-reference-not-a-dependency.md)); Vocetta2 276K / 500K / 1M (the nano line re-trained, MIT) | `sanotts_export.py`, `vocetta2_export.py` |
+| **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper), Vaniq-Edge (upstream VITS, 24 kHz) | `multi_phase_export.py`, `vits_export.py` |
+| **TTS — tiny distilled students** | sanoTTS: 26 piperlite voices (0.51M-1.83M, 14 languages) and 2 nano voices (heart, heart-nano), from upstream's GPL scripts in a pinned clone ([ADR-070](../adrs/adr-070-a-gpl-upstream-is-a-reference-not-a-dependency.md)); Vocetta2 276K / 500K / 1M (the nano line re-trained, MIT); AuroraTTS-100K (a BiGRU and a harmonic-plus-noise DSP synthesizer, no neural vocoder) | `sanotts_export.py`, `vocetta2_export.py`, `auroratts_export.py` |
 | **TTS — mel AR + HiFi-GAN** | SpeechT5 (`microsoft/speecht5_tts` + `speecht5_hifigan`) | `speecht5_export.py`, `speecht5_voices.py` |
 | **TTS — LM hidden rows + Vocos** | Soprano-1.1-80M (text front end: the reference's regexes run by `loom::PyRegex`, [ADR-067](../adrs/adr-067-a-regex-rule-table-ships-its-reference-patterns.md)) | `soprano_export.py` |
 | **TTS — LM + depthformer codes + LFM2 detokenizer** | LFM2.5-Audio-1.5B (text to speech, four voices as voice files) | `lfm25_audio_export.py`, `lfm25_audio_voices.py` |
@@ -1546,6 +1546,55 @@ sentences, upstream's G2P / the text door with the bundled misaki lexicon: 276K 
 widths (31, 62, 186) and the 1M's (72, 130, 337) have none, so their Q8_0_PC export is byte-identical
 to F32. The 500K's width-64 acoustic convs quantize (13 tensors, 2.0 to 1.3 MB) at 56/470 word errors
 against F32's 55/470, inside the user's bar of F32 + 1 pp.
+
+### Vaniq-Edge and AuroraTTS-100K: two more small English voices
+
+Both 2026-10-25, user request, F32 and `Q8_0_PC`.
+
+**`Abiray/Vaniq-Edge`** (MIT, 8.9M parameters, 24 kHz) is **upstream VITS**: its `models.py` is
+jaywalnut310's byte for byte, and Piper's fork differs from it only in formatting, so it loads into the
+VITS export's `SynthesizerTrn` and every trace patch applies. What changed is around the generator
+(`TTSUpstreamVitsExportConfig`): the architecture is read from the training `config.json`; the
+checkpoint is `{"model": state_dict}` with the posterior encoder stripped (loaded strictly otherwise);
+the table is keithito's 178 symbols framed by `commons.intersperse` (Matcha's declaration); and the
+synthesis defaults are the repo's own (`noise_scale` 0.333, not upstream VITS's 0.667 -- the first
+pinned-noise comparison failed on exactly that). Piper's miro exports byte-identical through the
+refactor. **No engine change**: it runs on 1.0.0-rc19. Verified with every draw pinned: 3.9e-6..1.0e-5
+from upstream at f64, upstream's own f32 spread. Upstream phonemizes with espeak-ng (GPL-3, not
+shipped); at this size the door needs the espeak fold, so it declares the style, unlike Piper's VITS
+([ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md)): Whisper-small WER on 30
+LibriSpeech sentences, espeak's ids 9.8%, the door with ipa-dict 174% unfolded and 21.7% folded,
+with misaki 57% and 18.3%.
+
+**`AuroraAI-Research/AuroraTTS-100K`** (Apache-2.0, 95,638 parameters, 22.05 kHz, LJSpeech) has no
+neural vocoder: an encoder (one conv-GLU block looped four times), a **BiGRU**, duration and pitch
+predictors, Gaussian soft upsampling, a dilated depthwise decoder, and heads for log-F0, voicing and
+two spectral envelopes that drive a harmonic-plus-noise synthesizer (80 harmonics, STFT-shaped white
+noise, a 65-tap FIR). Four graphs and the host arithmetic between them (`auroratts_export.py`):
+
+* **The GRU is the engine's first** -- a second cell shape in the recurrent sweep
+  ([ADR-087](../adrs/adr-087-a-recurrent-cell-declares-the-state-it-carries.md)), built from the module
+  because a traced `nn.GRU` is an unrolled loop in MIL. So this model needs the next release.
+* **The harmonic phase leaves the graph.** Upstream integrates `f0 * 2*pi/sr` with a float64 cumsum;
+  the driver carries the phase across frames in Lua doubles and hands the graph each frame's start
+  mod 2*pi, and inside a frame the running sum of the lerped f0 is a closed-form quadratic.
+* **Every per-sample interpolation is a stride-256 transposed convolution** (512 taps, cropped 256 at
+  each end): the phase quadratic and the frame starts as C=1 kernels; the 80 amplitudes as
+  nearest-neighbour upsampling plus a ramp, since a kernel per channel was a quarter of the file.
+  The envelope `gather` is a hat-function sum. Three outer products are K=1 matmuls, because ggml
+  broadcasts only the second operand.
+* **Noise renders as upstream's**: `aten_randn(seed)` is `torch.randn` after `torch.manual_seed(seed)`.
+
+Verified through the engine, the noise drawn from the same seed: every waveform upstream's length,
+1.4e-4..4.8e-4 from upstream at f64, where upstream's own f32 run is 2.1e-4..1.4e-3 (the phase
+integrates f0's float32 rounding). The table is ARPAbet with stress digits, g2p_en's; the door folds to
+it ([ADR-088](../adrs/adr-088-arpabet-is-a-phoneme-style-the-door-folds-to.md)) with CMUdict shipped as
+an IPA lexicon. WER (upstream's model, same 30 sentences): g2p_en 8.1%; the door with CMUdict 13.4% and
+with misaki 11.7% (four noise draws each), ipa-dict 15.7%, no lexicon 15.7%. CMUdict's ids are the closest
+to g2p_en's (65 token edits in 1153, misaki 108); what costs it is a door defect, contractions split
+at the apostrophe before the lookup ("doesn't" read as "doesn" + the letter T), which misaki's
+spelling of a bare `t` happens to hide. Through the engine: g2p_en 8.5%, the CMUdict door 12.3%. `Q8_0_PC` takes only the two
+predictors' 32-wide layers (2% of the weights, 6 KB): every other weight is depthwise or 56 wide.
 
 ### Family 14: MusicGen, two families composed
 
