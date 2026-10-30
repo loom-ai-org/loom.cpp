@@ -1,7 +1,7 @@
 // Runs gemm_f32_kernel in the QPU emulator against a CPU reference that sums k in the same order
 // (the QPU has no FMA: fmul then fadd), so the expected result is bit-identical.
 //
-// P4.44 (ADR-088); ctest -R test_vc4_gemm_emu
+// P4.44 (ADR-090); ctest -R test_vc4_gemm_emu
 #include "qpu_emu.h"
 #include "qpu_gemm.h"
 
