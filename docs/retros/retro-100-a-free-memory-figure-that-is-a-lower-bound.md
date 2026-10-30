@@ -8,7 +8,7 @@ tags: [vc4, cma, memory, device-selection, auto, raspberry-pi-zero, measurement]
 # Retro-100: A Free-Memory Figure That Is a Lower Bound
 
 Serves [Epic-04](../epics/epic-04-backends-and-accelerators.md) (P4.46); the decision is
-[ADR-090](../adrs/adr-090-the-qpus-take-the-epilogue-q4-0-and-the-pointwise-convolutions.md).
+[ADR-092](../adrs/adr-092-the-qpus-take-the-epilogue-q4-0-and-the-pointwise-convolutions.md).
 
 ## Issue
 

@@ -6,10 +6,10 @@ domain: backends
 tags: [vc4, qpu, raspberry-pi-zero, conv-transpose, polyphase, hifi-gan, buffer-type, weights, cma]
 ---
 
-# ADR-091: The QPUs Take the Transposed Convolutions, and the Weights Leave the Pool
+# ADR-093: The QPUs Take the Transposed Convolutions, and the Weights Leave the Pool
 
 P4.47 in [Epic-04](../epics/epic-04-backends-and-accelerators.md), two of
-[ADR-090](adr-090-the-qpus-take-the-epilogue-q4-0-and-the-pointwise-convolutions.md)'s open items. Code:
+[ADR-092](adr-092-the-qpus-take-the-epilogue-q4-0-and-the-pointwise-convolutions.md)'s open items. Code:
 `backends/ggml-vc4/` (`qpu_conv1d.h`, `ggml-vc4.cpp`); `src/core/backend.cpp`, `src/core/gguf_model.cpp`.
 What broke on the way: [Retro-102](../retros/retro-102-a-room-check-made-before-the-plan-took-its-room.md).
 
@@ -88,7 +88,7 @@ VITS F32 (62.6 MB of weights) and Moonshine F32 could not use the QPUs at all.
 * **GEMM + overlap-add** (ggml-0009's CPU form): K/s partial sums into every output, on the host.
 * **Weights placed per buffer by its first use** (CMA until a set_tensor under WEIGHTS usage, then RAM
   mapped over it): the scheduler's compute buffers must be CMA at allocation, where a refusal can still
-  fall back (ADR-090), and the weight buffer would be CMA-sized at allocation -- VITS F32 never gets it.
+  fall back (ADR-092), and the weight buffer would be CMA-sized at allocation -- VITS F32 never gets it.
 * **Per-weight routing by loom to an extra buffer type**, asking the device op by op: a weight is read
   by nodes of both kinds, and the graph does not exist at load time. With every QPU read a copy, there
   is nothing to route.

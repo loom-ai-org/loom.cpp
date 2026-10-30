@@ -102,8 +102,8 @@ of them, so they have no onnxruntime cells. Their own F32/Q8_0_PC ratios are in 
 ## Raspberry Pi Zero W: CPU against CPU+VC4
 
 The Pi Zero W's GPU, a VideoCore IV with 12 QPUs, as an accelerator beside its one ARM11 core
-([ADR-088](adrs/adr-088-the-pi-zero-qpus-are-an-accelerator-beside-the-cpu.md) to
-[ADR-091](adrs/adr-091-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md)): on a board booted
+([ADR-090](adrs/adr-090-the-pi-zero-qpus-are-an-accelerator-beside-the-cpu.md) to
+[ADR-093](adrs/adr-093-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md)): on a board booted
 without `vc4-kms-v3d`, `device="auto"` runs the convolutions, transposed convolutions and matrix products ggml-vc4 takes
 on the QPUs and every other node on the CPU. Measured on 2026-10-29/30 with the P4.47 build (loom.cpp #106 at
 `6ffd561`, not released), the CPU arm (`LOOM_DEVICE=cpu`) on the same build: the [table below](#raspberry-pi-zero-w)'s
@@ -130,7 +130,7 @@ Seconds, RTF in brackets; each device's faster precision in bold, and the speedu
 | WakeHuBERT tiny (wake word, jfk 11.0 s) | 2.08 s (0.19) | **1.83 s (0.17)** | **1.36 s (0.12)** | 1.41 s (0.13) | 1.34x |
 
 * **Every arm's output hashed the same in all three rounds**, and the CPU+VC4 arms' outputs against the CPU's are
-  [ADR-091](adrs/adr-091-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md)'s: transcripts
+  [ADR-093](adrs/adr-093-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md)'s: transcripts
   identical, Citrinet's CTC ids with one near-tie, TTS within 50-98 dB SNR (the QPUs' float rounding is not IEEE).
   Pocket TTS samples its latents in a loop that turns any rounding difference into another waveform (the CPU's own
   Q8_0_PC output is at -1.4 dB against its F32 output), so its outputs are checked by ear instead: whisper base
@@ -141,11 +141,11 @@ Seconds, RTF in brackets; each device's faster precision in bold, and the speedu
   time, hence 1.15x and 1.53x; VITS and amy are almost all convolutions, hence 3.3-3.4x. Pocket TTS's latent loop
   takes one frame a step, a product of one column the QPUs decline, so they take its prompt and its Mimi decoder:
   1.27-1.35x. Its KV cache stays in RAM beside them, leaving the GPU's pool to the compute buffers
-  ([ADR-091](adrs/adr-091-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md) decisions 9
+  ([ADR-093](adrs/adr-093-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md) decisions 9
   and 10): held in the pool, 18m's 32 MB cache crowded its decoder's convolutions out, and CPU+VC4 ran no faster than the
   CPU (22.7 s, one run).
 * **A first inference pays for packing the weights into the QPUs' layouts** (kept in the GPU's 64 MB pool while it has
-  room): Conformer-CTC's second inference is 3.55 s (ADR-091's run) against this table's 4.16 s.
+  room): Conformer-CTC's second inference is 3.55 s (ADR-093's run) against this table's 4.16 s.
 
 ## Raspberry Pi Zero W
 

@@ -8,7 +8,7 @@
 // panel tile orders, padding words untouched, done markers, and three legal-but-wrong kernels caught:
 // an fsub in a block sum, byte b read as b + 1, and a block's scale applied to the next block.
 //
-// P4.46 (ADR-089's "Q4_0 weights in the int8 kernel"); ctest -R test_vc4_gemm_qb_emu
+// P4.46 (ADR-091's "Q4_0 weights in the int8 kernel"); ctest -R test_vc4_gemm_qb_emu
 #include "qpu_emu.h"
 #include "qpu_gemm_qb.h"
 

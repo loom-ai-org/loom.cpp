@@ -8,7 +8,7 @@ tags: [vc4, cma, memory, ggml-backend-sched, supports-op, fallback, raspberry-pi
 # Retro-102: A Room Check Made Before the Plan Took Its Room
 
 Serves [Epic-04](../epics/epic-04-backends-and-accelerators.md) (P4.47); the decision is
-[ADR-091](../adrs/adr-091-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md).
+[ADR-093](../adrs/adr-093-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md).
 
 ## Issue
 
@@ -36,7 +36,7 @@ every node it accepts brings its result into that pool. Such a check can only be
 makes the backend correct is a fallback where the memory is actually taken. ggml-vc4 now runs a node
 whose memory it is refused at compute time (and the chain folded into it) on the CPU backend, warns once,
 counts it, and has a knob (`GGML_VC4_ARENA_MAX_KB`) with which the board test forces that path. And the
-pool got the room it was missing: the weights left it (ADR-091).
+pool got the room it was missing: the weights left it (ADR-093).
 
 ## Record
 
