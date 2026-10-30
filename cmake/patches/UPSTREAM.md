@@ -2070,6 +2070,27 @@ byte-identical to the direct and phase-major kernels (loom's `test_conv_1d_stage
 (`scripts/bench67.cpp`); end to end VITS (piper) F32 **1.301x** (1.041 -> 0.799 s) and its Q8_0 1.284x, the
 audio identical; Citrinet-256 1.070x, Pocket-TTS 1.03-1.07x; Moonshine tiny (no direct convolution) 1.002x.
 
+## PR 52 — `ggml-backend`: the scheduler's weight rule sees a view of a weight
+
+*(`cmake/patches/ggml-0056-sched-a-view-of-a-weight-is-a-weight.patch`)*
+
+**Problem.** `ggml_backend_sched` runs an op on the backend holding its weights by checking
+`src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS` (pass 1, cause `1.wgt`). A view has no buffer
+until the allocator initialises it, which is after scheduling, so an op that reads a weight through a
+reshape, permute or slice is not seen as reading one. A producer that reshapes its convolution kernels
+(loom's F32 kernels) loses the rule for exactly those ops, and with an accelerator beside the CPU the
+result is worse than no rule: the weight-reading neighbours (a bias ADD) are pinned to the CPU, and the
+CPU's expansion then takes the convolution between them.
+
+**Change.** Read the root: `wsrc = src->view_src ? src->view_src : src` for the usage test (and the
+host-buffer test of the offload check). `ggml_backend_sched_backend_from_buffer` already resolves the
+view's root, so nothing else changes.
+
+**Measured** (loom on a Pi Zero, ggml-vc4 beside the CPU, weights marked): without it amy F32 ran 0 of
+its 44 convolutions on the QPUs, 13.43 s; with it all 44, 6.09 s; de051, wake and heart F32 the same.
+On a GPU primary nothing moves (RADV, Vega 3: device-parity gates, 2 069 nodes on the device, 0
+fallback, before and after).
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the

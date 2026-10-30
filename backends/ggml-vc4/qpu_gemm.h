@@ -29,11 +29,64 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace vc4 {
 
 constexpr int GEMM_U = 4;          // k per loop iteration
 constexpr int GEMM_TMU_AHEAD = 4;  // max outstanding TMU requests (the emulator's TMU_DEPTH); B padding covers it
+
+// The order the weights-in-place kernels (qpu_gemm_wt.h, qpu_gemm_q8.h, qpu_gemm_qb.h) take their
+// 16 x 16 tiles in, dealt round-robin to the QPUs, so neighbours in this list run at the same time.
+// m-major (panel = 0): the tiles running at once share one 16-row block of W, which every QPU gathers
+// through the TMU -- n-major (each QPU a different W block) ran 3.6x slower on the Pi Zero, four
+// 16-row working sets per slice's TMU cache instead of one. With panel = P, the P column blocks of a
+// panel go through every m-block before the next panel starts (P4.46): P = 2 measured 1.17-1.36x over
+// m-major at every model shape (ggml-vc4.cpp's tile_panel has the numbers), P = 1 3.4x slower.
+struct GemmTile { int p, m0, n0; };
+inline void gemm_tiles(int M, int N, int panel, int p, std::vector<GemmTile> & out) {
+    const int nb = (N + 15) / 16, P = panel > 0 ? panel : nb;
+    for (int b0 = 0; b0 < nb; b0 += P)
+        for (int m0 = 0; m0 < M; m0 += 16)
+            for (int b = b0; b < std::min(nb, b0 + P); b++) out.push_back({p, m0, b * 16});
+}
+
+// The row stride a weight read through the TMU should have. Each k the 16 lanes gather one word from
+// each of 16 rows, so the rows' cache lines must spread over the TMU cache's sets; rows a multiple of
+// 512 bytes apart fall into one or two. Measured on the Pi Zero (P4.46, gemm_f32_wt_kernel, 12 QPUs,
+// M = 128, N = 3656): K = 384 (1536-byte rows) 2.2 GFLOPS and K = 512 1.5, against 9.3-9.4 for K = 368,
+// 400 and 416 -- and the same 2.2 at N = 457 or M = 192, so it was never the size of N that the
+// P4.44 note blamed. 64 bytes more puts the 16 rows in 16 different sets.
+inline size_t gemm_row_stride(size_t bytes) { return bytes % 512 == 0 ? bytes + 64 : bytes; }
+
+// Where a tile's C lands: GEMM_OUT_N, dst row n (c_stride apart) holds C[n][m0..m0+15] -- a MUL_MAT;
+// GEMM_OUT_M, dst row m holds C[n0..n0+15][m] -- a 1x1 convolution's [OC][T].
+enum GemmOut { GEMM_OUT_N, GEMM_OUT_M };
+
+// The VPM write setup and a tile's VDW stride / setup / address for either output layout: one VDW of
+// nvalid rows x mvalid words (GEMM_OUT_N) or mvalid rows x nvalid words (GEMM_OUT_M, from the VPM rows
+// the vertical writes filled). The stride is 13 bits: callers check gemm_out_ok.
+inline uint32_t gemm_vpm_setup(GemmOut out) { return out == GEMM_OUT_N ? (1u << 12 | 1u << 11 | 2u << 8) : (1u << 12 | 2u << 8); }
+inline bool gemm_out_ok(uint32_t c_stride) { return c_stride <= 8191 + 4; }
+inline void gemm_tile_vdw(GemmOut out, uint32_t c, uint32_t c_stride, int m0, int n0, int mvalid, int nvalid,
+                          uint32_t & stride_setup, uint32_t & vdw_setup, uint32_t & addr) {
+    const int rows = out == GEMM_OUT_N ? nvalid : mvalid, words = out == GEMM_OUT_N ? mvalid : nvalid;
+    stride_setup = 0xc0000000u | (c_stride - uint32_t(words) * 4);
+    vdw_setup = 0x80000000u | uint32_t(rows) << 23 | uint32_t(words) << 16 | 1u << 14;
+    addr = out == GEMM_OUT_N ? c + uint32_t(n0) * c_stride + uint32_t(m0) * 4 : c + uint32_t(m0) * c_stride + uint32_t(n0) * 4;
+}
+
+// The epilogue a convolution can absorb (P4.46): what loom's lowering puts after it and ggml's CPU
+// backend fuses (ggml-0005/0007/0036) -- relu(conv + bias + residual) * mask, each optional. With the
+// convolution on the QPUs and those nodes on the CPU, each was a full pass over the activation on the
+// ARM1176: amy's ADDs and LEAKY_RELUs took 2.2 s of a 5.8 s synthesis (P4.45, profiled on the board).
+//   bias      one per output channel
+//   residual  [OC][T_out] F32, read through the TMU
+//   relu      fmax(v, 0)
+//   mask      one value per output position (NeMo's time mask)
+// qpu_conv1d.h and qpu_gemm_q8.h (GEMM_OUT_M: a 1x1 convolution) each say what it costs them. A
+// LEAKY_RELU before the convolution is the host's, as it stages x (see ggml-vc4.cpp).
+enum Epilogue : unsigned { EPI_BIAS = 1, EPI_RESIDUAL = 2, EPI_RELU = 4, EPI_MASK = 8 };
 
 // Register map.
 //   ra0..ra15  accumulators         ra16 A block address   ra18 tiles left   ra19 seq

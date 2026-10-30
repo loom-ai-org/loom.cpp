@@ -1,5 +1,6 @@
 #include "loom/core/conv_state_cache.h"
 
+#include "loom/core/backend.h"
 #include "loom/core/gguf_model.h"
 #include "loom/loom_errors.h"
 
@@ -29,7 +30,7 @@ ConvStateCache::ConvStateCache(uint32_t n_layer, uint32_t n_state, uint32_t n_em
     zeros_ = ggml_new_tensor_2d(store_ctx_.get(), GGML_TYPE_F32, n_state, n_embd_conv);
     ggml_set_name(zeros_, "conv_state_zeros");
 
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(store_ctx_.get(), backend);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(store_ctx_.get(), state_buffer_type(backend));
     if (!buf) {
         throw Error("ConvStateCache: failed to allocate the persistent conv-state backend buffer");
     }
