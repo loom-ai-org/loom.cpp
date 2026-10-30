@@ -33,6 +33,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -40,8 +41,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -56,29 +59,35 @@ constexpr int64_t VC4_MIN_FLOPS = int64_t(1) << 18;
 // GGML_VC4_STATS=1: at exit, what the QPUs took and what the buffers cost (stderr). Not what they
 // declined: the scheduler asks supports_op several times per node, so this side cannot count it.
 struct Stats {
-    uint64_t mul_mats = 0, convs = 0, launches = 0, fused = 0, cpu_nodes = 0; double flops = 0, qpu_s = 0, host_s = 0;
+    uint64_t mul_mats = 0, convs = 0, convts = 0, launches = 0, fused = 0, cpu_nodes = 0, refused = 0;
+    double flops = 0, qpu_s = 0, host_s = 0;
     // Every ggml buffer of this type is a CMA allocation (dma-heap + vcsm import), far slower than
     // malloc, and an engine that makes VC4 its primary allocates inputs and outputs here too.
-    uint64_t buffers = 0; double buffer_bytes = 0, alloc_s = 0;
+    uint64_t buffers = 0, host_buffers = 0; double buffer_bytes = 0, host_buffer_bytes = 0, alloc_s = 0;
     ~Stats() {
         if (!getenv("GGML_VC4_STATS")) return;
-        fprintf(stderr, "ggml-vc4: %llu MUL_MATs and %llu CONV_2Ds in %llu launches, %.3f GFLOP, QPU %.3f s, host side %.3f s; "
-                        "%llu nodes folded into convolutions, %llu run by the CPU backend; "
-                        "%llu buffers, %.1f MB, allocated in %.3f s\n",
-                (unsigned long long) mul_mats, (unsigned long long) convs, (unsigned long long) launches, flops * 1e-9,
-                qpu_s, host_s, (unsigned long long) fused, (unsigned long long) cpu_nodes,
-                (unsigned long long) buffers, buffer_bytes * 1e-6, alloc_s);
+        fprintf(stderr, "ggml-vc4: %llu MUL_MATs, %llu CONV_2Ds and %llu CONV_TRANSPOSE_1Ds in %llu launches, %.3f GFLOP, QPU %.3f s, "
+                        "host side %.3f s; %llu nodes folded into convolutions, %llu run by the CPU backend (%llu for want of GPU memory); "
+                        "%llu buffers, %.1f MB, allocated in %.3f s; %llu VC4_HOST buffers, %.1f MB\n",
+                (unsigned long long) mul_mats, (unsigned long long) convs, (unsigned long long) convts, (unsigned long long) launches,
+                flops * 1e-9,
+                qpu_s, host_s, (unsigned long long) fused, (unsigned long long) cpu_nodes, (unsigned long long) refused,
+                (unsigned long long) buffers, buffer_bytes * 1e-6, alloc_s, (unsigned long long) host_buffers, host_buffer_bytes * 1e-6);
     }
 };
 Stats g_stats;
 
 // A weight in a kernel's own layout, packed on first use: a convolution's in the uniform stream's
 // (qpu_conv1d.h), a block-quantized MUL_MAT's in qpu_gemm_qb.h's.
+// P4.47: in slabs (packed_weights), at `off` in one shared with other weights' copies.
 struct Packed {
-    std::unique_ptr<vc4::GpuBuffer> mem;
+    std::shared_ptr<vc4::GpuBuffer> slab;
+    uint32_t off;
     const ggml_backend_buffer_t owner;       // the vc4 buffer holding the weight it was packed from
+    uint32_t bus() const { return slab->bus() + off; }
+    uint8_t * base() const { return slab->base() + off; }
 };
-enum PackKind { PACK_CONV_F32, PACK_QB, PACK_WT_PAD };
+enum PackKind { PACK_CONV_F32, PACK_QB, PACK_WT_PAD, PACK_CONVT_F32, PACK_Q8 };
 
 // The mailbox call that starts the QPUs blocks until they finish (and for 8 or more of them sometimes
 // returns early, which is why completion is the done markers), so a launch that should overlap host
@@ -144,15 +153,41 @@ struct Runtime {
     std::unique_ptr<vc4::GpuBuffer> codes;   // uncached: the generated kernels, bump-allocated
     size_t codes_used = 0;
     std::map<std::string, uint32_t> code_at;
-    // Keyed by the weight's data pointer (and the layout) and dropped when its buffer is freed: a later
-    // model's weight can come back at the same address.
-    std::map<std::pair<const void *, int>, Packed> packed;
+    // Keyed by the weight's data pointer, the layout and its size (a view of a weight at its start is
+    // another weight), and dropped when its buffer is freed: a later model's weight can come back at the
+    // same address.
+    std::map<std::tuple<const void *, int, size_t>, Packed> packed;
+    std::shared_ptr<vc4::GpuBuffer> slab;   // the slab packed_weights fills now, `slab_used` bytes of it
+    size_t slab_used = 0;
+    // P4.47: VC4_Q8 weights back in ggml's Q8_0 layout, in CPU_ARMV6_I8 or VC4_HOST, for the CPU to run
+    // a node over one when the pool refuses its call (q8_cpu_copy); dropped with the VC4_Q8 buffer.
+    struct CpuCopy {
+        ggml_context * ctx;
+        ggml_backend_buffer_t buf;
+        ggml_tensor * t;
+        ggml_backend_buffer_t owner;
+    };
+    std::map<std::tuple<const void *, ggml_backend_buffer_type_t, size_t>, CpuCopy> cpu_copies;
+    // The smallest arena the pool refused since it last got a block back (GpuBuffer::frees() was
+    // `refused_frees` then): see ensure_arena.
+    size_t refused_need = SIZE_MAX;
+    uint64_t refused_frees = 0;
     // The CPU backend the nodes this backend claims but cannot fold into a convolution run on (P4.46).
     ggml_backend_t cpu = nullptr;
     uint32_t ctrl = 0, done = 0, code = 0;
     uint32_t seq = 0;
     std::string unavailable;                 // empty when the QPUs are usable
 };
+
+// Where a weight's bytes are: a view of one has no data of its own until the allocator initialises
+// it, after supports_op has been asked (P4.45), but its source has.
+const void * weight_data(const ggml_tensor * w) {
+    if (w->data != nullptr || w->view_src == nullptr || w->view_src->data == nullptr) return w->data;
+    return static_cast<const char *>(w->view_src->data) + w->view_offs;
+}
+std::tuple<const void *, int, size_t> pack_key(const ggml_tensor * w, PackKind kind) {
+    return std::make_tuple(weight_data(w), int(kind), ggml_nbytes(w));
+}
 
 Runtime & runtime() {
     static Runtime rt;
@@ -185,14 +220,35 @@ struct BufferCtx {
 
 vc4::GpuBuffer & mem_of(ggml_backend_buffer_t buffer) { return *static_cast<BufferCtx *>(buffer->context)->mem; }
 
-void buffer_free(ggml_backend_buffer_t buffer) {
+// What this backend made from a buffer's weights -- packed copies, CPU copies of VC4_Q8 ones -- goes
+// with the buffer: a later model's weight can come back at the same address.
+void release_owned(ggml_backend_buffer_t buffer) {
     Runtime & rt = runtime();
+    std::vector<Runtime::CpuCopy> gone;
     {
         std::lock_guard<std::mutex> lock(rt.mu);
         for (auto it = rt.packed.begin(); it != rt.packed.end();) {
             it = it->second.owner == buffer ? rt.packed.erase(it) : std::next(it);
         }
+        rt.slab.reset();   // a slab goes with the last copy in it; the next copy starts another
+        for (auto it = rt.cpu_copies.begin(); it != rt.cpu_copies.end();) {
+            if (it->second.owner != buffer) { ++it; continue; }
+            gone.push_back(it->second);
+            it = rt.cpu_copies.erase(it);
+        }
     }
+    for (auto & c : gone) {   // outside the lock: freeing a VC4_HOST buffer takes it
+        ggml_backend_buffer_free(c.buf);
+        ggml_free(c.ctx);
+    }
+}
+// GGML_VC4_POOL_LOG=1: each pool buffer allocated and freed, with what the process holds of the pool
+// then (P4.47: told that a 32 MB KV cache and the codec's 28 MB compute buffer filled it for Pocket 18m).
+void buffer_free(ggml_backend_buffer_t buffer) {
+    if (getenv("GGML_VC4_POOL_LOG"))
+        fprintf(stderr, "vc4-pool: free %.3f MB usage %d, live %.3f MB\n", mem_of(buffer).size() / 1048576.0, int(buffer->usage),
+                (vc4::GpuBuffer::live_bytes() - mem_of(buffer).size()) / 1048576.0);
+    release_owned(buffer);
     delete static_cast<BufferCtx *>(buffer->context);
 }
 void * buffer_get_base(ggml_backend_buffer_t buffer) { return mem_of(buffer).base(); }
@@ -236,10 +292,13 @@ const ggml_backend_buffer_i buffer_iface = {
 };
 
 ggml_backend_buffer_type_t vc4_q8_buffer_type();
+ggml_backend_buffer_type_t vc4_host_buffer_type();
 extern const ggml_backend_buffer_i q8_buffer_iface;
 bool debug_on();
 
-const char * buft_get_name(ggml_backend_buffer_type_t buft) { return buft == vc4_q8_buffer_type() ? "VC4_Q8" : "VC4"; }
+const char * buft_get_name(ggml_backend_buffer_type_t buft) {
+    return buft == vc4_q8_buffer_type() ? "VC4_Q8" : buft == vc4_host_buffer_type() ? "VC4_HOST" : "VC4";
+}
 
 // A buffer ggml needs (weights, the scheduler's compute buffers) comes before what this backend keeps
 // for speed: when the pool cannot provide one, the packed weights and the arena are let go and the
@@ -258,6 +317,7 @@ std::unique_ptr<vc4::GpuBuffer> alloc_or_release(uint32_t bytes) {
             if (debug_on())
                 fprintf(stderr, "ggml-vc4: %u bytes refused; releasing %zu packed weights and the arena\n", bytes, rt.packed.size());
             rt.packed.clear();
+            rt.slab.reset();
             rt.arena.reset();
         }
         return std::make_unique<vc4::GpuBuffer>(bytes, /*cached=*/true);
@@ -265,7 +325,9 @@ std::unique_ptr<vc4::GpuBuffer> alloc_or_release(uint32_t bytes) {
 }
 void note_refused();
 
+ggml_backend_buffer_t host_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
 ggml_backend_buffer_t buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    if (buft == vc4_q8_buffer_type()) return host_buft_alloc_buffer(buft, size);   // RAM too (P4.47)
     try {
         const auto t0 = std::chrono::steady_clock::now();
         auto ctx = std::make_unique<BufferCtx>();
@@ -273,7 +335,9 @@ ggml_backend_buffer_t buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t 
         g_stats.buffers++;
         g_stats.buffer_bytes += double(size);
         g_stats.alloc_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        return ggml_backend_buffer_init(buft, buft == vc4_q8_buffer_type() ? q8_buffer_iface : buffer_iface, ctx.release(), size);
+        if (getenv("GGML_VC4_POOL_LOG"))
+            fprintf(stderr, "vc4-pool: alloc %.3f MB, live %.3f MB\n", ctx->mem->size() / 1048576.0, vc4::GpuBuffer::live_bytes() / 1048576.0);
+        return ggml_backend_buffer_init(buft, buffer_iface, ctx.release(), size);
     } catch (const std::exception & e) {
         note_refused();
         GGML_LOG_ERROR("ggml-vc4: cannot allocate %zu bytes of GPU memory: %s (raise the CMA pool, e.g. dtoverlay=cma,cma-256)\n",
@@ -295,6 +359,16 @@ bool buft_is_host(ggml_backend_buffer_type_t buft) { return buft != vc4_q8_buffe
 ggml_backend_buffer_type_t vc4_buffer_type();
 
 bool is_vc4_buffer(const ggml_backend_buffer_t b) { return b != nullptr && b->buft == vc4_buffer_type(); }
+bool is_vc4_host_buffer(const ggml_backend_buffer_t b);
+// A weight this backend packs from: in its pool (vc4) or in its RAM (VC4_HOST). Either way a buffer of
+// this backend's, whose free drops the packed copies.
+bool holds_weights(const ggml_backend_buffer_t b) { return is_vc4_buffer(b) || is_vc4_host_buffer(b); }
+// What loom keeps in RAM beside this device (state_buffer_type, P4.47) -- the KV cache an attention
+// product reads -- in ordinary host memory that is neither this backend's nor weights: read through a
+// copy made for each call, never kept, since it changes between calls.
+bool is_host_state(const ggml_backend_buffer_t b) {
+    return b != nullptr && !holds_weights(b) && ggml_backend_buffer_is_host(b) && b->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
 
 // Where a weight lives. A view of one has no buffer of its own until the allocator initialises it,
 // which is after the scheduler has asked supports_op -- so every reshaped kernel read as "not
@@ -304,12 +378,61 @@ ggml_backend_buffer_t weight_buffer(const ggml_tensor * w) { return w->view_src 
 void cma_memory(size_t * free, size_t * total);
 void pool_memory(size_t * free, size_t * total);
 
+// ---- the VC4_HOST buffer type (P4.47) ----
+//
+// Ordinary memory, for a model's weights: what the QPUs read of a weight is a copy in their own layout
+// (packed_weights) -- a convolution's packed blocks, a Q4_0 / Q8_0 MUL_MAT's repacked rows, an F32
+// MUL_MAT's (padded) rows -- so the weight itself need not be in the GPU's pool, where it held 64 MB's
+// worth of space beside those copies: VITS Q8_0_PC's 29 MB of weights, of which the QPUs read none in
+// place once its convolutions were packed. Offered as the device's host buffer type, which loom puts a
+// model's weights in for a device whose own buffers are host memory (weights_buffer_type). A buffer of
+// this type is the vc4 backend's so that freeing it drops what was packed from it.
+
+struct HostBufferCtx {
+    void * base = nullptr;
+};
+void host_buffer_free(ggml_backend_buffer_t buffer) {
+    release_owned(buffer);
+    auto * ctx = static_cast<HostBufferCtx *>(buffer->context);
+    free(ctx->base);
+    delete ctx;
+}
+void * host_buffer_get_base(ggml_backend_buffer_t buffer) { return static_cast<HostBufferCtx *>(buffer->context)->base; }
+void host_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) { memset(host_buffer_get_base(buffer), value, buffer->size); }
+
+const ggml_backend_buffer_i host_buffer_iface = {
+    /* .free_buffer   = */ host_buffer_free,
+    /* .get_base      = */ host_buffer_get_base,
+    /* .init_tensor   = */ nullptr,
+    /* .memset_tensor = */ buffer_memset_tensor,
+    /* .set_tensor    = */ buffer_set_tensor,
+    /* .get_tensor    = */ buffer_get_tensor,
+    /* .set_tensor_2d = */ nullptr,
+    /* .get_tensor_2d = */ nullptr,
+    /* .cpy_tensor    = */ buffer_cpy_tensor,
+    /* .clear         = */ host_buffer_clear,
+    /* .reset         = */ nullptr,
+};
+
+ggml_backend_buffer_t host_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    void * base = nullptr;
+    if (posix_memalign(&base, 64, std::max<size_t>(size, 64)) != 0) return nullptr;
+    auto * ctx = new HostBufferCtx{base};
+    g_stats.host_buffers++;
+    g_stats.host_buffer_bytes += double(size);
+    return ggml_backend_buffer_init(buft, buft == vc4_q8_buffer_type() ? q8_buffer_iface : host_buffer_iface, ctx, size);
+}
+bool is_vc4_host_buffer(const ggml_backend_buffer_t b) { return b != nullptr && b->buft == vc4_host_buffer_type(); }
+
 // ---- the VC4_Q8 buffer type (P4.45) ----
 //
 // Q8_0 weights whose blocks in a row share one scale -- loom's Q8_0_PC -- repacked on upload into
 // qpu_gemm_q8.h's layout: offset-binary bytes, row scales after them. Not host memory, because the
 // layout is not ggml's, so a weight here is read by the QPUs and by nothing else; an engine places a
 // copy here only for MUL_MATs this backend says it takes, offered through ggml's extra buffer types.
+// P4.47: in RAM like VC4_HOST, the QPUs reading a copy in the pool (q8_weight): as GPU memory, Pocket
+// TTS 18m's copies took so much of the 64 MB pool that the scheduler's 15 MB buffer no longer fitted --
+// for matrices most of whose products are its frame-by-frame N = 1 steps, which the QPUs decline.
 
 ggml_backend_buffer_type_t vc4_q8_buffer_type();
 bool is_vc4_q8_buffer(const ggml_backend_buffer_t b) { return b != nullptr && b->buft == vc4_q8_buffer_type(); }
@@ -325,16 +448,19 @@ void q8_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, co
         GGML_ABORT("ggml-vc4: '%s' is not per-channel (blocks of one row with different scales); VC4_Q8 holds only "
                    "weights with one scale per row", tensor->name);
     }
-    mem_of(buffer).clean(tensor->data, vc4::gemm_q8_weight_bytes(M, K));
+    GGML_UNUSED(buffer);
 }
 void q8_buffer_get_tensor(ggml_backend_buffer_t, const ggml_tensor * tensor, void *, size_t, size_t) {
     GGML_ABORT("ggml-vc4: VC4_Q8 holds '%s' repacked; there is no ggml layout to read back", tensor->name);
 }
 bool q8_buffer_cpy_tensor(ggml_backend_buffer_t, const ggml_tensor *, ggml_tensor *) { return false; }
 
+void host_buffer_free(ggml_backend_buffer_t buffer);
+void * host_buffer_get_base(ggml_backend_buffer_t buffer);
+void host_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value);
 const ggml_backend_buffer_i q8_buffer_iface = {
-    /* .free_buffer   = */ buffer_free,
-    /* .get_base      = */ buffer_get_base,
+    /* .free_buffer   = */ host_buffer_free,
+    /* .get_base      = */ host_buffer_get_base,
     /* .init_tensor   = */ nullptr,
     /* .memset_tensor = */ nullptr,
     /* .set_tensor    = */ q8_buffer_set_tensor,
@@ -342,7 +468,7 @@ const ggml_backend_buffer_i q8_buffer_iface = {
     /* .set_tensor_2d = */ nullptr,
     /* .get_tensor_2d = */ nullptr,
     /* .cpy_tensor    = */ q8_buffer_cpy_tensor,
-    /* .clear         = */ buffer_clear,
+    /* .clear         = */ host_buffer_clear,
     /* .reset         = */ nullptr,
 };
 
@@ -400,14 +526,36 @@ void launch_and_wait(Runtime & rt, int nq, const std::vector<uint32_t> & starts,
 
 // The arena for this call (rt.mu held). When the pool refuses it, the packed weights other than the
 // one this call is using (`keep`) are let go and it is tried again at exactly the size needed.
+// GGML_VC4_ARENA_MAX_KB caps it, so the board test can make the pool refuse a call and check that the
+// node runs on the CPU instead (P4.47).
+//
+// A refusal is remembered: until the pool gets a block back, a call needing at least what it refused
+// is refused at once. Each refusal had cost four failed dma-heap requests and every packed weight but
+// one: Pocket TTS 18m Q8_0_PC, whose scheduler buffers hold 63.5 of the 64 MB, had ~158 nodes a run
+// refused that way, frame after frame (P4.47). Past the retries GpuBuffer makes for pages the kernel
+// is still migrating, room comes back only with a block given back: what the arena held goes before a
+// request, so the pool is as it was when it refused, and whatever this backend has allocated since
+// only took more of it.
 void ensure_arena(Runtime & rt, size_t need, const void * keep = nullptr) {
+    static const size_t cap = [] { const char * e = getenv("GGML_VC4_ARENA_MAX_KB"); return e ? size_t(atoll(e)) << 10 : SIZE_MAX; }();
+    if (need > cap) throw std::runtime_error("arena of " + std::to_string(need) + " bytes above GGML_VC4_ARENA_MAX_KB");
     if (rt.arena && rt.arena->size() >= need) return;
+    if (need >= rt.refused_need && vc4::GpuBuffer::frees() == rt.refused_frees)
+        throw std::runtime_error("the pool refused an arena of " + std::to_string(rt.refused_need) + " bytes and has had nothing back since");
     rt.arena.reset();
     try {
         rt.arena = std::make_unique<vc4::GpuBuffer>(uint32_t((need + need / 4 + 65535) & ~size_t(65535)), /*cached=*/true);
     } catch (const std::exception &) {
-        for (auto it = rt.packed.begin(); it != rt.packed.end();) it = it->first.first == keep ? std::next(it) : rt.packed.erase(it);
-        rt.arena = std::make_unique<vc4::GpuBuffer>(uint32_t((need + 65535) & ~size_t(65535)), /*cached=*/true);
+        for (auto it = rt.packed.begin(); it != rt.packed.end();) it = std::get<0>(it->first) == keep ? std::next(it) : rt.packed.erase(it);
+        rt.slab.reset();
+        try {
+            rt.arena = std::make_unique<vc4::GpuBuffer>(uint32_t((need + 65535) & ~size_t(65535)), /*cached=*/true);
+        } catch (const std::exception &) {
+            const uint64_t frees = vc4::GpuBuffer::frees();   // after what was let go above
+            rt.refused_need = frees == rt.refused_frees ? std::min(rt.refused_need, need) : need;
+            rt.refused_frees = frees;
+            throw;
+        }
     }
 }
 
@@ -417,24 +565,47 @@ void ensure_arena(Runtime & rt, size_t need, const void * keep = nullptr) {
 // past that, null, and the caller packs into the arena for this call alone. Kept unconditionally,
 // VITS's text-encoder kernels (192 -> 768 channels, 1.5-1.7 MB each in F32) filled the 64 MB pool
 // before the vocoder's were reached, and the synthesis failed to allocate.
+//
+// In slabs of VC4_SLAB_BYTES, not an allocation a weight: each GPU allocation is a dma-heap buffer
+// imported into vcsm, ~2 ms on the Pi Zero, and with its weights in RAM (P4.47) conformer-ctc's 195 F32
+// matrices each got a copy on first use -- 0.45 s more on its first inference than P4.46, which had
+// read them in place (later inferences equal). A slab is freed with the last copy in it.
 constexpr size_t VC4_POOL_RESERVE = size_t(24) << 20;
+constexpr size_t VC4_SLAB_BYTES = size_t(2) << 20;
 Packed * packed_weights(Runtime & rt, const ggml_tensor * w, PackKind kind, size_t bytes,
                         const std::function<void(uint8_t *)> & pack) {
-    const auto key = std::make_pair(static_cast<const void *>(w->data), int(kind));
+    const auto key = pack_key(w, kind);
     auto it = rt.packed.find(key);
     if (it != rt.packed.end()) return &it->second;
-    size_t free_bytes = 0, total = 0;
-    pool_memory(&free_bytes, &total);
-    if (free_bytes < bytes + VC4_POOL_RESERVE) return nullptr;
-    std::unique_ptr<vc4::GpuBuffer> mem;
-    try {
-        mem = std::make_unique<vc4::GpuBuffer>(uint32_t((bytes + 4095) & ~size_t(4095)), /*cached=*/true);
-    } catch (const std::exception &) {
-        return nullptr;   // the estimate was optimistic (pool_memory): pack for this call instead
+    const size_t span = (bytes + 63) & ~size_t(63);
+    if (!rt.slab || rt.slab_used + span > rt.slab->size()) {
+        const size_t sbytes = (std::max(span, VC4_SLAB_BYTES) + 4095) & ~size_t(4095);
+        size_t free_bytes = 0, total = 0;
+        pool_memory(&free_bytes, &total);
+        if (free_bytes < sbytes + VC4_POOL_RESERVE) return nullptr;
+        try {
+            rt.slab = std::make_shared<vc4::GpuBuffer>(uint32_t(sbytes), /*cached=*/true);
+        } catch (const std::exception &) {
+            rt.slab.reset();
+            return nullptr;   // the estimate was optimistic (pool_memory): pack for this call instead
+        }
+        rt.slab_used = 0;
     }
-    pack(mem->base());
-    mem->clean(mem->base(), bytes);
-    return &rt.packed.emplace(key, Packed{std::move(mem), weight_buffer(w)}).first->second;
+    const uint32_t off = uint32_t(rt.slab_used);
+    rt.slab_used += span;
+    uint8_t * at = rt.slab->base() + off;
+    pack(at);
+    rt.slab->clean(at, bytes);
+    return &rt.packed.emplace(key, Packed{rt.slab, off, weight_buffer(w)}).first->second;
+}
+
+// A VC4_Q8 weight where the QPUs can read it (P4.47: the buffer is RAM): its copy in a slab, kept like a
+// packed weight, or -- null, `wcall` its bytes -- copied for this call into the arena's first bytes.
+Packed * q8_weight(Runtime & rt, const ggml_tensor * w, size_t & wcall) {
+    const size_t wb = vc4::gemm_q8_weight_bytes(int(w->ne[1]), int(w->ne[0]));
+    Packed * pk = packed_weights(rt, w, PACK_Q8, wb, [&](uint8_t * o) { memcpy(o, w->data, wb); });
+    wcall = pk != nullptr ? 0 : (wb + 63) & ~size_t(63);
+    return pk;
 }
 
 // The tile order (qpu_gemm.h's gemm_tiles): panels of two column blocks. Measured on the Pi Zero
@@ -473,7 +644,7 @@ bool mul_mat_qb_supported(const ggml_tensor * op) {
     const ggml_tensor * w = op->src[0];
     const ggml_tensor * x = op->src[1];
     if ((w->type != GGML_TYPE_Q8_0 && w->type != GGML_TYPE_Q4_0) || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
-    if (!is_vc4_buffer(w->buffer) || w->view_src != nullptr || w->op != GGML_OP_NONE || !ggml_is_contiguous(w)) return false;
+    if (!holds_weights(w->buffer) || w->view_src != nullptr || w->op != GGML_OP_NONE || !ggml_is_contiguous(w)) return false;
     if (w->ne[2] != 1 || w->ne[3] != 1 || w->ne[0] % vc4::QB_BLOCK) return false;
     if (x->nb[0] != 4 || x->nb[1] % 4 || op->nb[0] != 4 || op->nb[1] % 4) return false;
     if (op->nb[1] > 8191 + 4) return false;  // VDW row stride is 13 bits
@@ -481,7 +652,7 @@ bool mul_mat_qb_supported(const ggml_tensor * op) {
     if (2 * op->ne[0] * op->ne[1] * w->ne[0] * op->ne[2] * op->ne[3] < VC4_MIN_FLOPS) return false;
     Runtime & rt = runtime();
     std::lock_guard<std::mutex> lock(rt.mu);
-    if (rt.packed.count(std::make_pair(static_cast<const void *>(w->data), int(PACK_QB))) == 0) {
+    if (rt.packed.count(pack_key(w, PACK_QB)) == 0) {
         size_t free_bytes = 0, total = 0;
         pool_memory(&free_bytes, &total);
         const size_t have = free_bytes + (rt.arena ? rt.arena->size() : 0);
@@ -496,10 +667,29 @@ bool mul_mat_supported(const ggml_tensor * op) {
     if (is_vc4_q8_buffer(weight_buffer(w))) return mul_mat_q8_supported(op);
     if (w->type == GGML_TYPE_Q8_0 || w->type == GGML_TYPE_Q4_0) return mul_mat_qb_supported(op);
     if (w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
-    // The weights must already live where the QPUs can read them, a vc4 buffer, and be a leaf (or a
-    // view of one): only leaves carry the tail the TMU reads past the last row.
-    if (!is_vc4_buffer(weight_buffer(w))) return false;
+    // The weights must be a leaf (or a view of one) in a vc4 buffer, where the QPUs read them in place
+    // -- only leaves carry the tail the TMU reads past the last row -- or in VC4_HOST or a host state
+    // buffer, read through a copy in the pool. Pocket TTS 7m and 2m's prefill attention, 16 products
+    // over the KV cache, went to the CPU when the cache left the pool, and their synthesis took 2-4%
+    // longer (P4.47).
+    const bool state = is_host_state(weight_buffer(w));
+    if (!holds_weights(weight_buffer(w)) && !state) return false;
     if ((w->view_src ? w->view_src->op : w->op) != GGML_OP_NONE) return false;
+    if (is_vc4_host_buffer(weight_buffer(w)) || state) {
+        // A copy is only worth making for a product of many columns: Pocket TTS 18m's frame-by-frame
+        // 512 x 1 x 512 products, 2700 of them with the 1 MB weight copied each call, made its
+        // synthesis slower on the QPUs than on the CPU (and pushed 3090 nodes out of a full pool). The
+        // int8 kernels draw the same line, for the same reason.
+        if (x->ne[1] < 16 || w->nb[0] != 4 || w->nb[1] % 4) return false;
+        Runtime & rt = runtime();
+        std::lock_guard<std::mutex> lock(rt.mu);
+        if (state || rt.packed.count(pack_key(w, PACK_WT_PAD)) == 0) {
+            size_t free_bytes = 0, total = 0;
+            pool_memory(&free_bytes, &total);
+            const size_t have = free_bytes + (rt.arena ? rt.arena->size() : 0);
+            if (have < size_t(w->ne[1] * w->ne[2] * w->ne[3]) * vc4::gemm_row_stride(w->nb[1]) + (size_t(8) << 20)) return false;
+        }
+    }
     if (w->nb[0] != 4 || x->nb[0] != 4 || op->nb[0] != 4) return false;
     if (w->nb[1] % 4 || op->nb[1] % 4 || w->nb[1] >= (1u << 24)) return false;
     if (op->nb[1] > 8191 + 4) return false;  // VDW row stride is 13 bits (bytes after mvalid words)
@@ -514,7 +704,10 @@ void mul_mat(ggml_tensor * dst) {
     const auto t_host0 = std::chrono::steady_clock::now();
     const ggml_tensor * w = dst->src[0];
     const ggml_tensor * x = dst->src[1];
-    vc4::GpuBuffer & wmem = mem_of(weight_buffer(w));
+    // in the pool, read in place; or in VC4_HOST or a host state buffer (P4.47), read through a copy
+    // (`copied` below), never kept for the latter
+    vc4::GpuBuffer * wmem = is_vc4_buffer(weight_buffer(w)) ? &mem_of(weight_buffer(w)) : nullptr;
+    const bool state = is_host_state(weight_buffer(w));
     vc4::GpuBuffer & cmem = mem_of(dst->buffer);
     const int K = int(w->ne[0]), M = int(w->ne[1]), N = int(x->ne[1]);
     const int64_t r2 = x->ne[2] / w->ne[2], r3 = x->ne[3] / w->ne[3];
@@ -522,33 +715,44 @@ void mul_mat(ggml_tensor * dst) {
 
     // Rows a multiple of 512 bytes apart thrash the TMU cache (gemm_row_stride): read a copy with
     // padded rows instead -- kept like a packed convolution weight, or made for this call when it is
-    // small; a large weight the pool cannot keep a copy of is read in place, slow as before.
+    // small; a large weight the pool cannot keep a copy of is read in place, slow as before. A weight in
+    // VC4_HOST is always read through such a copy, padded or not, made for this call when not kept,
+    // every slice of a batched one (a slice after another, M rows apart).
     const size_t pstride = vc4::gemm_row_stride(w->nb[1]);
-    const size_t pbytes = size_t(M) * pstride + vc4::gemm_wt_tail_bytes();
-    const bool pad = pstride != w->nb[1] && w->ne[2] == 1 && w->ne[3] == 1;
+    const int64_t slices = w->ne[2] * w->ne[3];
+    const size_t sbytes = size_t(M) * pstride, pbytes = size_t(slices) * sbytes + vc4::gemm_wt_tail_bytes();
+    const bool pad = wmem == nullptr || (pstride != w->nb[1] && slices == 1);
     auto copy_padded = [&](uint8_t * o) {
-        for (int m = 0; m < M; m++) memcpy(o + size_t(m) * pstride, static_cast<const uint8_t *>(w->data) + size_t(m) * w->nb[1], size_t(K) * 4);
-        memset(o + size_t(M) * pstride, 0, vc4::gemm_wt_tail_bytes());
+        for (int64_t i3 = 0; i3 < w->ne[3]; i3++)
+            for (int64_t i2 = 0; i2 < w->ne[2]; i2++) {
+                const uint8_t * src = static_cast<const uint8_t *>(w->data) + i2 * w->nb[2] + i3 * w->nb[3];
+                uint8_t * dsl = o + size_t(i3 * w->ne[2] + i2) * sbytes;
+                for (int m = 0; m < M; m++) memcpy(dsl + size_t(m) * pstride, src + size_t(m) * w->nb[1], size_t(K) * 4);
+            }
+        memset(o + size_t(slices) * sbytes, 0, vc4::gemm_wt_tail_bytes());
     };
-    Packed * pk = pad ? packed_weights(rt, w, PACK_WT_PAD, pbytes, copy_padded) : nullptr;
-    const size_t wcall = pad && pk == nullptr && pbytes <= (size_t(1) << 20) ? (pbytes + 63) & ~size_t(63) : 0;
+    Packed * pk = pad && !state ? packed_weights(rt, w, PACK_WT_PAD, pbytes, copy_padded) : nullptr;
+    const size_t wcall = pad && pk == nullptr && (pbytes <= (size_t(1) << 20) || wmem == nullptr) ? (pbytes + 63) & ~size_t(63) : 0;
+    const bool copied = pk != nullptr || wcall != 0;
 
     std::vector<vc4::GemmWtProblem> probs;
     for (int64_t i3 = 0; i3 < x->ne[3]; i3++)
         for (int64_t i2 = 0; i2 < x->ne[2]; i2++) {
             const uint8_t * wp = static_cast<const uint8_t *>(w->data) + (i2 / r2) * w->nb[2] + (i3 / r3) * w->nb[3];
             uint8_t * cp = static_cast<uint8_t *>(dst->data) + i2 * dst->nb[2] + i3 * dst->nb[3];
-            probs.push_back({M, N, K, wmem.bus_of(wp), uint32_t(w->nb[1]), cmem.bus_of(cp), uint32_t(dst->nb[1]), 0});
+            probs.push_back({M, N, K, copied ? 0u : wmem->bus_of(wp), uint32_t(w->nb[1]), cmem.bus_of(cp), uint32_t(dst->nb[1]), 0});
         }
     const size_t need = wcall + probs.size() * xslice + vc4::gemm_wt_uniform_words(probs, 12) * 4 + 4096;
     ensure_arena(rt, need, w->data);
-    if (pk != nullptr) {
-        probs[0].w = pk->mem->bus();
-        probs[0].w_stride = uint32_t(pstride);
-    } else if (wcall != 0) {   // the arena's first wcall bytes; the packed X follows
-        copy_padded(rt.arena->base());
-        probs[0].w = rt.arena->bus();
-        probs[0].w_stride = uint32_t(pstride);
+    if (copied) {   // kept, or the arena's first wcall bytes (the packed X follows)
+        if (pk == nullptr) copy_padded(rt.arena->base());
+        const uint32_t base = pk != nullptr ? pk->bus() : rt.arena->bus();
+        size_t k = 0;
+        for (int64_t i3 = 0; i3 < x->ne[3]; i3++)
+            for (int64_t i2 = 0; i2 < x->ne[2]; i2++, k++) {
+                probs[k].w = base + uint32_t(size_t((i3 / r3) * w->ne[2] + i2 / r2) * sbytes);
+                probs[k].w_stride = uint32_t(pstride);
+            }
     }
     uint8_t * xbase = rt.arena->base() + wcall;
     size_t k = 0;
@@ -572,18 +776,26 @@ void mul_mat(ggml_tensor * dst) {
     // activation the CPU computed), the packed X and uniforms just were; dst must hold no dirty
     // lines that could be written back over what the QPUs store.
     rt.arena->clean(rt.arena->base(), need);
-    for (int64_t i3 = 0; i3 < w->ne[3]; i3++)
-        for (int64_t i2 = 0; i2 < w->ne[2]; i2++) {
-            const uint8_t * wp = static_cast<const uint8_t *>(w->data) + i2 * w->nb[2] + i3 * w->nb[3];
-            wmem.clean(wp, size_t(M - 1) * w->nb[1] + size_t(K) * 4 + vc4::gemm_wt_tail_bytes());
-        }
+    if (!copied)
+        for (int64_t i3 = 0; i3 < w->ne[3]; i3++)
+            for (int64_t i2 = 0; i2 < w->ne[2]; i2++) {
+                const uint8_t * wp = static_cast<const uint8_t *>(w->data) + i2 * w->nb[2] + i3 * w->nb[3];
+                wmem->clean(wp, size_t(M - 1) * w->nb[1] + size_t(K) * 4 + vc4::gemm_wt_tail_bytes());
+            }
     cmem.flush(dst->data, ggml_nbytes(dst));
     g_stats.host_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_host0).count();
+    const auto t_launch = std::chrono::steady_clock::now();
     launch_and_wait(rt, nq, starts, rt.code, seq,
                     "a MUL_MAT [" + std::to_string(M) + " x " + std::to_string(N) + " x " + std::to_string(K) + "]");
     const auto t1 = std::chrono::steady_clock::now();
     cmem.invalidate(dst->data, ggml_nbytes(dst));
     g_stats.host_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+    if (debug_on()) {
+        auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count(); };
+        fprintf(stderr, "ggml-vc4: MUL_MAT F32 M %d N %d K %d x%zu w %s: host %.2f QPU %.2f ms\n", M, N, K, probs.size(),
+                pk ? "cached" : wcall ? "per call" : "in place", ms(t_host0, t_launch), ms(t_launch, t1));
+    }
     g_stats.mul_mats++;
     g_stats.flops += 2.0 * M * N * K * double(probs.size());
 }
@@ -594,20 +806,25 @@ void mul_mat_q8(ggml_tensor * dst) {
     const auto t_host0 = std::chrono::steady_clock::now();
     const ggml_tensor * w = dst->src[0];
     const ggml_tensor * x = dst->src[1];
-    vc4::GpuBuffer & wmem = mem_of(weight_buffer(w));
     vc4::GpuBuffer & cmem = mem_of(dst->buffer);
     const int K = int(w->ne[0]), M = int(w->ne[1]), N = int(x->ne[1]);
     const size_t xslice = vc4::gemm_q8_xpack_bytes(N, K);
-    const uint32_t wbus = wmem.bus_of(w->data), ws = vc4::gemm_q8_stride(K);
+    size_t wcall = 0;
+    Packed * pk = q8_weight(rt, w, wcall);
+    const uint32_t ws = vc4::gemm_q8_stride(K);
+    uint32_t wbus = 0;   // set once the arena is had
     std::vector<vc4::GemmQ8Problem> probs;
     for (int64_t i3 = 0; i3 < x->ne[3]; i3++)
         for (int64_t i2 = 0; i2 < x->ne[2]; i2++) {
             uint8_t * cp = static_cast<uint8_t *>(dst->data) + i2 * dst->nb[2] + i3 * dst->nb[3];
-            probs.push_back({M, N, K, wbus, ws, wbus + uint32_t(vc4::gemm_q8_scales_at(M, K)), cmem.bus_of(cp), uint32_t(dst->nb[1]), 0});
+            probs.push_back({M, N, K, 0, ws, 0, cmem.bus_of(cp), uint32_t(dst->nb[1]), 0});
         }
-    const size_t need = probs.size() * xslice + vc4::gemm_q8_uniform_words(probs, 12) * 4 + 4096;
-    ensure_arena(rt, need);
-    uint8_t * xbase = rt.arena->base();
+    const size_t need = wcall + probs.size() * xslice + vc4::gemm_q8_uniform_words(probs, 12) * 4 + 4096;
+    ensure_arena(rt, need, w->data);
+    if (pk == nullptr) memcpy(rt.arena->base(), w->data, vc4::gemm_q8_weight_bytes(M, K));
+    wbus = pk != nullptr ? pk->bus() : rt.arena->bus();
+    for (auto & pr : probs) { pr.w = wbus; pr.scales = wbus + uint32_t(vc4::gemm_q8_scales_at(M, K)); }
+    uint8_t * xbase = rt.arena->base() + wcall;
     size_t k = 0;
     for (int64_t i3 = 0; i3 < x->ne[3]; i3++)
         for (int64_t i2 = 0; i2 < x->ne[2]; i2++, k++) {
@@ -622,7 +839,7 @@ void mul_mat_q8(ggml_tensor * dst) {
     auto cpu = [&](uint32_t bus) { return rt.arena->at(bus); };
     const int nq = vc4::gemm_q8_uniforms(cpu, unif, probs, 12, rt.done, seq, starts, vc4::GEMM_OUT_N, tile_panel(M, N, K));
     const uint32_t code = program_at(rt, "gemm_q8", [] { return vc4::gemm_q8_kernel(); });
-    rt.arena->clean(xbase, need);
+    rt.arena->clean(rt.arena->base(), need);
     cmem.flush(dst->data, ggml_nbytes(dst));
     g_stats.host_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_host0).count();
     launch_and_wait(rt, nq, starts, code, seq,
@@ -658,7 +875,7 @@ void mul_mat_qb(ggml_tensor * dst) {
     ensure_arena(rt, need, w->data);
     uint8_t * abase = rt.arena->base();
     if (!pk) repack_qb(w, abase);
-    const uint32_t wbus = pk ? pk->mem->bus() : rt.arena->bus();
+    const uint32_t wbus = pk ? pk->bus() : rt.arena->bus();
     size_t k = 0;
     for (int64_t i3 = 0; i3 < x->ne[3]; i3++)
         for (int64_t i2 = 0; i2 < x->ne[2]; i2++, k++) {
@@ -705,7 +922,7 @@ bool decline(const ggml_tensor * op, const char * why) {
                                 "] x[" + std::to_string(op->src[1]->ne[0]) + "," + std::to_string(op->src[1]->ne[1]) + "," +
                                 std::to_string(op->src[1]->ne[2]) + "]";
         std::lock_guard<std::mutex> lock(mu);
-        if (seen[key]++ == 0) fprintf(stderr, "ggml-vc4: CONV_2D declined: %s\n", key.c_str());
+        if (seen[key]++ == 0) fprintf(stderr, "ggml-vc4: %s declined: %s\n", ggml_op_desc(op), key.c_str());
     }
     return false;
 }
@@ -786,6 +1003,21 @@ bool conv_q8_supported(const ggml_tensor * op, const vc4::Conv1dShape & c) {
     return true;
 }
 
+// A weight not packed yet needs its F32 copy to fit in the GPU's pool beside what the arenas grow to;
+// declining here costs nothing, failing to allocate at compute time would. What the call needs from
+// the pool if nothing is cached: x staged (padded) and the weights packed into the arena, beside what
+// the arena already holds.
+bool conv_pool_fits(const ggml_tensor * w, PackKind kind, const vc4::Conv1dShape & c) {
+    Runtime & rt = runtime();
+    std::lock_guard<std::mutex> lock(rt.mu);
+    if (rt.packed.count(pack_key(w, kind)) != 0) return true;
+    size_t free_bytes = 0, total = 0;
+    pool_memory(&free_bytes, &total);
+    const size_t need = vc4::conv1d_wpack_floats(c.OC, c.IC * c.KW) * 4 + conv_stage_bytes() * (VC4_STAGE_SLOTS + 1);
+    const size_t have = free_bytes + (rt.arena ? rt.arena->size() : 0);
+    return have >= need + (size_t(4) << 20);
+}
+
 bool conv_supported(const ggml_tensor * op) {
     if (!conv_enabled()) return false;
     vc4::Conv1dShape c;
@@ -799,9 +1031,9 @@ bool conv_supported(const ggml_tensor * op) {
         (w->type != GGML_TYPE_F32 && ggml_get_type_traits(w->type)->to_float == nullptr)) {
         return decline(op, "types");
     }
-    // The weights are packed once from where they live, which must be a vc4 buffer: its free is
-    // what drops the packed copy.
-    if (!is_vc4_buffer(weight_buffer(w))) {
+    // The weights are packed once from where they live, which must be this backend's buffer: its free
+    // is what drops the packed copy.
+    if (!holds_weights(weight_buffer(w))) {
         return decline(op, weight_buffer(w) ? ggml_backend_buffer_name(weight_buffer(w)) : "weight not allocated");
     }
     if (!ggml_is_contiguous(w)) return decline(op, "weight not contiguous");
@@ -812,19 +1044,7 @@ bool conv_supported(const ggml_tensor * op) {
     vc4::conv1d_interior(c, lo, hi);
     if (hi - lo < 16) return decline(op, "interior < 16");
     if (2 * int64_t(c.OC) * c.T_out * c.IC * c.KW < VC4_MIN_FLOPS) return decline(op, "below the flop threshold");
-    // A weight not packed yet needs its F32 copy to fit in the GPU's pool beside what the arenas
-    // grow to; declining here costs nothing, failing to allocate at compute time would.
-    Runtime & rt = runtime();
-    std::lock_guard<std::mutex> lock(rt.mu);
-    // What the call needs from the pool if nothing is cached: x staged (padded) and the weights packed
-    // into the arena, beside what the arena already holds.
-    if (rt.packed.count(std::make_pair(static_cast<const void *>(w->data), int(PACK_CONV_F32))) == 0) {
-        size_t free_bytes = 0, total = 0;
-        pool_memory(&free_bytes, &total);
-        const size_t need = vc4::conv1d_wpack_floats(c.OC, c.IC * c.KW) * 4 + conv_stage_bytes() * (VC4_STAGE_SLOTS + 1);
-        const size_t have = free_bytes + (rt.arena ? rt.arena->size() : 0);
-        if (have < need + (size_t(4) << 20)) return decline(op, "GPU pool full");
-    }
+    if (!conv_pool_fits(w, PACK_CONV_F32, c)) return decline(op, "GPU pool full");
     if (debug_on()) {
         static std::mutex mu;
         static std::unordered_map<std::string, int> seen;
@@ -832,6 +1052,48 @@ bool conv_supported(const ggml_tensor * op) {
         std::lock_guard<std::mutex> lk(mu);
         if (seen[key]++ == 0) fprintf(stderr, "ggml-vc4: CONV_2D accepted: %s\n", key.c_str());
     }
+    return true;
+}
+
+// P4.47: a CONV_TRANSPOSE_1D as qpu_conv1d.h's polyphase convolution, its OC*s virtual channels
+// written straight into ggml's [OC][(T-1)*s + K] rows. Kernel [K, OC, IC] with K a multiple of the
+// stride, data [T, IC], no padding or dilation (the only form ggml has). HiFi-GAN's upsampling stages
+// -- VITS's four, piper's three -- were what was left of their vocoders on the CPU: ~1.5 s of amy's
+// 5.4 s and of VITS's 7.6 s under P4.46's "auto".
+bool convt_geom(const ggml_tensor * op, vc4::Conv1dShape & c, int & s) {
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    const int32_t * pp = reinterpret_cast<const int32_t *>(op->op_params);
+    s = pp[0];
+    const int64_t K = w->ne[0], OC = w->ne[1], IC = w->ne[2];
+    if (pp[1] != 0 || pp[2] != 1 || !vc4::conv1d_phases_ok(s) || K % s != 0) return false;
+    if (w->ne[3] != 1 || x->ne[1] != IC || x->ne[2] != 1 || x->ne[3] != 1) return false;
+    if (op->ne[0] != (x->ne[0] - 1) * s + K || op->ne[1] != OC || op->ne[2] != 1 || op->ne[3] != 1) return false;
+    c = vc4::conv1d_transposed(int(IC), int(OC), int(K), s, int(x->ne[0]));
+    return true;
+}
+
+bool convt_supported(const ggml_tensor * op) {
+    if (!conv_enabled()) return false;
+    vc4::Conv1dShape c;
+    int s = 1;
+    if (!convt_geom(op, c, s)) return decline(op, "stride, padding or shape");
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    if (x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+        (w->type != GGML_TYPE_F32 && ggml_get_type_traits(w->type)->to_float == nullptr)) {
+        return decline(op, "types");
+    }
+    if (!holds_weights(weight_buffer(w))) {
+        return decline(op, weight_buffer(w) ? ggml_backend_buffer_name(weight_buffer(w)) : "weight not allocated");
+    }
+    if (!ggml_is_contiguous(w)) return decline(op, "weight not contiguous");
+    if ((w->view_src ? w->view_src->op : w->op) != GGML_OP_NONE) return decline(op, "weight computed");
+    if (x->nb[0] != 4 || x->nb[1] % 4 || !ggml_is_contiguous(op)) return decline(op, "strides");
+    if (!vc4::conv1d_kernel_ok(c.IC, c.KW)) return decline(op, "IC too small for the kernel");
+    if (c.T_out < 16) return decline(op, "T < 16");
+    if (2 * int64_t(c.OC) * c.T_out * c.IC * c.KW < VC4_MIN_FLOPS) return decline(op, "below the flop threshold");
+    if (!conv_pool_fits(w, PACK_CONVT_F32, c)) return decline(op, "GPU pool full");
     return true;
 }
 
@@ -868,6 +1130,17 @@ void pack_conv_weights(const ggml_tensor * w, int OC, int K, float * out) {
             for (int k = 0; k < kn; k++)
                 for (int r = 0; r < 16; r++) *o++ = scratch[size_t(r) * KC + k];
         }
+}
+
+// A transposed convolution's weights in conv1d_pack_wt's layout, dequantized whole first when not F32.
+void pack_convt_weights(const ggml_tensor * w, int IC, int OC, int K, int s, float * out) {
+    if (w->type == GGML_TYPE_F32) {
+        vc4::conv1d_pack_wt(static_cast<const float *>(w->data), IC, OC, K, s, out);
+        return;
+    }
+    std::vector<float> f(size_t(ggml_nelements(w)));
+    ggml_get_type_traits(w->type)->to_float(w->data, f.data(), ggml_nelements(w));
+    vc4::conv1d_pack_wt(f.data(), IC, OC, K, s, out);
 }
 
 // ---- the elementwise nodes around a convolution (P4.46) ----
@@ -983,7 +1256,7 @@ bool fusion_at(const ggml_cgraph * g, int i, Fusion & f) {
         const ggml_tensor * in = node->src[0];
         if (!fuse_enabled() || !is_f32_contiguous(node) || !is_f32_contiguous(in) || ggml_nbytes(in) != ggml_nbytes(node)) return false;
         idx = next_compute(g, i + 1);
-        if (idx < 0 || g->nodes[idx]->op != GGML_OP_CONV_2D) return false;
+        if (idx < 0 || (g->nodes[idx]->op != GGML_OP_CONV_2D && g->nodes[idx]->op != GGML_OP_CONV_TRANSPOSE_1D)) return false;
         ggml_tensor * conv = g->nodes[idx];
         // Staging the unary's input in place of its output, pointer for pointer: the convolution's own
         // view of `node` still describes what it reads.
@@ -995,7 +1268,7 @@ bool fusion_at(const ggml_cgraph * g, int i, Fusion & f) {
         f.slope = ggml_get_op_params_f32(node, 0);
         node = conv;
     }
-    if (node->op != GGML_OP_CONV_2D) return false;
+    if (node->op != GGML_OP_CONV_2D && node->op != GGML_OP_CONV_TRANSPOSE_1D) return false;
     f.conv = node;
     f.out = node;
     f.last = idx;
@@ -1012,6 +1285,12 @@ bool fusion_at(const ggml_cgraph * g, int i, Fusion & f) {
         f.last = j;
         return true;
     };
+    // a transposed convolution's tile holds s phases of 16/s channels, not one channel's positions: its
+    // epilogue is the bias alone (all HiFi-GAN puts after one)
+    if (node->op == GGML_OP_CONV_TRANSPOSE_1D) {
+        take(GGML_OP_ADD, OPERAND_BIAS, f.bias);
+        return true;
+    }
     if (take(GGML_OP_ADD, OPERAND_BIAS, f.bias)) take(GGML_OP_ADD, OPERAND_RESIDUAL, f.residual);
     {
         const int j = next_compute(g, f.last + 1);
@@ -1049,12 +1328,15 @@ size_t res_claim_bytes() { static const size_t v = claim_cap("GGML_VC4_FUSE_RES_
 // RELU, mask MUL, each after an earlier one. dev_supports_op claims an elementwise node only in its
 // place in that chain -- not, say, HiFi-GAN's sum of three resblock outputs, an ADD of two residual
 // results, which no convolution absorbs.
-enum Step { STEP_NONE, STEP_CONV, STEP_BIAS, STEP_RESIDUAL, STEP_RELU, STEP_MASK };
+// A transposed convolution's chain is its own two steps, after the others so the range tests below
+// never take them: its bias, and nothing after it.
+enum Step { STEP_NONE, STEP_CONV, STEP_BIAS, STEP_RESIDUAL, STEP_RELU, STEP_MASK, STEP_TCONV, STEP_TBIAS };
 Step step_of(const ggml_tensor * t, int depth = 0) {
     if (depth > 5 || !fuse_enabled()) return STEP_NONE;
     t = producer(t);
     switch (t->op) {
         case GGML_OP_CONV_2D: return conv_supported(t) ? STEP_CONV : STEP_NONE;
+        case GGML_OP_CONV_TRANSPOSE_1D: return convt_supported(t) ? STEP_TCONV : STEP_NONE;
         case GGML_OP_LEAKY_RELU: return STEP_NONE;
         case GGML_OP_UNARY: {
             if (ggml_get_unary_op(t) != GGML_UNARY_OP_RELU || !is_f32_contiguous(t) || ggml_nbytes(t) > res_claim_bytes()) return STEP_NONE;
@@ -1069,7 +1351,11 @@ Step step_of(const ggml_tensor * t, int depth = 0) {
                 const ggml_tensor * o = t->src[1 - s];
                 if (x == nullptr || o == nullptr || ggml_nelements(x) != ggml_nelements(t)) continue;
                 const Operand kind = operand_kind(x, o);
-                if (t->op == GGML_OP_ADD && kind == OPERAND_BIAS && step_of(x, depth + 1) == STEP_CONV) return STEP_BIAS;
+                if (t->op == GGML_OP_ADD && kind == OPERAND_BIAS) {
+                    const Step prev = step_of(x, depth + 1);
+                    if (prev == STEP_CONV) return STEP_BIAS;
+                    if (prev == STEP_TCONV) return STEP_TBIAS;
+                }
                 if (ggml_nbytes(t) > res_claim_bytes()) continue;
                 if (t->op == GGML_OP_ADD && kind == OPERAND_RESIDUAL && step_of(x, depth + 1) == STEP_BIAS) return STEP_RESIDUAL;
                 if (t->op == GGML_OP_MUL && kind == OPERAND_MASK) {
@@ -1145,21 +1431,24 @@ void conv_q8_run(Runtime & rt, const Fusion & f, ggml_tensor * target) {
     GGML_ASSERT(conv_geom(f.conv, c));
     const ggml_tensor * w = f.conv->src[0];
     const ggml_tensor * x = f.conv->src[1];
-    vc4::GpuBuffer & wmem = mem_of(weight_buffer(w));
     vc4::GpuBuffer & dmem = mem_of(view_root(target)->buffer);
     const int M = c.OC, N = c.T_out, K = c.IC;
+    size_t wcall = 0;
+    Packed * pk = q8_weight(rt, w, wcall);
     const size_t xbytes = (vc4::gemm_q8_xpack_bytes(N, K) + 63) & ~size_t(63);
     const size_t bbytes = f.bias && !in_vc4(f.bias) ? (ggml_nbytes(f.bias) + 63) & ~size_t(63) : 0;
     const size_t rbytes = f.residual && !in_vc4(f.residual) ? (ggml_nbytes(f.residual) + 63) & ~size_t(63) : 0;
-    const uint32_t wbus = wmem.bus_of(w->data);
     GGML_ASSERT(ggml_is_contiguous(target) && ggml_nelements(target) == ggml_nelements(f.conv));
-    std::vector<vc4::GemmQ8Problem> probs{{M, N, K, wbus, vc4::gemm_q8_stride(K), wbus + uint32_t(vc4::gemm_q8_scales_at(M, K)), dmem.bus_of(target->data),
-                                           uint32_t(N) * 4, 0}};
-    const size_t need = xbytes + bbytes + rbytes + vc4::gemm_q8_uniform_words(probs, 12) * 4 + 4096;
-    ensure_arena(rt, need);
-    uint8_t * abase = rt.arena->base();
+    std::vector<vc4::GemmQ8Problem> probs{{M, N, K, 0, vc4::gemm_q8_stride(K), 0, dmem.bus_of(target->data), uint32_t(N) * 4, 0}};
+    const size_t need = wcall + xbytes + bbytes + rbytes + vc4::gemm_q8_uniform_words(probs, 12) * 4 + 4096;
+    ensure_arena(rt, need, w->data);
+    if (pk == nullptr) memcpy(rt.arena->base(), w->data, vc4::gemm_q8_weight_bytes(M, K));
+    const uint32_t wbus = pk != nullptr ? pk->bus() : rt.arena->bus();
+    probs[0].w = wbus;
+    probs[0].scales = wbus + uint32_t(vc4::gemm_q8_scales_at(M, K));
+    uint8_t * abase = rt.arena->base() + wcall;   // [weights for this call] x | bias | residual | uniforms
     vc4::gemm_q8_pack_x(static_cast<const float *>(x->data), 1, x->nb[2] / 4, N, K, reinterpret_cast<float *>(abase));
-    probs[0].xpack = rt.arena->bus();
+    probs[0].xpack = rt.arena->bus_of(abase);
     vc4::GemmQ8Epi E;
     E.flags = f.epi();
     if (f.bias) E.bias = gpu_view(rt, f.bias, abase + xbytes);
@@ -1169,14 +1458,14 @@ void conv_q8_run(Runtime & rt, const Fusion & f, ggml_tensor * target) {
     }
     std::vector<float> mask;
     if (f.mask) { mask.assign(static_cast<const float *>(f.mask->data), static_cast<const float *>(f.mask->data) + N); E.mask = mask.data(); }
-    const uint32_t unif = rt.arena->bus() + uint32_t(xbytes + bbytes + rbytes);
+    const uint32_t unif = rt.arena->bus_of(abase) + uint32_t(xbytes + bbytes + rbytes);
     const uint32_t seq = ++rt.seq;
     std::vector<uint32_t> starts;
     auto cpu = [&](uint32_t bus) { return rt.arena->at(bus); };
     const int nq = vc4::gemm_q8_uniforms(cpu, unif, probs, 12, rt.done, seq, starts, vc4::GEMM_OUT_M, tile_panel(M, N, K), E);
     const unsigned epi = f.epi();
     const uint32_t code = program_at(rt, "gemm_q8/" + std::to_string(epi), [epi] { return vc4::gemm_q8_kernel(epi); });
-    rt.arena->clean(abase, need);
+    rt.arena->clean(rt.arena->base(), need);
     dmem.flush(target->data, ggml_nbytes(target));
     const auto t1 = clk::now();
     g_stats.host_s += std::chrono::duration<double>(t1 - t0).count();
@@ -1190,26 +1479,35 @@ void conv_q8_run(Runtime & rt, const Fusion & f, ggml_tensor * target) {
     g_stats.flops += 2.0 * M * N * K;
 }
 
-// The F32-packed convolution (any kernel type with a to_float) with its epilogue, staged or in place.
+// The F32-packed convolution (any kernel type with a to_float) with its epilogue, staged or in place;
+// a transposed one (P4.47) always staged, as conv1d_transposed's polyphase shape: c.OC is then its
+// virtual channels, c.T_out the positions q, and each real channel's row s times as long.
 void conv_f32_run(Runtime & rt, const Fusion & f, ggml_tensor * target) {
     auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     const auto t_host0 = clk::now();
     const ggml_tensor * conv = f.conv;
+    const bool transposed = conv->op == GGML_OP_CONV_TRANSPOSE_1D;
     vc4::Conv1dShape c;
-    GGML_ASSERT(conv_geom(conv, c));
+    int phases = 1;
+    GGML_ASSERT(transposed ? convt_geom(conv, c, phases) : conv_geom(conv, c));
     const ggml_tensor * w = conv->src[0];
     const ggml_tensor * xv = conv->src[1];
     // x's bytes: with a fused LEAKY_RELU its input, through the convolution's own view of its output
     const uint8_t * xdata = static_cast<const uint8_t *>(xv->data);
     if (f.act) xdata = static_cast<const uint8_t *>(f.act->src[0]->data) + (xdata - static_cast<const uint8_t *>(f.act->data));
-    const size_t x_row = xv->nb[2];
+    const size_t x_row = transposed ? xv->nb[1] : xv->nb[2];
     GGML_ASSERT(ggml_is_contiguous(target) && ggml_nelements(target) == ggml_nelements(conv));
     vc4::GpuBuffer & dmem = mem_of(view_root(target)->buffer);
-    const uint32_t dst_row = uint32_t(c.T_out) * 4;
+    const uint32_t dst_row = uint32_t(c.T_out) * uint32_t(phases) * 4;
     const int K = c.IC * c.KW;
     const size_t wfull = vc4::conv1d_wpack_floats(c.OC, K) * 4;
-    Packed * pk = packed_weights(rt, w, PACK_CONV_F32, wfull,
-                                 [&](uint8_t * o) { pack_conv_weights(w, c.OC, K, reinterpret_cast<float *>(o)); });
+    const int OC_real = c.OC / phases, KT = int(w->ne[0]);
+    auto pack = [&](float * o) {
+        if (transposed) pack_convt_weights(w, c.IC, OC_real, KT, phases, o);
+        else pack_conv_weights(w, c.OC, K, o);
+    };
+    Packed * pk = packed_weights(rt, w, transposed ? PACK_CONVT_F32 : PACK_CONV_F32, wfull,
+                                 [&](uint8_t * o) { pack(reinterpret_cast<float *>(o)); });
     const unsigned epi = f.epi();
 
     // x where the TMU can read it. In place when it already is in a vc4 buffer and the host's share of
@@ -1220,7 +1518,7 @@ void conv_f32_run(Runtime & rt, const Fusion & f, ggml_tensor * target) {
     int lo, hi;
     vc4::conv1d_interior(c, lo, hi);
     const double edge_macs = double(lo + c.T_out - hi) * c.OC * K;
-    const bool in_place = epi == 0 && f.act == nullptr && in_vc4(xv) && edge_macs < 2e5;
+    const bool in_place = !transposed && epi == 0 && f.act == nullptr && in_vc4(xv) && edge_macs < 2e5;
     int chunk = c.T_out;
     if (!in_place) {
         const int64_t per_out = int64_t(c.IC) * c.s * 4;
@@ -1236,21 +1534,23 @@ void conv_f32_run(Runtime & rt, const Fusion & f, ggml_tensor * target) {
     const size_t rstage = res_staged ? (size_t(c.OC) * chunk * 4 + 63) & ~size_t(63) : 0;
     const size_t mbytes = f.mask && !in_vc4(f.mask) ? (size_t(c.T_out) * 4 + 63) & ~size_t(63) : 0;
     const size_t wbytes = pk ? 0 : (wfull + 63) & ~size_t(63);
-    const vc4::Conv1dOut out = vc4::conv1d_block_ok(dst_row) ? vc4::CONV1D_OUT_BLOCK : vc4::CONV1D_OUT_ROWS;
+    const vc4::Conv1dOut out = transposed ? vc4::CONV1D_OUT_PHASES
+                               : vc4::conv1d_block_ok(dst_row) ? vc4::CONV1D_OUT_BLOCK : vc4::CONV1D_OUT_ROWS;
     vc4::Conv1dProblem P{cq, 0, 0, 0, dst_row, 0, 0};
+    P.phases = phases;
     const size_t ubytes = (vc4::conv1d_uniform_words(P, 12) * 4 + 63) & ~size_t(63);
     // arena: [weights packed for this call] [slots x (x | residual)] [mask] [discard] [slots x uniforms]
     const size_t slot_bytes = xstage + rstage, slots_at = wbytes, mask_at = slots_at + slots * slot_bytes;
-    const size_t discard_at = mask_at + mbytes, unif_at = discard_at + 64;
+    const size_t discard_at = mask_at + mbytes, unif_at = discard_at + ((vc4::conv1d_discard_bytes(phases) + 63) & ~size_t(63));
     ensure_arena(rt, unif_at + slots * ubytes + 4096, w->data);
     uint8_t * abase = rt.arena->base();
     auto bus = [&](size_t at) { return rt.arena->bus() + uint32_t(at); };
     const float * wpack;
     if (pk) {
-        P.wpack = pk->mem->bus();
-        wpack = reinterpret_cast<const float *>(pk->mem->base());
+        P.wpack = pk->bus();
+        wpack = reinterpret_cast<const float *>(pk->base());
     } else {
-        pack_conv_weights(w, c.OC, K, reinterpret_cast<float *>(abase));
+        pack(reinterpret_cast<float *>(abase));
         P.wpack = rt.arena->bus();
         wpack = reinterpret_cast<const float *>(abase);
         rt.arena->clean(abase, wbytes);
@@ -1258,7 +1558,14 @@ void conv_f32_run(Runtime & rt, const Fusion & f, ggml_tensor * target) {
     P.discard = bus(discard_at);
     vc4::Conv1dEpi E;
     E.flags = epi;
-    if (f.bias) E.bias = static_cast<const float *>(f.bias->data);
+    std::vector<float> bias_v;   // transposed: one per virtual channel
+    if (f.bias && transposed) {
+        bias_v.resize(size_t(c.OC));
+        for (int v = 0; v < c.OC; v++) bias_v[size_t(v)] = static_cast<const float *>(f.bias->data)[v / phases];
+        E.bias = bias_v.data();
+    } else if (f.bias) {
+        E.bias = static_cast<const float *>(f.bias->data);
+    }
     uint32_t mask_bus = 0, res_bus = 0;
     if (f.mask) {
         mask_bus = gpu_view(rt, f.mask, abase + mask_at);
@@ -1267,8 +1574,8 @@ void conv_f32_run(Runtime & rt, const Fusion & f, ggml_tensor * target) {
     if (f.residual && !res_staged) res_bus = gpu_view(rt, f.residual, nullptr);
     const int tail = vc4::conv1d_tail(c.IC, c.KW);
     const uint32_t code = program_at(rt, "conv1d/" + std::to_string(c.KW) + "/" + std::to_string(tail) + "/" + std::to_string(int(out)) +
-                                     "/" + std::to_string(epi),
-                                     [&] { return vc4::conv1d_f32_kernel(c.KW, tail, out, epi); });
+                                     "/" + std::to_string(epi) + "/" + std::to_string(phases),
+                                     [&] { return vc4::conv1d_f32_kernel(c.KW, tail, out, epi, phases); });
     dmem.flush(target->data, ggml_nbytes(target));
     const auto t_prep = clk::now();
     g_stats.host_s += ms(t_host0, t_prep) * 1e-3;
@@ -1298,7 +1605,7 @@ void conv_f32_run(Runtime & rt, const Fusion & f, ggml_tensor * target) {
             stage_rows(f, c, xdata, x_row, t0 * c.s - c.p, Q.c.T_in, xs, size_t(in_len) * 4);
             Q.x = rt.arena->bus_of(xs);
             Q.x_row = uint32_t(in_len) * 4;
-            Q.dst = dmem.bus_of(target->data) + uint32_t(t0) * 4;
+            Q.dst = dmem.bus_of(target->data) + uint32_t(t0) * uint32_t(phases) * 4;
             rt.arena->clean(xs, xstage);
             if (res_staged) {
                 uint8_t * rs = xs + xstage;
@@ -1319,8 +1626,9 @@ void conv_f32_run(Runtime & rt, const Fusion & f, ggml_tensor * target) {
         rt.arena->clean(abase + u_at, ubytes);
         stage_ms += ms(ta, clk::now());
     };
-    const std::string what = "a CONV_2D [IC " + std::to_string(c.IC) + " KW " + std::to_string(c.KW) + " T " +
-                             std::to_string(c.T_in) + " OC " + std::to_string(c.OC) + "]";
+    const std::string what = std::string(transposed ? "a CONV_TRANSPOSE_1D" : "a CONV_2D") + " [IC " + std::to_string(c.IC) + " KW " +
+                             std::to_string(c.KW) + " T " + std::to_string(c.T_in) + " OC " + std::to_string(c.OC) +
+                             (transposed ? " s " + std::to_string(phases) : std::string()) + "]";
     double wait_ms = 0;
     for (int k = 0; k < std::min(nchunks, 2); k++) prepare(k);
     for (int k = 0; k < nchunks; k++) {
@@ -1339,9 +1647,11 @@ void conv_f32_run(Runtime & rt, const Fusion & f, ggml_tensor * target) {
     const auto t_end = clk::now();
     g_stats.host_s += ms(t1, t_end) * 1e-3;
     if (debug_on()) {
-        fprintf(stderr, "ggml-vc4: CONV_2D IC %d KW %d s %d d %d T %d->%d OC %d %s%s%s epi %x%s x%d: pack+flush %.1f stage+uniforms %.1f "
-                        "(overlapped) waiting %.1f inval+edges %.1f ms\n", c.IC, c.KW, c.s, c.d, c.T_in, c.T_out, c.OC,
-                in_place ? "in place" : "staged", out == vc4::CONV1D_OUT_BLOCK ? " block" : " rows", pk ? " cached" : " per call",
+        fprintf(stderr, "ggml-vc4: %s IC %d KW %d s %d d %d T %d->%d OC %d %s%s%s epi %x%s x%d: pack+flush %.1f stage+uniforms %.1f "
+                        "(overlapped) waiting %.1f inval+edges %.1f ms\n", transposed ? "CONV_TRANSPOSE_1D (polyphase)" : "CONV_2D", c.IC, c.KW,
+                transposed ? phases : c.s, c.d, c.T_in, c.T_out * phases, c.OC / phases,
+                in_place ? "in place" : "staged", out == vc4::CONV1D_OUT_BLOCK ? " block" : out == vc4::CONV1D_OUT_PHASES ? " phases" : " rows",
+                pk ? " cached" : " per call",
                 epi, f.act ? " +lrelu" : "", nchunks, ms(t_host0, t_prep), stage_ms, wait_ms, ms(t1, t_end));
     }
     g_stats.flops += 2.0 * c.OC * c.T_out * K;
@@ -1371,7 +1681,7 @@ void conv_run(const Fusion & f) {
     ggml_tensor * target = direct ? const_cast<ggml_tensor *>(out) : conv;
     if (debug_on())
         fprintf(stderr, "ggml-vc4: fused %s%s%s%s%s%s -> %s: %.2f MB, result %s the convolution's memory%s\n", f.act ? "LEAKY_RELU " : "",
-                "CONV_2D", f.bias ? " +bias" : "", f.residual ? " +residual" : "", f.relu ? " RELU" : "", f.mask ? " *mask" : "",
+                ggml_op_desc(conv), f.bias ? " +bias" : "", f.residual ? " +residual" : "", f.relu ? " RELU" : "", f.mask ? " *mask" : "",
                 ggml_get_name(out), ggml_nbytes(out) / 1048576.0, out->data == conv->data ? "IN" : "NOT in", direct ? "" : " (via it)");
     GGML_ASSERT(is_vc4_buffer(view_root(target)->buffer));
     if (is_vc4_q8_buffer(weight_buffer(conv->src[0]))) {
@@ -1380,8 +1690,38 @@ void conv_run(const Fusion & f) {
         conv_f32_run(rt, f, target);
     }
     if (target != out) memmove(out->data, target->data, ggml_nbytes(out));
-    g_stats.convs++;
+    (conv->op == GGML_OP_CONV_TRANSPOSE_1D ? g_stats.convts : g_stats.convs)++;
     g_stats.fused += (f.act != nullptr) + (f.bias != nullptr) + (f.residual != nullptr) + f.relu + (f.mask != nullptr);
+}
+
+// A VC4_Q8 weight back in ggml's layout (gemm_q8_unpack: exact), for the CPU backend; made once per
+// buffer type: `buft` (the CPU's int8 one, which repacks it in set_tensor) or, null, VC4_HOST.
+ggml_tensor * q8_cpu_copy(const ggml_tensor * w, ggml_backend_buffer_type_t buft) {
+    Runtime & rt = runtime();
+    const auto key = std::make_tuple(weight_data(w), buft, ggml_nbytes(w));
+    {
+        std::lock_guard<std::mutex> lock(rt.mu);
+        auto it = rt.cpu_copies.find(key);
+        if (it != rt.cpu_copies.end()) return it->second.t;
+    }
+    ggml_init_params ip = {ggml_tensor_overhead(), nullptr, /*no_alloc=*/true};
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * t = ggml_dup_tensor(ctx, w);
+    ggml_set_name(t, ggml_get_name(w));
+    ggml_backend_buffer_t buf = buft != nullptr ? ggml_backend_buft_alloc_buffer(buft, ggml_backend_buft_get_alloc_size(buft, t))
+                                                : host_buft_alloc_buffer(vc4_host_buffer_type(), ggml_nbytes(t));
+    if (buf == nullptr) {
+        ggml_free(ctx);
+        throw std::runtime_error("no memory for a CPU copy of a VC4_Q8 weight");
+    }
+    GGML_ASSERT(ggml_backend_tensor_alloc(buf, t, ggml_backend_buffer_get_base(buf)) == GGML_STATUS_SUCCESS);
+    std::vector<BlockQ8_0> blocks(ggml_nbytes(t) / sizeof(BlockQ8_0));
+    vc4::gemm_q8_unpack(static_cast<const uint8_t *>(w->data), int(w->ne[1]), int(w->ne[0]), [](float d) { return ggml_fp32_to_fp16(d); },
+                        blocks.data());
+    ggml_backend_tensor_set(t, blocks.data(), 0, ggml_nbytes(t));
+    std::lock_guard<std::mutex> lock(rt.mu);
+    rt.cpu_copies.emplace(key, Runtime::CpuCopy{ctx, buf, t, w->buffer});
+    return t;
 }
 
 // ---- backend ----
@@ -1401,6 +1741,23 @@ ggml_backend_dev_t cpu_device() {
     if (f == nullptr) f = dlsym(RTLD_DEFAULT, "ggml_backend_dev_by_type");   // a build that links ggml in
     return f ? reinterpret_cast<dev_by_type_t>(f)(GGML_BACKEND_DEVICE_TYPE_CPU) : nullptr;
 }
+// The CPU's per-channel int8 buffer type (ggml-0041/0043: MUL_MAT and pointwise CONV_2D), where a
+// VC4_Q8 weight's CPU copy goes: in VC4_HOST, as plain Q8_0, ggml's generic kernel ran Pocket TTS 18m
+// Q8_0_PC's refused nodes, and CPU+VC4 took 38.9 s to the CPU's 23.3 (P4.47). Null when this ggml has
+// none (not ARMv6, or GGML_CPU_ARMV6_I8=0). Not CPU_NEON_I8: it takes no CONV_2D.
+ggml_backend_buffer_type_t cpu_int8_buffer_type() {
+    static ggml_backend_buffer_type_t buft = [] {
+        ggml_backend_dev_t dev = cpu_device();
+        if (dev == nullptr) return ggml_backend_buffer_type_t(nullptr);
+        auto get_extra = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_dev_get_extra_bufts"));
+        for (ggml_backend_buffer_type_t * p = get_extra ? get_extra(dev) : nullptr; p != nullptr && *p != nullptr; ++p)
+            if (strcmp(ggml_backend_buft_name(*p), "CPU_ARMV6_I8") == 0) return *p;
+        return ggml_backend_buffer_type_t(nullptr);
+    }();
+    return buft;
+}
+
 ggml_backend_t cpu_backend(Runtime & rt) {
     if (rt.cpu == nullptr) {
         ggml_backend_dev_t dev = cpu_device();
@@ -1426,7 +1783,7 @@ void backend_graph_optimize(ggml_backend_t, ggml_cgraph * cgraph, ggml_backend_g
     if (!fuse_enabled()) return;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_op op = cgraph->nodes[i]->op;
-        if (op != GGML_OP_CONV_2D && op != GGML_OP_LEAKY_RELU) continue;
+        if (op != GGML_OP_CONV_2D && op != GGML_OP_CONV_TRANSPOSE_1D && op != GGML_OP_LEAKY_RELU) continue;
         Fusion f;
         if (!fusion_at(cgraph, i, f) || f.out == f.conv) continue;
         bool after = false;
@@ -1461,6 +1818,33 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph * cgraph) {
         for (int j = run0; j < end; j++) g_stats.cpu_nodes += !ggml_op_is_empty(cgraph->nodes[j]->op);
         run0 = -1;
     };
+    // P4.47: what the QPUs cannot get memory for at compute time -- the arena for staged input and
+    // weights packed for one call, grown on demand -- runs on the CPU backend instead, the node and any
+    // chain folded into it: VITS Q8_0_PC with its upsampling on the QPUs and its 29 MB of weights still
+    // in the 64 MB pool failed the whole synthesis there ("dma_heap alloc: Cannot allocate memory").
+    // Everything this backend allocates is before its first launch, so nothing was half written. A
+    // VC4_Q8 weight, which only the QPUs can read, is given to the CPU as its Q8_0 copy (q8_cpu_copy):
+    // in the CPU's int8 buffer type when the CPU device takes the node from there, else plain.
+    auto on_cpu = [&](int first, int last, const std::exception & e) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true) || debug_on())
+            GGML_LOG_WARN("ggml-vc4: %s on the CPU: the GPU pool refused its memory (%s)\n", ggml_op_desc(cgraph->nodes[first]), e.what());
+        // a VC4_Q8 weight is not in ggml's layout: the CPU reads its Q8_0 copy, for this run
+        std::vector<std::pair<ggml_tensor **, ggml_tensor *>> swapped;
+        for (int j = first; j <= last; j++)
+            for (int k = 0; k < GGML_MAX_SRC; k++) {
+                ggml_tensor *& src = cgraph->nodes[j]->src[k];
+                if (src == nullptr || !is_vc4_q8_buffer(src->buffer)) continue;
+                swapped.emplace_back(&src, src);
+                ggml_backend_buffer_type_t i8 = cpu_int8_buffer_type();
+                src = q8_cpu_copy(src, i8);
+                if (i8 != nullptr && !ggml_backend_dev_supports_op(cpu_device(), cgraph->nodes[j])) src = q8_cpu_copy(swapped.back().second, nullptr);
+            }
+        run0 = first;
+        flush_cpu(last + 1);
+        for (auto & sw : swapped) *sw.first = sw.second;
+        g_stats.refused++;
+    };
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (debug_on() && node->op != GGML_OP_NONE)
@@ -1471,20 +1855,33 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph * cgraph) {
         switch (node->op) {
             case GGML_OP_MUL_MAT:
                 flush_cpu(i);
-                if (is_vc4_q8_buffer(weight_buffer(node->src[0]))) mul_mat_q8(node);
-                else if (node->src[0]->type == GGML_TYPE_F32) mul_mat(node);
-                else mul_mat_qb(node);
+                try {
+                    if (is_vc4_q8_buffer(weight_buffer(node->src[0]))) mul_mat_q8(node);
+                    else if (node->src[0]->type == GGML_TYPE_F32) mul_mat(node);
+                    else mul_mat_qb(node);
+                } catch (const std::exception & e) {
+                    on_cpu(i, i, e);
+                }
                 break;
             case GGML_OP_CONV_2D:
+            case GGML_OP_CONV_TRANSPOSE_1D:
                 flush_cpu(i);
-                if (!fusion_at(cgraph, i, f)) GGML_ABORT("ggml-vc4: a CONV_2D it cannot run");
-                conv_run(f);
+                if (!fusion_at(cgraph, i, f)) GGML_ABORT("ggml-vc4: a %s it cannot run", ggml_op_desc(node));
+                try {
+                    conv_run(f);
+                } catch (const std::exception & e) {
+                    on_cpu(i, f.last, e);
+                }
                 i = f.last;
                 break;
             case GGML_OP_LEAKY_RELU:
                 if (fusion_at(cgraph, i, f)) {
                     flush_cpu(i);
-                    conv_run(f);
+                    try {
+                        conv_run(f);
+                    } catch (const std::exception & e) {
+                        on_cpu(i, f.last, e);
+                    }
                     i = f.last;
                     break;
                 }
@@ -1591,6 +1988,7 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char *) {
 }
 
 ggml_backend_buffer_type_t dev_get_buffer_type(ggml_backend_dev_t) { return vc4_buffer_type(); }
+ggml_backend_buffer_type_t dev_get_host_buffer_type(ggml_backend_dev_t) { return vc4_host_buffer_type(); }
 
 bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor * op) {
     if (debug_on()) {
@@ -1605,8 +2003,18 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor * op) {
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE: return true;
-        case GGML_OP_MUL_MAT: return mul_mat_supported(op);
-        case GGML_OP_CONV_2D: return conv_supported(op);
+        default: break;
+    }
+    // The QPUs write a result by its bus address, so it must be in the pool: not a node whose memory is
+    // already placed elsewhere -- a view into the KV cache or output store loom keeps in RAM beside this
+    // device (state_buffer_type, P4.47). The elementwise nodes may: the CPU backend runs them, or one
+    // folded into a convolution leaves its result in the convolution's tensor and is copied out.
+    const ggml_backend_buffer_t placed = op->view_src ? op->view_src->buffer : op->buffer;
+    const bool qpu_dst_ok = placed == nullptr || is_vc4_buffer(placed);
+    switch (op->op) {
+        case GGML_OP_MUL_MAT: return qpu_dst_ok && mul_mat_supported(op);
+        case GGML_OP_CONV_2D: return qpu_dst_ok && conv_supported(op);
+        case GGML_OP_CONV_TRANSPOSE_1D: return qpu_dst_ok && convt_supported(op);
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_UNARY:
         case GGML_OP_ADD:
@@ -1627,7 +2035,7 @@ const ggml_backend_device_i device_iface = {
     /* .get_props            = */ dev_get_props,
     /* .init_backend         = */ dev_init_backend,
     /* .get_buffer_type      = */ dev_get_buffer_type,
-    /* .get_host_buffer_type = */ nullptr,
+    /* .get_host_buffer_type = */ dev_get_host_buffer_type,
     /* .buffer_from_host_ptr = */ nullptr,
     /* .supports_op          = */ dev_supports_op,
     /* .supports_buft        = */ dev_supports_buft,
@@ -1653,6 +2061,27 @@ ggml_backend_buffer_type_t vc4_buffer_type() {
             /* .get_alloc_size   = */ buft_get_alloc_size,
             /* .get_alloc_size_n = */ nullptr,
             /* .is_host          = */ buft_is_host,
+        },
+        /* .device  = */ &the_device(),
+        /* .context = */ nullptr,
+    };
+    return &buft;
+}
+
+size_t host_buft_get_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor * tensor) { return ggml_nbytes(tensor); }
+bool host_buft_is_host(ggml_backend_buffer_type_t) { return true; }
+
+ggml_backend_buffer_type_t vc4_host_buffer_type() {
+    static ggml_backend_buffer_type buft = {
+        /* .iface = */ {
+            /* .get_name         = */ buft_get_name,
+            /* .alloc_buffer     = */ host_buft_alloc_buffer,
+            /* .alloc_buffer_n   = */ nullptr,
+            /* .get_alignment    = */ buft_get_alignment,
+            /* .get_max_size     = */ nullptr,
+            /* .get_alloc_size   = */ host_buft_get_alloc_size,
+            /* .get_alloc_size_n = */ nullptr,
+            /* .is_host          = */ host_buft_is_host,
         },
         /* .device  = */ &the_device(),
         /* .context = */ nullptr,

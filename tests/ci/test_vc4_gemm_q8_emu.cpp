@@ -5,6 +5,7 @@
 //     within a bound of the offset sum's rounding (what the encoding costs, see qpu_gemm_q8.h).
 // Plus: a row whose blocks differ in scale is refused by the repack, padding words untouched, done
 // markers, and two legal-but-wrong kernels caught (an fsub in an accumulator; byte b read as b + 1).
+// P4.47: the repack's inverse gives the blocks back byte for byte.
 //
 // P4.45 (ADR-090's "Q8_0 / Q4_0 weights in the kernel"); ctest -R test_vc4_gemm_q8_emu
 #include "qpu_emu.h"
@@ -177,13 +178,33 @@ int main() {
     std::vector<uint8_t> scratch(gemm_q8_weight_bytes(1, 64));
     const bool refused = !gemm_q8_repack(two.data(), 1, 64, half_to_float, scratch.data());
     printf("mixed-scale row refused: %s\n", refused ? "yes" : "NO");
+    // P4.47: gemm_q8_unpack gives back the blocks byte for byte (the CPU's fallback reads them), at a
+    // row length the repack pads and one it does not
+    bool round_trip = true;
+    for (int K : {288, 512}) {
+        const int M = 7, nb = K / 32;
+        std::mt19937 rr(K);
+        std::vector<BlockQ8> src(size_t(M) * nb), back(src.size());
+        for (int m = 0; m < M; m++) {
+            const uint16_t dh = float_to_half(0.001f * float(m + 1));
+            for (int j = 0; j < nb; j++) {
+                src[size_t(m) * nb + j].d = dh;
+                for (auto & q : src[size_t(m) * nb + j].qs) q = int8_t(int(rr() % 255) - 127);
+            }
+        }
+        std::vector<uint8_t> packed(gemm_q8_weight_bytes(M, K));
+        round_trip = round_trip && gemm_q8_repack(src.data(), M, K, half_to_float, packed.data());
+        gemm_q8_unpack(packed.data(), M, K, float_to_half, back.data());
+        round_trip = round_trip && memcmp(src.data(), back.data(), src.size() * sizeof(BlockQ8)) == 0;
+    }
+    printf("repack -> unpack identical: %s\n", round_trip ? "yes" : "NO");
     printf("sabotage, fsub (must FAIL): ");
     const int s1 = run_case(288, 64, 288, 0, 12, FSUB);
     printf("sabotage, byte b -> b+1 (must FAIL): ");
     const int s2 = run_case(29, 37, 96, 3, 12, BYTE);
     printf("sabotage, residual position (must FAIL): ");
     const int s3 = run_case(29, 37, 96, 3, 7, RESIDUAL_ROW, GEMM_OUT_M, 0, EPI_RESIDUAL);
-    const bool ok = fails == 0 && refused && s1 && s2 && s3;
+    const bool ok = fails == 0 && refused && round_trip && s1 && s2 && s3;
     printf("%s\n", ok ? "ALL OK" : "FAILURES");
     return ok ? 0 : 1;
 }

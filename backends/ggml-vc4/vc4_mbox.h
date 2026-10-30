@@ -126,7 +126,10 @@ public:
         live_bytes() += size_;
     }
     ~GpuBuffer() {
-        if (cpu_) live_bytes() -= size_;
+        if (cpu_) {
+            live_bytes() -= size_;
+            frees()++;
+        }
         release();
     }
 
@@ -136,6 +139,12 @@ public:
     // though the next allocation reuses it (P4.46, Pi Zero).
     static std::atomic<size_t>& live_bytes() {
         static std::atomic<size_t> n{0};
+        return n;
+    }
+    // Blocks this process has given back to the pool: while it stands still, a request the pool
+    // refused would be refused again (ensure_arena).
+    static std::atomic<uint64_t>& frees() {
+        static std::atomic<uint64_t> n{0};
         return n;
     }
     GpuBuffer(const GpuBuffer&) = delete;
