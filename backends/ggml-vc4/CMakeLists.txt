@@ -1,5 +1,5 @@
 # ggml-vc4: the Pi Zero / Pi 1-3 GPU (VideoCore IV, 12 QPUs) as a ggml ACCEL backend used WITH the
-# CPU (P4.44, ADR-088). Built through ggml's own `ggml_add_backend_library`, so it is whatever every
+# CPU (P4.44, ADR-090). Built through ggml's own `ggml_add_backend_library`, so it is whatever every
 # other ggml backend is in this build: a MODULE `libggml-vc4.so` beside the others under
 # GGML_BACKEND_DL (what the wheels ship; a dependency of `ggml`, so an EXCLUDE_FROM_ALL consumer such
 # as loom-py still builds it), a library linked into `ggml` otherwise. ggml's registry knows nothing

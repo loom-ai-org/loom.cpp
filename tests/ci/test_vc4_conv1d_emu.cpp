@@ -5,7 +5,7 @@
 // epilogue (bias, residual, relu, mask, every combination) against relu(bias + conv + residual) * mask
 // in the kernel's order, and a sabotage that adds one channel's residual to the next.
 //
-// P4.45 (ADR-088's "convolutions as GEMM"), P4.46; ctest -R test_vc4_conv1d_emu
+// P4.45 (ADR-090's "convolutions as GEMM"), P4.46; ctest -R test_vc4_conv1d_emu
 #include "qpu_conv1d.h"
 #include "qpu_emu.h"
 

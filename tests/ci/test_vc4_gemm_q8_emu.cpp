@@ -6,7 +6,7 @@
 // Plus: a row whose blocks differ in scale is refused by the repack, padding words untouched, done
 // markers, and two legal-but-wrong kernels caught (an fsub in an accumulator; byte b read as b + 1).
 //
-// P4.45 (ADR-088's "Q8_0 / Q4_0 weights in the kernel"); ctest -R test_vc4_gemm_q8_emu
+// P4.45 (ADR-090's "Q8_0 / Q4_0 weights in the kernel"); ctest -R test_vc4_gemm_q8_emu
 #include "qpu_emu.h"
 #include "qpu_gemm_q8.h"
 
