@@ -154,16 +154,24 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   [TigreGotico/orthography2ipa#1721](https://github.com/TigreGotico/orthography2ipa/issues/1721). *Context:
   [Epic-03](../epics/epic-03-model-coverage.md#vaniq-edge-and-auroratts-100k-two-more-small-english-voices),
   [ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md)*
+* [ ] **Nemotron-Labs-Unified-ASR 0.6B: publish** (built 2026-10-30, F32 + Q8_0,
+  `nemotron-labs-unified-asr-0.6b-loom`, staged in `hf-models-rc20/`). Runs on the released rc19; exported
+  from NeMo 3.0 (the `nemo3` venv), offline mode only. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **Vaniq-Edge and AuroraTTS-100K: publish** (built 2026-10-25, F32 + `Q8_0_PC` each,
   `vaniq-edge-loom` and `auroratts-100k-loom`). Vaniq-Edge runs on the released 1.0.0-rc19; AuroraTTS
   needs the engine's GRU cells ([ADR-087](../adrs/adr-087-a-recurrent-cell-declares-the-state-it-carries.md))
   and loom-py's `arpabet` fold ([ADR-088](../adrs/adr-088-arpabet-is-a-phoneme-style-the-door-folds-to.md)),
   so it uploads only after the release that carries them. *Context:
   [Epic-03](../epics/epic-03-model-coverage.md#vaniq-edge-and-auroratts-100k-two-more-small-english-voices)*
+* [ ] **oruk-loop-153M: publish** (built 2026-10-30, F32 + Q8_0, `oruk-loop-153m-loom`, staged in
+  `hf-models-rc20/`). Short clips run on rc19; audio past ~55 s needs the quiet-point split, so it uploads
+  after the release that carries it. Weights are PolyForm Small Business / Noncommercial (Oruk AI), not
+  the teacher's Apache-2.0. *Context: [ADR-094](../adrs/adr-094-a-speech-lm-recognizer-is-cut-at-quiet-points-and-its-cache-holds-one-piece.md),
+  [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **Audio8-TTS-Realistic-0.6B + its codec: publish after rc20** (built 2026-10-30, talker F32 + Q8_0,
   codec F32; `audio8-tts-realistic-0.6b-loom`, `audio8-tts-codec-loom`). The talker's sampler needs rc20's
   `truncation`/`top_p_crossing` ([ADR-095](../adrs/adr-095-a-samplers-truncation-may-be-measured-before-its-temperature.md)).
-  Follow-ups: opt the token table into `quantize_gathered` once oruk's branch lands (Q8_0 1.2 GB -> ~0.8 GB);
+  Follow-ups: opt the token table into `quantize_gathered` once loom-exporter #69 (oruk) lands (Q8_0 1.2 GB -> ~0.8 GB);
   Audio8-TTS-Preview-0.6b is the same leaf and the same codec, not exported. *Context:
   [Epic-03](../epics/epic-03-model-coverage.md#the-fourth-leaf-was-audio8-tts-realistic-06b-and-its-sampler-was-not-transformers-2026-10-30)*
 * [ ] **Moonshine base**: the same leaf as tiny (`moonshine_v1_export.py`), on disk at `~/Dev/models/moonshine-base`, not exported
