@@ -160,6 +160,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   and loom-py's `arpabet` fold ([ADR-088](../adrs/adr-088-arpabet-is-a-phoneme-style-the-door-folds-to.md)),
   so it uploads only after the release that carries them. *Context:
   [Epic-03](../epics/epic-03-model-coverage.md#vaniq-edge-and-auroratts-100k-two-more-small-english-voices)*
+* [ ] **oruk-loop-153M: publish** (built 2026-10-30, F32 + Q8_0, `oruk-loop-153m-loom`, staged in
+  `hf-models-rc20/`). Short clips run on rc19; audio past ~55 s needs the quiet-point split, so it uploads
+  after the release that carries it. Weights are PolyForm Small Business / Noncommercial (Oruk AI), not
+  the teacher's Apache-2.0. *Context: [ADR-094](../adrs/adr-094-a-speech-lm-recognizer-is-cut-at-quiet-points-and-its-cache-holds-one-piece.md),
+  [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **Moonshine base**: the same leaf as tiny (`moonshine_v1_export.py`), on disk at `~/Dev/models/moonshine-base`, not exported
   or measured. *Context: [Epic-03](../epics/epic-03-model-coverage.md#family-2s-third-leaf-moonshine-v1-tiny)*
 * [ ] **MOSS-TTS + MOSS-Audio-Tokenizer: three open pieces.** Both are published
