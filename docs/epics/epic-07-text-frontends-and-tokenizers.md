@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: text-frontend
-last_updated: 2026-10-23
+last_updated: 2026-10-25
 ---
 
 # Epic-07: Text Front-Ends and Tokenizers
@@ -160,12 +160,16 @@ espeak's (11.1% against 8.5%). A model now declares `loom.tts.phoneme_style` (`e
 loom-py's door folds to it (`loom.phonemizers.fold`). The port carries the fold with it. The
 framing is part of the same story: Piper trained with a blank after BOS
 ([Retro-081](../retros/retro-081-piper-has-two-framings.md)), now `tokenizer.ggml.phoneme.blank_after_bos`.
+A third style changes the ALPHABET too: `arpabet` (2026-10-25,
+[ADR-088](../adrs/adr-088-arpabet-is-a-phoneme-style-the-door-folds-to.md)) folds the door's IPA to
+g2p_en's ARPAbet tokens for AuroraTTS-100K, written space-separated with `|` for the word boundary, with
+CMUdict shipped as an IPA lexicon the fold returns exactly.
 
 ## 3. Related Decisions and Artifacts
 
 | | |
 |---|---|
-| Decisions | [ADR-012](../adrs/adr-012-permissive-phonemizer.md), [ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md) |
+| Decisions | [ADR-012](../adrs/adr-012-permissive-phonemizer.md), [ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md), [ADR-088](../adrs/adr-088-arpabet-is-a-phoneme-style-the-door-folds-to.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md) |
 | Design | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) §5 |
 | Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md), [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md), [Retro-059](../retros/retro-059-a-shared-tokenizers-whitespace-was-ascii.md), [Retro-081](../retros/retro-081-piper-has-two-framings.md) |
 | Decisions | [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md), [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md), [ADR-067](../adrs/adr-067-a-regex-rule-table-ships-its-reference-patterns.md) |
