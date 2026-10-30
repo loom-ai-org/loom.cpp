@@ -157,12 +157,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 * [ ] **Nemotron-Labs-Unified-ASR 0.6B: publish** (built 2026-10-30, F32 + Q8_0,
   `nemotron-labs-unified-asr-0.6b-loom`, staged in `hf-models-rc20/`). Runs on the released rc19; exported
   from NeMo 3.0 (the `nemo3` venv), offline mode only. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
-* [ ] **Parakeet TDT/RNNT (and the NeMo CTC leaves?): one encoder frame past `encoded_len`.** NeMo's
-  centred STFT emits `n // hop + 1` mel frames, the last invalid; when the valid count is a multiple of 8
-  the encoder emits a frame NeMo's decode never reads and the transducer driver decodes it (a stray
-  final "." on 6 of 73 LibriSpeech clips for the unified model, fixed in `nemotron_unified_export` by
-  dropping that mel frame). `parakeet_export` traces the same preprocessor, so it very likely has it
-  too, unmeasured: jfk.wav (1100 frames) cannot show it. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **Vaniq-Edge and AuroraTTS-100K: publish** (built 2026-10-25, F32 + `Q8_0_PC` each,
   `vaniq-edge-loom` and `auroratts-100k-loom`). Vaniq-Edge runs on the released 1.0.0-rc19; AuroraTTS
   needs the engine's GRU cells ([ADR-087](../adrs/adr-087-a-recurrent-cell-declares-the-state-it-carries.md))
