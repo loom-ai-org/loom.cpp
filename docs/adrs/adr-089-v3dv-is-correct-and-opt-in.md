@@ -6,7 +6,7 @@ domain: backends
 tags: [vulkan, v3dv, broadcom, raspberry-pi-4, workgroup-size, specialization-constants, device-selection]
 ---
 
-# ADR-087: The Raspberry Pi 4's GPU Runs Correctly and Is Opt-In
+# ADR-089: The Raspberry Pi 4's GPU Runs Correctly and Is Opt-In
 
 P4.43 in [Epic-04](../epics/epic-04-backends-and-accelerators.md#7-p443-v3dv-on-the-raspberry-pi-4-2026-10-28).
 Built as `ggml-0054` and `ggml-0055` (`cmake/patches/UPSTREAM.md` PRs 50 and 51). The lesson from the

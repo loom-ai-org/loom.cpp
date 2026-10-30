@@ -8,7 +8,7 @@ tags: [vulkan, v3dv, raspberry-pi-4, benchmarking, measurement, a-b]
 # Retro-094: A Speedup Measured Against a Run With Different Output
 
 Serves [Epic-04](../epics/epic-04-backends-and-accelerators.md#7-p443-v3dv-on-the-raspberry-pi-4-2026-10-28)
-(P4.43); the decision is [ADR-087](../adrs/adr-087-v3dv-is-correct-and-opt-in.md).
+(P4.43); the decision is [ADR-089](../adrs/adr-089-v3dv-is-correct-and-opt-in.md).
 
 ## Issue
 
