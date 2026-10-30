@@ -6,10 +6,10 @@ domain: backends
 tags: [vc4, qpu, raspberry-pi-zero, convolution, int8, q8_0_pc, ggml-backend-sched, weights]
 ---
 
-# ADR-089: The QPUs Take Convolutions and Per-Channel Int8
+# ADR-091: The QPUs Take Convolutions and Per-Channel Int8
 
 P4.45 in [Epic-04](../epics/epic-04-backends-and-accelerators.md), the open items of
-[ADR-088](adr-088-the-pi-zero-qpus-are-an-accelerator-beside-the-cpu.md). Code:
+[ADR-090](adr-090-the-pi-zero-qpus-are-an-accelerator-beside-the-cpu.md). Code:
 `backends/ggml-vc4/qpu_conv1d.h`, `qpu_gemm_q8.h`, `ggml-vc4.cpp`; `src/core/gguf_model.cpp`;
 `cmake/patches/ggml-0056`. What broke on the way: [Retro-097](../retros/retro-097-an-emulator-that-runs-the-qpus-one-at-a-time.md)
 (a QPU race the emulator could not see), [Retro-098](../retros/retro-098-a-scheduler-that-placed-weight-ops-by-accident.md)

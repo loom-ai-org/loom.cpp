@@ -6,10 +6,10 @@ domain: backends
 tags: [vc4, qpu, raspberry-pi-zero, fusion, epilogue, q4_0, q8_0, int8, tile-order, cma, ggml-backend-sched]
 ---
 
-# ADR-090: The QPUs Take the Epilogue, Q4_0 and the Pointwise Convolutions
+# ADR-092: The QPUs Take the Epilogue, Q4_0 and the Pointwise Convolutions
 
 P4.46 in [Epic-04](../epics/epic-04-backends-and-accelerators.md), the open items of
-[ADR-089](adr-089-the-qpus-take-convolutions-and-per-channel-int8.md). Code: `backends/ggml-vc4/`
+[ADR-091](adr-091-the-qpus-take-convolutions-and-per-channel-int8.md). Code: `backends/ggml-vc4/`
 (`qpu_gemm_qb.h` new; `qpu_conv1d.h`, `qpu_gemm_q8.h`, `qpu_gemm.h`, `qpu_gemm_wt.h`, `vc4_mbox.h`,
 `ggml-vc4.cpp`); `src/core/gguf_model.cpp`. What broke on the way:
 [Retro-099](../retros/retro-099-a-slowdown-blamed-on-the-dimension-that-was-large.md) (the "large N"

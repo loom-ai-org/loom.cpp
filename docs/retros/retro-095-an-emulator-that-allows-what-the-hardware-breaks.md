@@ -8,7 +8,7 @@ tags: [vc4, qpu, emulator, tmu, hazard, raspberry-pi-zero, verification]
 # Retro-095: An Emulator That Allows What the Hardware Breaks
 
 Serves [Epic-04](../epics/epic-04-backends-and-accelerators.md) (P4.44); the decision is
-[ADR-088](../adrs/adr-088-the-pi-zero-qpus-are-an-accelerator-beside-the-cpu.md).
+[ADR-090](../adrs/adr-090-the-pi-zero-qpus-are-an-accelerator-beside-the-cpu.md).
 
 ## Issue
 

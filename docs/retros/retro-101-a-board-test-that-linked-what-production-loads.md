@@ -8,7 +8,7 @@ tags: [vc4, ggml-backend-dl, dlopen, symbols, testing, device-selection, raspber
 # Retro-101: A Board Test That Linked What Production Loads
 
 Serves [Epic-04](../epics/epic-04-backends-and-accelerators.md) (P4.46); the decision is
-[ADR-090](../adrs/adr-090-the-qpus-take-the-epilogue-q4-0-and-the-pointwise-convolutions.md).
+[ADR-092](../adrs/adr-092-the-qpus-take-the-epilogue-q4-0-and-the-pointwise-convolutions.md).
 
 ## Issue
 
