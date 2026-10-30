@@ -1054,17 +1054,29 @@ void LoomLuaBridge::cell_sweep(LoomLuaBridge* self, const std::string& module_na
             ggml_backend_tensor_set(cell_input, layer_input.data(), 0,
                                      layer_input.size() * sizeof(float));
         }
+        // Two cell shapes, told apart by what the topology declares. An LSTM cell carries h AND c: it
+        // reads `c_prev` and declares `h_new`, `c_new`. A GRU cell's whole state is h: no `c_prev`, and
+        // `h_new` alone. Anything in between is a cell this loop would carry wrongly, so it is refused
+        // rather than guessed at -- a missing `c_prev` with two outputs would drop the cell state.
+        const auto c_prev = r.input_tensors.find("c_prev");
+        const bool carries_c = c_prev != r.input_tensors.end();
+        if (r.outputs.size() != (carries_c ? 2u : 1u)) {
+            throw Error(std::string(fname) + ": module '" + module_name + "' declares " +
+                         std::to_string(r.outputs.size()) + " output(s) and " +
+                         (carries_c ? "a" : "no") + " 'c_prev' input; a cell topology is an LSTM's "
+                         "('c_prev' in, 'h_new' and 'c_new' out, in that order) or a GRU's (no "
+                         "'c_prev', 'h_new' out)");
+        }
         ggml_backend_tensor_set(r.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
-        ggml_backend_tensor_set(r.input_tensors.at("c_prev"), c.data(), 0, c.size() * sizeof(float));
+        if (carries_c) {
+            ggml_backend_tensor_set(c_prev->second, c.data(), 0, c.size() * sizeof(float));
+        }
         builder.compute();
 
-        if (r.outputs.size() < 2) {
-            throw Error(std::string(fname) + ": module '" + module_name + "' declares " +
-                         std::to_string(r.outputs.size()) + " output(s); a cell topology must declare "
-                         "both 'h_new' and 'c_new', in that order");
-        }
         ggml_backend_tensor_get(r.outputs[0], h.data(), 0, h.size() * sizeof(float));
-        ggml_backend_tensor_get(r.outputs[1], c.data(), 0, c.size() * sizeof(float));
+        if (carries_c) {
+            ggml_backend_tensor_get(r.outputs[1], c.data(), 0, c.size() * sizeof(float));
+        }
         emit(t, h);
     }
 }
