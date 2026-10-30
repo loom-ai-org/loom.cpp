@@ -14,7 +14,7 @@ option(LOOM_BUILD_TOOLS "Build the CLI/demo tools" ON)
 
 include(cmake/Dependencies.cmake)
 
-# The Pi Zero / Pi 1-3 QPUs as an accelerator beside the CPU (P4.44, ADR-088). ON by default where
+# The Pi Zero / Pi 1-3 QPUs as an accelerator beside the CPU (P4.44, ADR-090). ON by default where
 # such a board can be: 32-bit ARM Linux, the only userland its mailbox route exists in. Elsewhere it
 # builds (CI turns it on to compile it) and reports no device.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 4 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")

@@ -2,7 +2,7 @@
 // of dst outside the product untouched (it writes straight into dst), done markers, and a legal but
 // wrong kernel caught.
 //
-// P4.44 (ADR-088); ctest -R test_vc4_gemm_wt_emu
+// P4.44 (ADR-090); ctest -R test_vc4_gemm_wt_emu
 #include "qpu_emu.h"
 #include "qpu_gemm_wt.h"
 
