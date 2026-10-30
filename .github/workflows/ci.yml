@@ -65,8 +65,10 @@ jobs:
             ccache-${{ runner.os }}-${{ steps.isa.outputs.id }}-${{ hashFiles('CMakeLists.txt', 'cmake/Dependencies.cmake') }}-
             ccache-${{ runner.os }}-${{ steps.isa.outputs.id }}-
 
+      # LOOM_GGML_VC4 defaults ON only on 32-bit ARM Linux. ON here so the Pi Zero QPU backend still
+      # compiles, and test_vc4_backend_cpu_only checks loom registers it, on a machine with no board.
       - name: Configure
-        run: cmake -B build
+        run: cmake -B build -DLOOM_GGML_VC4=ON
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
