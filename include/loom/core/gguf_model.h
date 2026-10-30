@@ -157,6 +157,9 @@ private:
     bool primary_takes(const ggml_tensor* node, const ggml_tensor* w) const;
     ggml_tensor* primary_copy(ggml_tensor* w);
     ggml_backend_buffer_type_t primary_extra_buft_ = nullptr;
+    // Where the weights went (weights_buffer_type, P4.47): the primary's own buffer type, or the host
+    // buffer type of a primary whose kernels read weights through their own copies. Plain copies too.
+    ggml_backend_buffer_type_t weights_buft_ = nullptr;
     ggml_backend_buffer_ptr primary_probe_buf_;
     std::vector<ggml_backend_buffer_ptr> primary_bufs_;
     // The CPU backend whose extra buffer types hold `repacked_`: the primary, or the CPU fallback beside

@@ -388,7 +388,7 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
         // whose declared inputs are all zero-sized at these axes -- so the check is on the tensors
         // themselves rather than on the return value. Anything still unallocated and non-empty here
         // would fall through to gallocr, which is precisely what this arrangement exists to prevent.
-        inputs_buf_.reset(ggml_backend_alloc_ctx_tensors(inputs_ctx_.get(), backend_));
+        inputs_buf_.reset(ggml_backend_alloc_ctx_tensors_from_buft(inputs_ctx_.get(), state_buffer_type(backend_)));
         for (const auto& [name, t] : result.input_tensors) {
             if (t->data == nullptr && ggml_nbytes(t) > 0) {
                 throw Error("GraphBuilder::build: failed to allocate the backend buffer for declared "

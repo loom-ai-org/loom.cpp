@@ -257,6 +257,23 @@ bool gemm_q8_repack(const Block * rows, int M, int K, D2F d_to_float, uint8_t * 
     return true;
 }
 
+// The inverse (P4.47): ggml's Q8_0 rows back from a repacked weight -- exact, since every block of a row
+// had the row's one fp16 scale -- for the CPU to run a node over it when the GPU pool refuses the call.
+template <class Block, class F2D>
+void gemm_q8_unpack(const uint8_t * in, int M, int K, F2D float_to_d, Block * rows) {
+    const int nb = K / 32;
+    const float * scales = reinterpret_cast<const float *>(in + gemm_q8_scales_at(M, K));
+    for (int m = 0; m < M; m++) {
+        const uint8_t * r = in + size_t(m) * gemm_q8_stride(K);
+        const auto d = float_to_d(scales[m]);
+        Block * b = rows + size_t(m) * nb;
+        for (int j = 0; j < nb; j++) {
+            b[j].d = d;
+            for (int i = 0; i < 32; i++) b[j].qs[i] = int8_t(int(r[j * 32 + i]) - 128);
+        }
+    }
+}
+
 // X -> 255 * X, k-major in 16-row blocks zero-padded to Kp, each block followed by its 16 columns'
 // 128 * sum_k x (summed in double: the subtraction cancels most of the accumulator). X[n][k] is
 // x[n * ns + k * ks]: ks = 1 for a MUL_MAT's activations, ns = 1 for a 1x1 convolution's [IC][T].
