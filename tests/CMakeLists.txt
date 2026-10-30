@@ -2001,7 +2001,7 @@ target_link_libraries(test_fft_ops PRIVATE loom::engine)
 add_test(NAME test_fft_ops COMMAND test_fft_ops)
 set_tests_properties(test_fft_ops PROPERTIES LABELS ci)
 
-# P4.44 (ADR-088): ggml-vc4, the Pi Zero QPU backend. The kernels run in a QPU emulator that refuses
+# P4.44 (ADR-090): ggml-vc4, the Pi Zero QPU backend. The kernels run in a QPU emulator that refuses
 # the hazards the reference guide warns about, so they are hermetic and run everywhere, whatever
 # LOOM_GGML_VC4 says: the encoder against a golden dump cross-checked with py-videocore, and both
 # GEMM kernels bit for bit against an fmul-then-fadd reference, each with a legal-but-wrong sabotage

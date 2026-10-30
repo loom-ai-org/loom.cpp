@@ -3,7 +3,7 @@
 // untouched (each row is its own DMA), done markers, and two legal-but-wrong kernels caught -- a
 // subtraction in one accumulator, and the next-channel step swapped for the tap step.
 //
-// P4.45 (ADR-088's "convolutions as GEMM"); ctest -R test_vc4_conv1d_emu
+// P4.45 (ADR-090's "convolutions as GEMM"); ctest -R test_vc4_conv1d_emu
 #include "qpu_conv1d.h"
 #include "qpu_emu.h"
 
