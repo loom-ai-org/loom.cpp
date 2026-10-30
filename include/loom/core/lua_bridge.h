@@ -318,7 +318,8 @@ private:
     // unrestricted argmax would answer with a word (BACKLOG.md P4.1 follow-up).
     static int l_argmax_row_range(lua_State* L);
     // `loom.sample_row(module, row, {temperature =, top_k =, top_p =, min_p =, lo =, hi =, generation =,
-    // repetition_penalty =, penalized =, guidance = {module =, scale =}})` -> one token id DRAWN from that row rather than maximized over
+    // repetition_penalty =, penalized =, guidance = {module =, scale =}, top_p_mass =, banned =,
+    // uniform =, truncation =, top_p_crossing =})` -> one token id DRAWN from that row rather than maximized over
     // it (P4.24). Greedy settings run `l_argmax_row`'s own reduction over the same window -- see
     // `sample_tensor_row`. `lo`/`hi` restrict it to a half-open id window and return absolute ids, as
     // `l_argmax_row_range` does; `guidance` combines this module's logits with a second module's as
