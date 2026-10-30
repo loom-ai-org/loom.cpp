@@ -8,12 +8,12 @@ tags: [vc4, qpu, tmu, cache, stride, aliasing, raspberry-pi-zero, measurement]
 # Retro-099: A Slowdown Blamed on the Dimension That Was Large
 
 Serves [Epic-04](../epics/epic-04-backends-and-accelerators.md) (P4.46); the decision is
-[ADR-090](../adrs/adr-090-the-qpus-take-the-epilogue-q4-0-and-the-pointwise-convolutions.md).
+[ADR-092](../adrs/adr-092-the-qpus-take-the-epilogue-q4-0-and-the-pointwise-convolutions.md).
 
 ## Issue
 
 P4.44 measured one MUL_MAT, 128 x 3656 x 384, at 2.2 GFLOPS where its neighbours ran at 9-11, and
-filed it as "the tile order for large N" (ADR-088, carried by ADR-089 and the P4.45 handover). P4.46
+filed it as "the tile order for large N" (ADR-090, carried by ADR-091 and the P4.45 handover). P4.46
 built the fix that diagnosis asked for -- panels of column blocks, so the packed X a pass streams
 through the uniform caches stays bounded -- and measured it: m-major 2.21 GFLOPS, panels of 1, 2, 3, 4,
 6 and 12 between 1.93 and 2.20. Nothing moved.

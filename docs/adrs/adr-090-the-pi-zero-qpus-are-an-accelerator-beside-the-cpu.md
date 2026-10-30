@@ -6,12 +6,12 @@ domain: backends
 tags: [vc4, videocore-iv, qpu, raspberry-pi-zero, armv6, accel, mailbox, device-selection]
 ---
 
-# ADR-088: The Pi Zero's QPUs Are an Accelerator Beside the CPU
+# ADR-090: The Pi Zero's QPUs Are an Accelerator Beside the CPU
 
 P4.44 in [Epic-04](../epics/epic-04-backends-and-accelerators.md). Code: `backends/ggml-vc4/`. The
 hardware trap found building it is [Retro-095](../retros/retro-095-an-emulator-that-allows-what-the-hardware-breaks.md);
 what validating it on the shipped models found is [Retro-096](../retros/retro-096-an-accelerator-primary-rewrote-the-graphs-it-did-not-touch.md).
-The Pi 4's GPU went the other way (ADR-087: V3DV is correct but slower than the CPU on every op, so it
+The Pi 4's GPU went the other way (ADR-089: V3DV is correct but slower than the CPU on every op, so it
 is opt-in).
 
 ## Context
@@ -111,4 +111,4 @@ end to end it is a wash: its Mimi convolutions dominate and stay on the CPU.
 * Open (hub P4.44): Q8_0 / Q4_0 weights in the kernel (what the Pi Zero models ship as), convolutions
   as GEMM (the TMU gather can do the im2col addressing), and the tile order for large N (128x3656x384
   ran at 2.2 GFLOPS). The convolutions and per-channel Q8_0 were taken up by P4.45:
-  [ADR-089](adr-089-the-qpus-take-convolutions-and-per-channel-int8.md).
+  [ADR-091](adr-091-the-qpus-take-convolutions-and-per-channel-int8.md).

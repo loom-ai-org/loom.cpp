@@ -8,7 +8,7 @@ tags: [ggml-backend-sched, weights, buffer-usage, device-selection, vc4, hybrid]
 # Retro-098: A Scheduler That Placed Weight Ops by Accident
 
 Serves [Epic-04](../epics/epic-04-backends-and-accelerators.md) (P4.45); the decision is
-[ADR-089](../adrs/adr-089-the-qpus-take-convolutions-and-per-channel-int8.md) (decision 5).
+[ADR-091](../adrs/adr-091-the-qpus-take-convolutions-and-per-channel-int8.md) (decision 5).
 
 ## Issue
 

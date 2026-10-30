@@ -1,4 +1,4 @@
-// ggml-vc4 through ggml's scheduler, the way the engine uses it (P4.44, ADR-088): backends
+// ggml-vc4 through ggml's scheduler, the way the engine uses it (P4.44, ADR-090): backends
 // [VC4, CPU], weights in the VC4 buffer type, activations in CPU buffers. For each graph: that every
 // MUL_MAT and CONV_2D landed where it must (a VC4 that declined everything would otherwise pass, since
 // the reference is the CPU), the result against the same graph on [CPU] alone, and the time of both.
@@ -8,7 +8,7 @@
 //
 // VC4 is found the way the engine finds it -- loom's backend sweep, which loads libggml-vc4.so or
 // registers the linked one -- so this also gates that loading. Exits 77 without a VC4 device: any
-// machine but a Pi Zero / Pi 1-3 booted without vc4-kms-v3d (read the KMS trap in ADR-088 first).
+// machine but a Pi Zero / Pi 1-3 booted without vc4-kms-v3d (read the KMS trap in ADR-090 first).
 // `test_vc4_backend cpu-only` runs both arms on the CPU, which must pass with placements ignored --
 // the harness and the loading checked anywhere, which is how CI runs it.
 #include "cpu_backend.h"

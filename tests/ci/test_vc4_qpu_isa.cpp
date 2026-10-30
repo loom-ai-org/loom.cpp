@@ -1,4 +1,4 @@
-// Golden test for qpu_isa.h (P4.44, ADR-088): rebuild qpu_probe.c's programs and compare word for
+// Golden test for qpu_isa.h (P4.44, ADR-090): rebuild qpu_probe.c's programs and compare word for
 // word against tests/fixtures/vc4_qpu_golden.hex (qpu_probe --dump, whose encodings were diffed
 // against py-videocore's assembler on 2026-10-28: equal except don't-care fields -- py sets sf on add
 // ops by default, cond_mul on ldi to a nop mul address, writes nops as `nop r0`, and releases the
