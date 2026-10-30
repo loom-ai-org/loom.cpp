@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: backends
-last_updated: 2026-10-28
+last_updated: 2026-10-30
 ---
 
 # Epic-04: Backends and Accelerators
@@ -68,13 +68,14 @@ cost 183 splits against the monolithic export's 181 — measured, against the pr
 | Metal | verified on an M1 Pro ([§5](#5-metal-p411--shipped-2026-08-31-run-on-an-apple-m1-pro), [§6](#6-gpu-correctness-f32-matmul-precision-the-metal-norm-the-cuda-mat-vec-stride-2026-10-08)) |
 | NPU | open; no NPU registers as a `ggml` device type the engine can resolve |
 | Vulkan on V3D (Raspberry Pi 4) | correct and opt-in (`GGML_VK_VISIBLE_DEVICES`); 79-122x slower than the A72s ([§7](#7-p443-v3dv-on-the-raspberry-pi-4-2026-10-28)) |
+| ggml-vc4 (Pi Zero / Pi 1-3 QPUs) | in tree, beside the CPU under `"auto"` on a board booted without `vc4-kms-v3d`; 1.15-3.36x the CPU alone on the Pi Zero W ([§8](#8-p444-p447-ggml-vc4-the-pi-zeros-qpus-beside-the-cpu-2026-10-28-to-30)) |
 
 ## 3. Related Decisions and Artifacts
 
 | | |
 |---|---|
-| Decisions | [ADR-007](../adrs/adr-007-backend-capability-negotiation.md), [ADR-008](../adrs/adr-008-atan-approximation.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md), [ADR-089](../adrs/adr-089-v3dv-is-correct-and-opt-in.md) |
-| Retros | [Retro-007](../retros/retro-007-gpu-chose-the-integrated-gpu.md), [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-009](../retros/retro-009-host-callback-count-was-the-wrong-lens.md), [Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md), [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md), [Retro-075](../retros/retro-075-upstream-had-already-fixed-the-norm.md), [Retro-076](../retros/retro-076-a-full-device-said-device-lost.md), [Retro-077](../retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md), [Retro-094](../retros/retro-094-a-speedup-measured-against-a-run-with-different-output.md) |
+| Decisions | [ADR-007](../adrs/adr-007-backend-capability-negotiation.md), [ADR-008](../adrs/adr-008-atan-approximation.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md), [ADR-089](../adrs/adr-089-v3dv-is-correct-and-opt-in.md), [ADR-090](../adrs/adr-090-the-pi-zero-qpus-are-an-accelerator-beside-the-cpu.md), [ADR-091](../adrs/adr-091-the-qpus-take-convolutions-and-per-channel-int8.md), [ADR-092](../adrs/adr-092-the-qpus-take-the-epilogue-q4-0-and-the-pointwise-convolutions.md), [ADR-093](../adrs/adr-093-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md) |
+| Retros | [Retro-007](../retros/retro-007-gpu-chose-the-integrated-gpu.md), [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-009](../retros/retro-009-host-callback-count-was-the-wrong-lens.md), [Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md), [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md), [Retro-075](../retros/retro-075-upstream-had-already-fixed-the-norm.md), [Retro-076](../retros/retro-076-a-full-device-said-device-lost.md), [Retro-077](../retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md), [Retro-094](../retros/retro-094-a-speedup-measured-against-a-run-with-different-output.md), [Retro-095](../retros/retro-095-an-emulator-that-allows-what-the-hardware-breaks.md), [Retro-096](../retros/retro-096-an-accelerator-primary-rewrote-the-graphs-it-did-not-touch.md), [Retro-097](../retros/retro-097-an-emulator-that-runs-the-qpus-one-at-a-time.md), [Retro-098](../retros/retro-098-a-scheduler-that-placed-weight-ops-by-accident.md), [Retro-099](../retros/retro-099-a-slowdown-blamed-on-the-dimension-that-was-large.md), [Retro-100](../retros/retro-100-a-free-memory-figure-that-is-a-lower-bound.md), [Retro-101](../retros/retro-101-a-board-test-that-linked-what-production-loads.md), [Retro-102](../retros/retro-102-a-room-check-made-before-the-plan-took-its-room.md) |
 | Active tasks | [Backlog → Backends](../backlog/active-index.md#backends--accelerators) |
 
 ## 4. The Record
@@ -1327,3 +1328,38 @@ spec-sized dimensions and the fitter skipped it -- now fixed; open there, on nei
 n = 129 over tolerance (ADR-089 lists them). On an AMD Vega 3 (RADV, 1024 invocations) every
 op passes, 17 490 cases, and the device-parity gates run on it, so nothing changes where 512 fits. A
 conv2d tile for V3D was measured out ([Retro-094](../retros/retro-094-a-speedup-measured-against-a-run-with-different-output.md)).
+
+## 8. P4.44-P4.47: ggml-vc4, the Pi Zero's QPUs beside the CPU (2026-10-28 to 30)
+
+The user asked for the Pi Zero's GPU as well as the Pi 4's. Unlike V3DV it pays: the VideoCore IV's 12
+QPUs (26 GFLOPS measured, against one ARM11 core) run beside the CPU as an `ACCEL` device, rank 1, which
+`"auto"` picks on a board booted without `vc4-kms-v3d` (under KMS the firmware's QPU calls wedge it).
+Decisions: [ADR-090](../adrs/adr-090-the-pi-zero-qpus-are-an-accelerator-beside-the-cpu.md) (the
+backend), [ADR-091](../adrs/adr-091-the-qpus-take-convolutions-and-per-channel-int8.md) (convolutions,
+per-channel int8), [ADR-092](../adrs/adr-092-the-qpus-take-the-epilogue-q4-0-and-the-pointwise-convolutions.md)
+(epilogue fusion, Q4_0, pointwise), [ADR-093](../adrs/adr-093-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md)
+(transposed convolutions, memory).
+
+**What the QPUs take** (`backends/ggml-vc4/`, kernels generated from `qpu_*.h`): F32 `MUL_MAT`; Q8_0 /
+Q4_0 `MUL_MAT`s, per-channel Q8_0 (loom's Q8_0_PC) through its own `VC4_Q8` buffer type; 1-D
+convolutions (loom's `CONV_2D` with one row) with the bias, residual, ReLU, mask and a LEAKY_RELU before
+them folded in; `CONV_TRANSPOSE_1D` as polyphase convolutions. Every other node is the CPU's, through
+`ggml_backend_sched`; the elementwise nodes it claims either fold into a convolution or run on the CPU
+backend it holds. Products of fewer than 16 columns over a weight it must copy stay on the CPU.
+
+**Memory.** Its own buffers come from the GPU's contiguous pool (CMA, 64 MB by default), which its
+kernels write by bus address. So the pool holds the scheduler's compute buffers, the QPUs' packed
+copies of weights (2 MB slabs, kept while the pool has room) and a per-call arena, and nothing else:
+weights are loaded into `VC4_HOST`, ordinary memory (`weights_buffer_type`), and loom's KV and
+conv-state caches, retained outputs and inputs into the CPU's buffer type (`state_buffer_type`), read
+by the QPUs through per-call copies. A node the pool refuses at compute time runs on the CPU, a
+`VC4_Q8` weight as its Q8_0 copy in `CPU_ARMV6_I8`.
+
+**Measured** (Pi Zero W, thirteen models, [BENCHMARKS](../BENCHMARKS.md#raspberry-pi-zero-w-cpu-against-cpuvc4)):
+1.15x (Silero VAD) to 3.36x (VITS) over the CPU alone, Pocket TTS 1.27-1.35x; outputs as the CPU's
+within the QPUs' non-IEEE rounding.
+
+**Verified:** the kernels in a QPU emulator in CI (`test_vc4_*_emu`, `test_vc4_qpu_isa`), the module's
+imports against `libggml-base` (`test_vc4_module_symbols`), and the backend through the scheduler on
+the board (`test_vc4_backend`, a gate that exits 77 anywhere else). What broke on the way:
+Retro-095 to Retro-102 ([§3](#3-related-decisions-and-artifacts)).
