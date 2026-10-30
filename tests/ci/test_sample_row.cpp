@@ -112,6 +112,8 @@ const char* kScript = R"lua(
         'is banned, so there is nothing to draw from',
         'it is the draw itself',
         'top_p_mass is',
+        'truncation is',
+        'top_p_crossing is',
     }
 
     -- The whole last row, marshalled out, so the test can compute what guidance SHOULD answer instead
@@ -220,6 +222,19 @@ const char* kScript = R"lua(
         return out
     end
 
+    -- Fish Audio's DualAR sampler (Audio8-TTS, ADR-095): `truncation` 1 = "untempered", 2 = "tempered";
+    -- `crossing` 1 = "exclude", 2 = "include"; numbers for the reason `top_p_mass` gives.
+    function fished(inputs)
+        logits(inputs.tokens)
+        local truncation, crossing
+        if inputs.truncation == 1 then truncation = 'untempered' elseif inputs.truncation == 2 then truncation = 'tempered' end
+        if inputs.crossing == 1 then crossing = 'exclude' elseif inputs.crossing == 2 then crossing = 'include' end
+        return loom.sample_row('stage_b', -1, {temperature = inputs.temperature, top_k = inputs.top_k,
+                                                top_p = inputs.top_p, top_p_mass = top_p_mass(inputs),
+                                                truncation = truncation, top_p_crossing = crossing,
+                                                uniform = inputs.uniform})
+    end
+
     -- A pinned draw must leave the stream where it was: seed, one pinned draw, then one streamed
     -- draw -- which must be the FIRST streamed draw after that seed.
     function pinned_then_streamed(inputs)
@@ -266,6 +281,12 @@ const char* kScript = R"lua(
             elseif inputs.case == 13 then
                 logits({1, 3, 4})
                 loom.sample_row('stage_b', -1, {temperature = 1.0, top_p = 0.5, top_p_mass = 'vocab'})
+            elseif inputs.case == 14 then
+                logits({1, 3, 4})
+                loom.sample_row('stage_b', -1, {temperature = 1.0, truncation = 'raw'})
+            elseif inputs.case == 15 then
+                logits({1, 3, 4})
+                loom.sample_row('stage_b', -1, {temperature = 1.0, top_p = 0.5, top_p_crossing = 'drop'})
             else
                 -- `stage_a`'s output is the EMBEDDING, n_embd wide, not the 6-wide head -- so this is
                 -- guidance against a tensor that is not the same distribution.
@@ -471,7 +492,7 @@ int main() {
     }
 
     // --- 8. Every way of getting it wrong that the binding is supposed to catch. ---
-    for (double c = 1; c <= 13; ++c) {
+    for (double c = 1; c <= 15; ++c) {
         const auto got = std::get<double>(bridge.call("expect_error", {{"case", c}}));
         if (got != c) std::fprintf(stderr, "sample_row error case %g returned %g\n", c, got);
         LOOM_CHECK(got == c);
@@ -624,6 +645,72 @@ int main() {
         LOOM_CHECK(std::get<double>(bridge.call("knobbed", pinned)) == greedy);
         pinned["mass"] = 1.0;   // "row"
         LOOM_CHECK(std::get<double>(bridge.call("knobbed", pinned)) == static_cast<double>(order[1]));
+    }
+
+    // --- 14. Fish Audio's sampler (Audio8-TTS, ADR-095): top-k and top-p on the RAW row, the crossing
+    //         id dropped, the temperature on the survivors only. Every expectation computed HERE. ---
+    {
+        std::vector<double> raw(6);
+        double raw_sum = 0.0;
+        for (size_t i = 0; i < 6; ++i) { raw[i] = std::exp(cond[i] - row_max); raw_sum += raw[i]; }
+        for (double& p : raw) p /= raw_sum;
+        double tempered_sum = 0.0;
+        for (const double p : probs) tempered_sum += p;
+        const double share_raw = raw[order[0]];
+        const double share_tempered = probs[order[0]] / tempered_sum;
+        std::fprintf(stderr, "best id's share of the row: %g raw, %g at T=%g\n", share_raw, share_tempered, kT);
+        LOOM_CHECK(share_tempered < share_raw);   // a temperature above 1 flattens the row
+        // (a) `exclude`: with top_p between the best id's raw share and the top two's, the default
+        //     keeps two and `exclude` keeps one -- a pinned u near 1 tells them apart.
+        {
+            const double two = raw[order[0]] + raw[order[1]];
+            Args a = {{"tokens", tokens}, {"temperature", kT}, {"top_p", (share_raw + two) / 2.0},
+                      {"mass", 1.0}, {"truncation", 1.0}, {"uniform", 0.999}};
+            LOOM_CHECK(std::get<double>(bridge.call("fished", a)) == static_cast<double>(order[1]));
+            a["crossing"] = 2.0;   // "include", said explicitly
+            LOOM_CHECK(std::get<double>(bridge.call("fished", a)) == static_cast<double>(order[1]));
+            a["crossing"] = 1.0;   // "exclude"
+            LOOM_CHECK(std::get<double>(bridge.call("fished", a)) == greedy);
+        }
+        // (b) `untempered`: with top_p between the best id's tempered and raw shares, the raw row
+        //     already reaches it at the best id and the tempered one does not.
+        {
+            Args b = {{"tokens", tokens}, {"temperature", kT}, {"mass", 1.0},
+                      {"top_p", (share_tempered + share_raw) / 2.0}, {"uniform", 0.999}};
+            LOOM_CHECK(std::get<double>(bridge.call("fished", b)) != greedy);   // tempered, the default
+            b["truncation"] = 2.0;
+            LOOM_CHECK(std::get<double>(bridge.call("fished", b)) != greedy);
+            b["truncation"] = 1.0;
+            LOOM_CHECK(std::get<double>(bridge.call("fished", b)) == greedy);
+        }
+        // (c) The whole rule against a hand walk, across a scan of u: keep the prefix with i < top_k and
+        //     raw cumulative <= top_p (at least one), then draw from it at T = kT.
+        {
+            const int64_t top_k = 4;
+            const double top_p = 0.9;
+            size_t keep = 0;
+            double cumulative = 0.0;
+            for (size_t i = 0; i < 6 && static_cast<int64_t>(i) < top_k; ++i) {
+                cumulative += raw[order[i]];
+                if (cumulative > top_p) break;
+                keep = i + 1;
+            }
+            keep = std::max<size_t>(keep, 1);
+            std::fprintf(stderr, "fish rule at top_k=%lld top_p=%g keeps %zu\n",
+                         static_cast<long long>(top_k), top_p, keep);
+            std::set<double> reached;
+            for (double u = 0.03; u < 1.0; u += 0.06) {
+                const double want = walk(u, keep, {});
+                Args c = {{"tokens", tokens}, {"temperature", kT}, {"top_k", static_cast<double>(top_k)},
+                          {"top_p", top_p}, {"mass", 1.0}, {"truncation", 1.0}, {"crossing", 1.0},
+                          {"uniform", u}};
+                const auto got = std::get<double>(bridge.call("fished", c));
+                if (got != want) std::fprintf(stderr, "fish u %g drew %g, the walk says %g\n", u, got, want);
+                LOOM_CHECK(got == want);
+                reached.insert(got);
+            }
+            LOOM_CHECK(reached.size() >= 2);   // otherwise the scan proved nothing about the walk
+        }
     }
 
     LOOM_TEST_REPORT_AND_RETURN();

@@ -407,7 +407,8 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
                            ggml_tensor* uncond, float guidance_scale, int64_t guidance_top_k,
                            float repetition_penalty, const std::vector<int64_t>& penalized,
                            float min_p, bool top_p_over_row, const std::vector<int64_t>& banned,
-                           std::optional<float> fixed_uniform) {
+                           std::optional<float> fixed_uniform, bool truncate_untempered,
+                           bool top_p_excludes_crossing) {
     if (!(repetition_penalty > 0.0f)) {
         throw Error(std::string(fname) + ": repetition_penalty is " +
                      std::to_string(repetition_penalty) + "; it is a positive divisor and 1 means "
@@ -612,11 +613,19 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
     // Softmax over the survivors, shifted by the maximum -- which is `candidates[0]`, since they are
     // sorted. Without the shift a logit around 30 (ordinary for a 262144-wide head at temperature 0.1)
     // overflows expf.
-    const float max_logit = logits[static_cast<size_t>(candidates[0])] / temperature;
+    //
+    // **At `select_t`, which is the temperature unless `truncate_untempered`** (ADR-095). Fish Audio's
+    // DualAR samplers -- Audio8-TTS's `ArkttsLegacyTopKTopPLogitsProcessor` -- decide top-k and top-p on
+    // the RAW logits and divide only the survivors by the temperature, where `transformers` divides
+    // first. Top-k picks the same ids either way (the order is the order); top-p's mass does not, so
+    // the two keep different prefixes from the same three numbers. The draw itself is re-weighted at
+    // the real temperature below.
+    const float select_t = truncate_untempered ? 1.0f : temperature;
+    const float max_logit = logits[static_cast<size_t>(candidates[0])] / select_t;
     std::vector<float> probs(candidates.size());
     float sum = 0.0f;
     for (size_t i = 0; i < candidates.size(); ++i) {
-        probs[i] = std::exp(logits[static_cast<size_t>(candidates[i])] / temperature - max_logit);
+        probs[i] = std::exp(logits[static_cast<size_t>(candidates[i])] / select_t - max_logit);
         sum += probs[i];
     }
 
@@ -647,19 +656,32 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
     // cut mass off. `top_p_mass = "row"` is that one: the denominator is the full window's softmax
     // (banned ids excluded, since they are -inf). Measured against the other it is a different
     // sampler from the same two numbers (loom.cpp ADR-047).
+    //
+    // **And whether the id that CROSSES `top_p` is kept**, which is the second choice with two answers.
+    // `transformers` keeps it (the prefix's mass reaches `top_p`); the Fish/Audio8 sampler removes every
+    // id whose inclusive cumulative mass EXCEEDS `top_p` (`cumulative > top_p`), so its prefix stays at
+    // or under it. `top_p_crossing = "exclude"` is that one. Both keep at least the best id.
     if (top_p < 1.0f) {
         float denominator = sum;
         if (top_p_over_row) {
             denominator = 0.0f;
-            for (const float v : logits) denominator += std::exp(v / temperature - max_logit);
+            for (const float v : logits) denominator += std::exp(v / select_t - max_logit);
         }
         float cumulative = 0.0f;
         for (size_t i = 0; i < keep; ++i) {
             cumulative += probs[i] / denominator;
-            if (cumulative >= top_p) {
-                keep = i + 1;
+            if (top_p_excludes_crossing ? cumulative > top_p : cumulative >= top_p) {
+                keep = top_p_excludes_crossing ? std::max<size_t>(i, 1) : i + 1;
                 break;
             }
+        }
+    }
+
+    // The survivors re-weighted at the real temperature, when the truncation was measured without it.
+    if (truncate_untempered && temperature != 1.0f) {
+        const float max_tempered = logits[static_cast<size_t>(candidates[0])] / temperature;
+        for (size_t i = 0; i < keep; ++i) {
+            probs[i] = std::exp(logits[static_cast<size_t>(candidates[i])] / temperature - max_tempered);
         }
     }
 
@@ -1752,8 +1774,9 @@ int LoomLuaBridge::l_argmax_row_range(lua_State* L) {
 // than reproducing it.
 //
 // **A table rather than positional arguments** because the knobs are a set that grows, and it has now
-// grown four times: `lo`/`hi` and `guidance` for family 10, `repetition_penalty`/`penalized` for
-// Qwen3-TTS, and `top_p_mass`/`banned`/`uniform` for CosyVoice3 (ADR-047). Adding one must not renumber what a shipped GGUF's driver already passes, which is the
+// grown five times: `lo`/`hi` and `guidance` for family 10, `repetition_penalty`/`penalized` for
+// Qwen3-TTS, `top_p_mass`/`banned`/`uniform` for CosyVoice3 (ADR-047), and `truncation`/
+// `top_p_crossing` for Audio8-TTS's Fish-style sampler (ADR-095). Adding one must not renumber what a shipped GGUF's driver already passes, which is the
 // whole reason for the table. (min-p and the FREQUENCY/presence penalties are still not implemented;
 // nothing in the fixture set asks for them.)
 //
@@ -1813,6 +1836,8 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
         bool check_uncond_generation = false;
         uint64_t uncond_generation = 0;
         bool top_p_over_row = false;
+        bool truncate_untempered = false;
+        bool top_p_excludes_crossing = false;
         std::vector<int64_t> banned;
         std::optional<float> fixed_uniform;
         if (!lua_isnoneornil(L, 3)) {
@@ -1877,6 +1902,40 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
             }
             lua_pop(L, 1);
 
+            // `truncation`: whether top-k/min-p/top-p are measured on the TEMPERED row ("tempered",
+            // `transformers`' order and the default) or on the raw one with the temperature applied to
+            // the survivors only ("untempered", Fish Audio's DualAR -- Audio8-TTS). And
+            // `top_p_crossing`: whether the id whose mass crosses `top_p` is kept ("include", the
+            // default) or dropped ("exclude", the same samplers). Strings for `top_p_mass`'s reason:
+            // an unknown one is refused, never read as the default (ADR-095).
+            lua_getfield(L, 3, "truncation");
+            if (!lua_isnil(L, -1)) {
+                const std::string truncation = luaL_checkstring(L, -1);
+                if (truncation == "untempered") {
+                    truncate_untempered = true;
+                } else if (truncation != "tempered") {
+                    lua_pop(L, 1);
+                    return luaL_error(L, "loom.sample_row: truncation is '%s'; it is \"tempered\" (top-k "
+                                          "and top-p measured after the temperature, the default) or "
+                                          "\"untempered\" (measured on the raw row, the temperature "
+                                          "applied to the survivors)", truncation.c_str());
+                }
+            }
+            lua_pop(L, 1);
+            lua_getfield(L, 3, "top_p_crossing");
+            if (!lua_isnil(L, -1)) {
+                const std::string crossing = luaL_checkstring(L, -1);
+                if (crossing == "exclude") {
+                    top_p_excludes_crossing = true;
+                } else if (crossing != "include") {
+                    lua_pop(L, 1);
+                    return luaL_error(L, "loom.sample_row: top_p_crossing is '%s'; it is \"include\" (the "
+                                          "id whose mass crosses top_p is kept, the default) or "
+                                          "\"exclude\"", crossing.c_str());
+                }
+            }
+            lua_pop(L, 1);
+
             // `banned`: ids that may not be drawn at all -- set to -inf ahead of every other step.
             lua_getfield(L, 3, "banned");
             if (!lua_isnil(L, -1)) {
@@ -1937,7 +1996,8 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
         lua_pushnumber(L, static_cast<lua_Number>(sample_tensor_row(
             store.get(0), requested_row, "loom.sample_row", self->rng_, self->uniform_dist_,
             temperature, top_k, top_p, lo, hi, uncond, guidance_scale, guidance_top_k,
-            repetition_penalty, penalized, min_p, top_p_over_row, banned, fixed_uniform)));
+            repetition_penalty, penalized, min_p, top_p_over_row, banned, fixed_uniform,
+            truncate_untempered, top_p_excludes_crossing)));
         return 1;
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.sample_row: %s", e.what());
