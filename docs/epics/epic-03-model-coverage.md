@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-10-25
+last_updated: 2026-10-30
 ---
 
 # Epic-03: Model Coverage
@@ -39,7 +39,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 | domain | models | template |
 |---|---|---|
 | **Language** | Qwen3-0.6B-Base, LFM2-350M (monolithic *and* modular), SmolLM2-360M-Instruct, Gemma-3-270M-it | `causal_lm_export.py` |
-| **ASR — NeMo encoders** | Conformer-CTC-small, Parakeet-TDT-0.6B, Parakeet-RNNT-0.6B, GigaAM v3, Nemotron 3.5 ASR Streaming 0.6B (language-prompted, 40 locales) | `nemo_asr_export.py`, `transducer_export.py`, `nemotron_asr_export.py` |
+| **ASR — NeMo encoders** | Conformer-CTC-small, Parakeet-TDT-0.6B, Parakeet-RNNT-0.6B, GigaAM v3, Nemotron 3.5 ASR Streaming 0.6B (language-prompted, 40 locales), Nemotron-Labs-Unified-ASR 0.6B (offline mode of the unified offline/streaming FastConformer RNN-T, 25 European languages, language prompt folded into an embedding row; NeMo 3.0) | `nemo_asr_export.py`, `transducer_export.py`, `nemotron_asr_export.py`, `nemotron_unified_export.py` |
 | **ASR — CNN + transformer + CTC** | any HF `*ForCTC` (HuBERT, data2vec-audio, wav2vec 2.0) | `ctc_asr_export.py` |
 | **ASR — SANM / FunASR** | SenseVoice-Small | `sanm_asr_export.py` |
 | **ASR — SANM + CIF** | Paraformer-zh | `paraformer_export.py` |
