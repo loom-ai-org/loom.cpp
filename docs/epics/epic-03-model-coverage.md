@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-10-25
+last_updated: 2026-10-30
 ---
 
 # Epic-03: Model Coverage
@@ -58,7 +58,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **Audio codec + recurrence** | EnCodec-32kHz | `encodec_export.py` |
 | **Audio codec + chunked attention** | Qwen3-TTS-Tokenizer-12Hz | `qwen3_tts_export.py` (companion) |
 | **Audio codec + blocked attention, stereo** | MOSS-Audio-Tokenizer-v2 | `moss_audio_tokenizer_export.py` |
-| **Text → codec tokens** | Dia-1.6B, Qwen3-TTS-12Hz-0.6B-Base, MOSS-TTS-Local-Transformer-v1.5 | `dia_export.py`, `qwen3_tts_export.py`, `moss_tts_export.py` |
+| **Text → codec tokens** | Dia-1.6B, Qwen3-TTS-12Hz-0.6B-Base, MOSS-TTS-Local-Transformer-v1.5, Audio8-TTS-Realistic-0.6B | `dia_export.py`, `qwen3_tts_export.py`, `moss_tts_export.py`, `audio8_tts_export.py` |
 | **Text → music codec tokens** | MusicGen Small (decodes through EnCodec-32kHz) | `musicgen_export.py` |
 | **Text encoder-decoder** | flan-t5-small (and every `model_type: t5`) | `t5_export.py` |
 
@@ -851,6 +851,42 @@ The fingerprint is the codec's quantizer, not the TTS weights, because that is w
 meaning. The gate gained three clone arms (one reference greedy, two references greedy, one
 pinned-sampled). They read their codes through voice files written by the tool and check those files
 against the reference's encode of the same clips first.
+
+#### The fourth leaf was Audio8-TTS-Realistic-0.6B, and its sampler was not `transformers'` (2026-10-30)
+
+Audio8-TTS-Realistic-0.6B (`Edge0`, Apache-2.0 with a NOTICE, 0.6B, 23 languages, voice cloning) is a
+Fish-S2-style DualAR: a 24-layer slow stack (896 wide, GQA 14/2, qkv bias) emits one SEMANTIC token per
+frame, and a 4-layer fast stack draws the frame's other nine codebooks. Codebook 0 is the semantic id
+minus `semantic_begin_id`. The checkpoint ships its codec as one file, `codec.pth`, byte-identical to
+Audio8-TTS-Preview's, so the pair is `audio8_tts_export` (family 10) and `audio_codec_export`'s
+`AUDIO8` member (family 11), the codec being the talker's `companions()`. Three phases: `embed` (one row
+= a token id + ten codes, an absent code's zero row standing in for the reference's
+`where(semantic, ...)`), `slow` (cached, head trimmed to the 4096 semantic rows + EOS) and `fast`
+(uncached, one shared 4096-row table and head, so no offsets).
+
+**The RoPE rotates interleaved PAIRS from a BF16 table**, in the talker and in the codec's windowed
+transformer. The table is read off the module as gathered `cos`/`sin` constants (the bf16 rounding is
+~2^-9 of every rotation, which a greedy decode does not survive), and the pairs become rotate-half by
+permuting each q/k head's rows evens-then-odds at export time. No class patch, and exact.
+
+**The sampler is the reference's "legacy" one**: top-k and top-p measured on the untempered row, top-p
+over the whole row with the crossing id dropped, the temperature applied to the survivors, and a
+repetition-aware redraw. The first two became `sample_row`'s `truncation` and `top_p_crossing`
+([ADR-095](../adrs/adr-095-a-samplers-truncation-may-be-measured-before-its-temperature.md)); the
+redraw is driver Lua. Cloning takes a voice file holding the clip's codes AND its transcript's ids,
+tokenized there with the processor's `<|speaker:0|>` prefix (`audio8_tts_voices`, ADR-045).
+
+**Two exporter defects on the way.** `_op_split` ignored `split_sizes` and emitted three equal 384-row
+views of the 896/128/128 qkv split; fixed, with a test. And the codec's per-column gather index reached
+ggml as `[1, T]`, so every convolution after it ran over a length-1 axis with the frames as a batch:
+the right numbers in the wrong layout, until the first transposed convolution refused a rank-3 input.
+Flattened first, MOSS's rule.
+
+**Verified** (dev box): greedy codes against `generate(do_sample=False)` **810/810** (81 frames, same
+stop) and, cloned, **4000/4000** (400 frames); codec against `decode_audio` **4.6e-6** max abs; sampled
+takes read back by Parakeet-TDT, F32 and Q8_0. Q8_0's greedy codes differ from frame 0 (a 4096-way
+argmax flips). F32 2.4 GB, Q8_0 1.2 GB (the 156k-row token table stays F32 until `quantize_gathered`
+lands on main), codec 523 MB.
 
 ### Family 9's third leaf, and the primitive that had to be added
 
