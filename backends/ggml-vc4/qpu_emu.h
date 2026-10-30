@@ -20,6 +20,7 @@
 
 #include "qpu_isa.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -225,6 +226,7 @@ private:
             switch (op) {
                 case A_FADD: r[l] = u(f(a[l]) + f(b[l])); break;
                 case A_FSUB: r[l] = u(f(a[l]) - f(b[l])); break;
+                case A_FMAX: r[l] = u(std::max(f(a[l]), f(b[l]))); break;
                 case A_ADD:  r[l] = a[l] + b[l]; break;
                 case A_SUB:  r[l] = a[l] - b[l]; break;
                 case A_MIN:  r[l] = uint32_t(std::min(int32_t(a[l]), int32_t(b[l]))); break;

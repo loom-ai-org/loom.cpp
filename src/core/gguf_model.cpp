@@ -257,15 +257,19 @@ std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, Backends bac
     // ggml_backend_alloc_ctx_tensors will allocate: each tensor's size as the buffer type pads it.
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    // P4.47: the weights' own buffer type, which for ggml-vc4 is RAM (weights_buffer_type) -- the room
+    // check below then never applies, since a host buffer type is not checked.
+    ggml_backend_buffer_type_t wbuft = dev != nullptr ? weights_buffer_type(dev) : buft;
+    model->weights_buft_ = wbuft;
     if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
-        !ggml_backend_buft_is_host(buft)) {
+        !ggml_backend_buft_is_host(wbuft)) {
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(dev, &free, &total);
-        const size_t align = ggml_backend_buft_get_alignment(buft);
+        const size_t align = ggml_backend_buft_get_alignment(wbuft);
         size_t needed = 0;
         for (ggml_tensor* t = ggml_get_first_tensor(model->meta_ctx_.get()); t != nullptr;
              t = ggml_get_next_tensor(model->meta_ctx_.get(), t)) {
-            needed += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+            needed += GGML_PAD(ggml_backend_buft_get_alloc_size(wbuft, t), align);
         }
         if (total != 0 && needed > free) {
             char numbers[160];
@@ -318,7 +322,7 @@ std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, Backends bac
     }
     ggml_backend_buffer_t buf = nullptr;
     if (to_repack.empty()) {
-        buf = ggml_backend_alloc_ctx_tensors(model->meta_ctx_.get(), backend);
+        buf = ggml_backend_alloc_ctx_tensors_from_buft(model->meta_ctx_.get(), wbuft);
     } else {
         std::vector<ggml_tensor*> plain;
         for (ggml_tensor* t = ggml_get_first_tensor(model->meta_ctx_.get()); t != nullptr;
@@ -337,7 +341,7 @@ std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, Backends bac
         }
         std::fprintf(stderr, "loom: %zu weights (%.1f MB) in %s\n", to_repack.size(), bytes / 1e6,
                      ggml_backend_buft_name(repack_buft));
-        buf = alloc_tensors(buft, plain);
+        buf = alloc_tensors(wbuft, plain);
     }
     if (!buf) {
         throw LoadError("GgufModel::load: failed to allocate a backend buffer for weights in '" + path + "'");
@@ -699,7 +703,9 @@ void GgufModel::route_repacked_uses(ggml_cgraph* gf) {
             // so for it supports_op is the whole test: with these rules applied to it, every one of
             // Citrinet's pointwise kernels was routed to a plain copy and the int8 path never ran.
             // CPU_NEON_I8 (P4.37) checks its own layouts the same way.
-            if (j == 0 && t->op == GGML_OP_MUL_MAT && primary_takes(t, s)) {
+            // P4.46: and a CONV_2D the same way -- ggml-vc4 runs a 1x1 one over a VC4_Q8 weight as an int8
+            // GEMM (Citrinet's pointwise kernels, which CPU_ARMV6_I8 held: 4.8 s of a 7.1 s clip on the CPU).
+            if (j == 0 && (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_CONV_2D) && primary_takes(t, s)) {
                 if (ggml_tensor* copy = primary_copy(s)) {
                     t->src[0] = copy;
                     continue;
@@ -730,7 +736,8 @@ ggml_tensor* GgufModel::plain_copy(ggml_tensor* w) {
     ggml_context_ptr ctx(ggml_init(ggml_init_params{ggml_tensor_overhead() + 256, nullptr, /*no_alloc=*/true}));
     ggml_tensor* copy = ggml_dup_tensor(ctx.get(), w);
     ggml_set_name(copy, ggml_get_name(w));
-    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend_));
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(
+        ctx.get(), weights_buft_ != nullptr ? weights_buft_ : ggml_backend_get_default_buffer_type(backend_)));
     if (!buf) {
         throw LoadError("GgufModel: failed to allocate a plain copy of repacked weight '" +
                         std::string(ggml_get_name(w)) + "'");
@@ -773,7 +780,7 @@ ggml_tensor* GgufModel::primary_copy(ggml_tensor* w) {
     ggml_context_ptr ctx(ggml_init(ggml_init_params{ggml_tensor_overhead() + 256, nullptr, /*no_alloc=*/true}));
     ggml_tensor* copy = ggml_dup_tensor(ctx.get(), w);
     ggml_set_name(copy, ggml_get_name(w));
-    // The pool such a buffer comes from is small (ggml-vc4: the GPU's 64 MB CMA); a copy it cannot hold
+    // Such a buffer may come from a small pool (ggml-vc4's did, the GPU's 64 MB, until P4.47); a copy it cannot hold
     // leaves the CPU's repacked weight in place for these uses, which is what ran before.
     ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), primary_extra_buft_));
     if (!buf) {
