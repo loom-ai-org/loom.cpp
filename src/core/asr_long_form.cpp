@@ -1,6 +1,7 @@
 #include "loom/core/asr_long_form.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace loom {
 namespace audio {
@@ -210,6 +211,55 @@ std::vector<int32_t> merge_windows(const std::vector<std::vector<int32_t>>& wind
         merged.insert(merged.end(), data.begin() + static_cast<long>(head), data.end());
     }
     return merged;
+}
+
+std::vector<Window> plan_quiet_splits(const std::vector<float>& waveform, const QuietSplitPolicy& policy) {
+    const size_t n = waveform.size();
+    std::vector<size_t> bounds = {0};
+    if (policy.declared()) {
+        const size_t limit = policy.max_samples;
+        const size_t search = policy.search_samples;
+        const size_t frame = policy.frame_samples;
+        size_t start = 0;
+        // `while n - start > L`: a remainder of exactly the limit is one more piece, not two.
+        while (n - start > limit) {
+            const size_t lo = start + limit - search;
+            const size_t frames = search / frame;
+            size_t best = 0;
+            double best_energy = 0.0;
+            for (size_t k = 0; k < frames; ++k) {
+                double energy = 0.0;
+                for (size_t i = 0; i < frame; ++i) {
+                    const double x = waveform[lo + k * frame + i];
+                    energy += x * x;
+                }
+                energy /= static_cast<double>(frame);
+                // Strict `<`: the first of equally quiet frames wins, as `np.argmin` returns it.
+                if (k == 0 || energy < best_energy) {
+                    best_energy = energy;
+                    best = k;
+                }
+            }
+            const size_t cut = lo + best * frame + frame / 2;
+            bounds.push_back(cut);
+            start = cut;
+        }
+    }
+    bounds.push_back(n);
+    std::vector<Window> pieces;
+    for (size_t i = 0; i + 1 < bounds.size(); ++i) {
+        const size_t real = bounds[i + 1] - bounds[i];
+        if (real < policy.min_samples || real == 0) continue;
+        pieces.push_back({bounds[i], real, real});
+    }
+    return pieces;
+}
+
+uint32_t piece_token_budget(size_t samples, double rate, const QuietSplitPolicy& policy) {
+    if (policy.token_cap == 0) return 0;
+    const double seconds = static_cast<double>(samples) / rate;
+    const double budget = std::ceil(static_cast<double>(policy.tokens_per_second) * seconds) + policy.token_base;
+    return static_cast<uint32_t>(std::min<double>(policy.token_cap, budget));
 }
 
 } // namespace audio
