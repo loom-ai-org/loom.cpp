@@ -334,6 +334,40 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
             return decoded;
         };
 
+        // QUIET-POINT PIECES, for a family-3 file that declares them (asr_long_form.h's second scheme):
+        // each piece is decoded alone, with its own token budget, and the pieces' TEXTS are joined with
+        // single spaces -- the reference's `" ".join(t for t in texts if t)` after stripping each. Ids are
+        // not merged, because nothing overlaps. Each piece is copied out before padding, so what follows
+        // it in the caller's audio is not what fills its last chunk: the reference extracts features from
+        // the piece alone, and so does this.
+        if (chunk != 0 && table.quiet_split.declared()) {
+            const std::vector<Window> pieces = plan_quiet_splits(waveform, table.quiet_split);
+            const auto trimmed = [](const std::string& text) {
+                const char* space = " \t\n\r\f\v";
+                const size_t first = text.find_first_not_of(space);
+                if (first == std::string::npos) return std::string();
+                return text.substr(first, text.find_last_not_of(space) - first + 1);
+            };
+            std::string joined;
+            for (const Window& piece : pieces) {
+                const std::vector<float> audio(waveform.begin() + static_cast<long>(piece.start),
+                                               waveform.begin() + static_cast<long>(piece.start + piece.real));
+                std::unordered_map<std::string, LoomLuaBridge::Value> piece_args = {
+                    {"waveform", window_at(audio, 0, static_cast<uint32_t>(padded_to_chunk(piece.real, chunk)))},
+                    {"audio_samples", static_cast<double>(piece.real)}};
+                const uint32_t budget = piece_token_budget(piece.real, rate, table.quiet_split);
+                if (budget > 0) piece_args["max_new_tokens"] = static_cast<double>(budget);
+                const std::string text = trimmed(detokenize(decode(piece_args)));
+                if (text.empty()) continue;
+                if (!joined.empty()) joined += ' ';
+                joined += text;
+            }
+            out.text = joined;
+            out.segments.push_back({0.0, static_cast<double>(waveform.size()) / rate, out.text, false});
+            out.windows = pieces.size();
+            return out;
+        }
+
         // LONG-FORM, for a file that declares a training ceiling and audio past it (asr_long_form.h):
         // overlapping windows, each decoded alone with the same arguments, stitched where they overlap.
         // Each window is handed over at its planned length with the real sample count in `length` --
@@ -341,7 +375,8 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
         // (end-of-sequence, padding) come off BEFORE the merge, because they are what the merge would
         // otherwise align on: every window ends in the same end-of-sequence token.
         //
-        // Family 3 (`chunk != 0`) declares no ceiling, so it never reaches this.
+        // Family 3 (`chunk != 0`) declares no overlap ceiling, so it never reaches this: its long-form
+        // decode, when it has one, is the quiet-point scheme above.
         const std::vector<Window> windows =
             chunk == 0 ? plan_windows(n_real, table.long_form) : std::vector<Window>{{0, n_real, n_real}};
         std::vector<int32_t> ids;

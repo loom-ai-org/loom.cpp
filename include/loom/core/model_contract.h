@@ -211,6 +211,10 @@ struct AsrDecodeTable {
     // (all zero) means one pass whatever the length, which is every such file exported before Canary's
     // long-form decode. See asr_long_form.h.
     LongFormPolicy long_form;
+    // The other long-form scheme: cuts at quiet points, no overlap, texts joined, with a per-piece token
+    // budget -- `loom.asr.split_*` / `loom.asr.tokens_*`. A speech-LM recognizer (family 3) declares it
+    // when its reference chunks that way. See asr_long_form.h.
+    QuietSplitPolicy quiet_split;
 
     // True when this file declared no language/task table and a caller must fall back to resolving a
     // name against the vocabulary by Whisper's `<|xx|>` spelling. Set only when a vocabulary was

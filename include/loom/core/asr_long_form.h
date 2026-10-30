@@ -77,5 +77,43 @@ std::vector<int32_t> lcs_merge(const std::vector<int32_t>& buffer, const std::ve
 std::vector<int32_t> merge_windows(const std::vector<std::vector<int32_t>>& windows,
                                    const LongFormPolicy& policy);
 
+// THE SECOND SCHEME: cut at quiet points, decode each piece alone, join the TEXTS. This is what a
+// speech-LM recognizer whose reference chunks this way gets (family 3; oruk-loop-153M's
+// `split_points` + `transcribe`, ported decision for decision): no overlap and so no merge, because
+// each cut sits in the quietest frame near the limit, where no word is being spoken.
+//
+//   * a piece is at most `max_samples` long; while more than that remains, the next cut is the centre
+//     of the lowest-energy `frame_samples` frame among the last `search_samples` before the limit
+//     (the FIRST such frame on a tie, which is numpy's `argmin`);
+//   * a piece shorter than `min_samples` is dropped, not decoded (the reference's "<0.1 s tail");
+//   * each piece may generate `min(token_cap, ceil(tokens_per_second * seconds) + token_base)` tokens.
+//
+// Like `LongFormPolicy`, the numbers are the file's (`loom.asr.split_*`, `loom.asr.tokens_*`), never
+// this header's. A file declares one scheme or the other: they are different references' decodes.
+struct QuietSplitPolicy {
+    uint32_t max_samples = 0;
+    uint32_t search_samples = 0;
+    uint32_t frame_samples = 0;
+    uint32_t min_samples = 0;
+    // The per-piece generation budget. `token_cap == 0` leaves the driver's own default in place.
+    float tokens_per_second = 0.0f;
+    uint32_t token_base = 0;
+    uint32_t token_cap = 0;
+
+    bool declared() const {
+        return max_samples > 0 && frame_samples > 0 && search_samples >= frame_samples &&
+               search_samples <= max_samples;
+    }
+};
+
+// The pieces `waveform` is cut into, in order: `start` and `real` set, `padded == real` (a caller that
+// needs a chunk multiple pads each piece itself). One piece covering everything when the audio fits in
+// `max_samples` or the policy is not declared; pieces shorter than `min_samples` are left out, so the
+// result can be empty for a clip shorter than that.
+std::vector<Window> plan_quiet_splits(const std::vector<float>& waveform, const QuietSplitPolicy& policy);
+
+// How many tokens a piece of `samples` at `rate` may generate, or 0 when the policy sets no budget.
+uint32_t piece_token_budget(size_t samples, double rate, const QuietSplitPolicy& policy);
+
 } // namespace audio
 } // namespace loom
