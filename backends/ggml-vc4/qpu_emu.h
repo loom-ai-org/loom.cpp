@@ -7,12 +7,20 @@
 //   - reading a regfile A/B location in the instruction right after it was written,
 //   - a uniform read less than 3 instructions after a write to uniforms_address,
 //   - ldtmu with an empty queue, more than TMU_DEPTH outstanding requests, or thread end with any,
-//   - mul24 operands wider than 24 bits, any pack/unpack/pm, conditions other than always/never.
+//   - a VPM / VPM DMA setup, VPM write or DMA store outside the mutex (the VPM and its DMA engine
+//     are shared by every QPU, and the emulator runs them one at a time, so it cannot see a race;
+//     it refuses what could be one instead), and a mutex acquired twice or released unheld,
+//   - mul24 operands wider than 24 bits, any pack, any regfile-A unpack, conditions other than
+//     always/never. The one unpack it models is r4's 8-bit one (pm = 1, unpack 4..7 = byte a..d),
+//     as measured on the Pi Zero 2026-10-28 (probe_unpack): every op reading r4 gets the byte u as
+//     a float u/255 TRUNCATED to 24 bits (exact for 0 and 255, one ulp under the nearest float for
+//     the other 254), the integer ops too.
 // Anything it does not implement is an error, never a silent no-op.
 #pragma once
 
 #include "qpu_isa.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -51,7 +59,7 @@ public:
     void run(const std::vector<uint64_t>& code, uint32_t uniforms_bus, uint32_t qpu, EmuStats& st,
              uint64_t max_instructions = 2000000000ull) {
         ra_.fill({}); rb_.fill({}); for (auto& r : acc_) r.fill(0);
-        tmu_.clear(); unif_ = uniforms_bus; qpu_ = qpu;
+        tmu_.clear(); unif_ = uniforms_bus; qpu_ = qpu; mutex_ = false;
         zf_.fill(false); nf_.fill(false);
         written_a_prev_ = written_b_prev_ = -1;
         last_unif_write_ = -100;
@@ -67,6 +75,7 @@ public:
             pc++;
         }
         if (!tmu_.empty()) throw std::runtime_error("emu: thread end with outstanding TMU requests");
+        if (mutex_) throw std::runtime_error("emu: thread end holding the mutex");
     }
 
     // VPM: 64 rows x 16 words is plenty for the kernels (the hardware has more).
@@ -78,6 +87,10 @@ private:
     std::array<Vec, 6> acc_{};
     std::array<bool, 16> zf_{}, nf_{};
     std::deque<Vec> tmu_;
+    bool mutex_ = false;
+    void need_mutex(int64_t pc, const char* what) const {
+        if (!mutex_) throw err(pc, std::string(what) + " outside the VPM mutex");
+    }
     uint32_t unif_ = 0, qpu_ = 0;
     int written_a_prev_, written_b_prev_;  // regfile index written by the previous instruction
     int64_t last_unif_write_;
@@ -109,11 +122,22 @@ private:
             case 38: if (is_a) { for (int l = 0; l < 16; l++) v[l] = l; } else v.fill(qpu_); return v;
             case R_NOP: return v;
             case 50: return v;  // vpm_ld_wait / vpm_st_wait: DMA is synchronous here
-            case R_MUTEX: return v;
+            case R_MUTEX:
+                if (mutex_) throw err(pc, "mutex acquired twice");
+                mutex_ = true; return v;
             default: throw err(pc, "unsupported read address " + std::to_string(addr));
         }
     }
 
+public:
+    // r4's 8-bit colour unpack: u / 255 truncated toward zero to a float.
+    static uint32_t colour8(uint32_t byte) {
+        const double v = byte / 255.0;
+        float x = float(v);
+        if (double(x) > v) x = std::nextafter(x, 0.f);
+        return u(x);
+    }
+private:
     static Vec small_imm(uint32_t s, int64_t pc, const QpuEmu* self) {
         Vec v{};
         if (s < 16) v.fill(s);
@@ -133,14 +157,16 @@ private:
             case W_UNIFORMS_ADDR:
                 if (!to_a) throw err(pc, "uniforms_address is regfile-A only");
                 unif_ = v[0]; last_unif_write_ = n; return;
-            case W_VPM: vpm_write(v, pc); return;
+            case W_VPM: need_mutex(pc, "VPM write"); vpm_write(v, pc); return;
             case W_VPMVCD_SETUP:
                 if (to_a) throw err(pc, "vpmvcd_rd_setup (VPM reads/VDR) not emulated");
-                setup(v[0], pc); return;
+                need_mutex(pc, "VPM / VDW setup"); setup(v[0], pc); return;
             case W_VPM_ADDR:
                 if (to_a) throw err(pc, "vpm_ld_addr (DMA load) not emulated");
-                dma_store(v[0], pc, st); return;
-            case W_MUTEX: return;
+                need_mutex(pc, "VDW store"); dma_store(v[0], pc, st); return;
+            case W_MUTEX:
+                if (!mutex_) throw err(pc, "mutex released without being held");
+                mutex_ = false; return;
             case W_TMU0_S: {
                 if ((int)tmu_.size() >= TMU_DEPTH) throw err(pc, "TMU queue overflow");
                 Vec d{}; for (int l = 0; l < 16; l++) d[l] = mem_.at(v[l]);
@@ -200,6 +226,7 @@ private:
             switch (op) {
                 case A_FADD: r[l] = u(f(a[l]) + f(b[l])); break;
                 case A_FSUB: r[l] = u(f(a[l]) - f(b[l])); break;
+                case A_FMAX: r[l] = u(std::max(f(a[l]), f(b[l]))); break;
                 case A_ADD:  r[l] = a[l] + b[l]; break;
                 case A_SUB:  r[l] = a[l] - b[l]; break;
                 case A_MIN:  r[l] = uint32_t(std::min(int32_t(a[l]), int32_t(b[l]))); break;
@@ -265,7 +292,10 @@ private:
             written_a_prev_ = wa; written_b_prev_ = wb;
             return;
         }
-        if ((w >> 52) & 0xff) throw err(pc, "pack/pm/unpack not emulated");
+        const uint32_t pack = (w >> 52) & 15, pm = (w >> 56) & 1, unpack = (w >> 57) & 7;
+        if (pack) throw err(pc, "pack not emulated");
+        if (unpack && !pm) throw err(pc, "regfile-A unpack not emulated");
+        if (pm && unpack && unpack < 4) throw err(pc, "r4 unpack modes 1..3 not emulated");
         if (sig != SIG_NONE && sig != SIG_END && sig != SIG_LDTMU0 && sig != SIG_SMALL_IMM)
             throw err(pc, "signal " + std::to_string(sig) + " not emulated");
         check_cond(cond_add); check_cond(cond_mul);
@@ -285,8 +315,13 @@ private:
         else if (sig != SIG_SMALL_IMM && (raddr_b == R_UNIFORM || raddr_b == R_MUTEX || raddr_b == 50))
             vb = read_regfile(false, raddr_b, pc, n, unif_read);
         if (uses(MUX_R5)) throw err(pc, "r5 not emulated");
+        Vec r4u{};
+        if (pm && unpack) {
+            for (int l = 0; l < 16; l++) r4u[l] = colour8(acc_[4][l] >> (8 * (unpack - 4)) & 0xff);
+        }
         auto mux = [&](uint32_t m) -> const Vec& {
-            switch (m) { case MUX_A: return va; case MUX_B: return vb; default: return acc_[m]; }
+            switch (m) { case MUX_A: return va; case MUX_B: return vb; case MUX_R4: return pm && unpack ? r4u : acc_[4];
+                         default: return acc_[m]; }
         };
         Vec ra = op_add != A_NOP ? add_op(op_add, mux(add_a), mux(add_b), pc) : Vec{};
         Vec rm = op_mul != M_NOP ? mul_op(op_mul, mux(mul_a), mux(mul_b), pc) : Vec{};
