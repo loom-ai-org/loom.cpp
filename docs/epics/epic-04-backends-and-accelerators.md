@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: backends
-last_updated: 2026-10-09
+last_updated: 2026-10-28
 ---
 
 # Epic-04: Backends and Accelerators
@@ -67,13 +67,14 @@ cost 183 splits against the monolithic export's 181 — measured, against the pr
 | CUDA | verified on an RTX 5090; both device-parity gates pass against `CUDA0` and **ran** rather than skipped |
 | Metal | verified on an M1 Pro ([§5](#5-metal-p411--shipped-2026-08-31-run-on-an-apple-m1-pro), [§6](#6-gpu-correctness-f32-matmul-precision-the-metal-norm-the-cuda-mat-vec-stride-2026-10-08)) |
 | NPU | open; no NPU registers as a `ggml` device type the engine can resolve |
+| Vulkan on V3D (Raspberry Pi 4) | correct and opt-in (`GGML_VK_VISIBLE_DEVICES`); 79-122x slower than the A72s ([§7](#7-p443-v3dv-on-the-raspberry-pi-4-2026-10-28)) |
 
 ## 3. Related Decisions and Artifacts
 
 | | |
 |---|---|
-| Decisions | [ADR-007](../adrs/adr-007-backend-capability-negotiation.md), [ADR-008](../adrs/adr-008-atan-approximation.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md) |
-| Retros | [Retro-007](../retros/retro-007-gpu-chose-the-integrated-gpu.md), [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-009](../retros/retro-009-host-callback-count-was-the-wrong-lens.md), [Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md), [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md), [Retro-075](../retros/retro-075-upstream-had-already-fixed-the-norm.md), [Retro-076](../retros/retro-076-a-full-device-said-device-lost.md), [Retro-077](../retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md) |
+| Decisions | [ADR-007](../adrs/adr-007-backend-capability-negotiation.md), [ADR-008](../adrs/adr-008-atan-approximation.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md), [ADR-089](../adrs/adr-089-v3dv-is-correct-and-opt-in.md) |
+| Retros | [Retro-007](../retros/retro-007-gpu-chose-the-integrated-gpu.md), [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-009](../retros/retro-009-host-callback-count-was-the-wrong-lens.md), [Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md), [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md), [Retro-075](../retros/retro-075-upstream-had-already-fixed-the-norm.md), [Retro-076](../retros/retro-076-a-full-device-said-device-lost.md), [Retro-077](../retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md), [Retro-094](../retros/retro-094-a-speedup-measured-against-a-run-with-different-output.md) |
 | Active tasks | [Backlog → Backends](../backlog/active-index.md#backends--accelerators) |
 
 ## 4. The Record
@@ -1303,3 +1304,26 @@ per-node dump (NaN count, sum, abs-sum) written from the profiler's eval callbac
 and joined on (op, name, shape, occurrence), named the first divergent node in all four cases in one
 run each. That hook was scratch and was not committed; see
 [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md#the-fix).
+
+## 7. P4.43: V3DV on the Raspberry Pi 4 (2026-10-28)
+
+The user asked for the Pi 4's GPU now that Mesa's V3DV exposes it as a Vulkan 1.3 device, and to
+measure before deciding what to patch. Decision and alternatives: [ADR-089](../adrs/adr-089-v3dv-is-correct-and-opt-in.md).
+
+**What it took to run at all** (`ggml-0054`, `ggml-0055`, `cmake/patches/UPSTREAM.md` PRs 50/51): device
+init threw on 16 KB of shared memory over one IQ type's tile; 32 shaders asked for 512 invocations where
+V3D allows 256 (invalid usage, compiled into wrong results: 123 of 506 cases failed, VITS produced the
+wrong number of samples); Mesa never finished compiling the F32 matrix-vector shader without
+`V3D_DEBUG=noloopunroll`; SET_ROWS counted 512-wide workgroups, which wrote half of each KV-cache row.
+
+**Measured** (Pi 4, V3DV opted in, against the CPU at 4 threads): VITS F32 64.9 s against 0.836 s with
+the same audio (1.0e-5); Qwen3-0.6B Q8_0_PC 509 s against 4.18 s for 24 tokens, the same tokens; Qwen3
+F32 does not fit (2.38 GB of weights, 1.99 GB device). V3D peaks at 32 GFLOPS, a third of four A72s.
+
+**Verified:** on V3D the 30 ops VITS uses and Qwen3's op set pass test-backend-ops, and both models'
+outputs match the CPU. The every-op sweep found SSM_CONV wrong in all 45 cases -- its workgroup has two
+spec-sized dimensions and the fitter skipped it -- now fixed; open there, on neither model's path:
+`ARGSORT` from 1 023 columns, `GATED_DELTA_NET`'s fused L2_NORM (precision), and 36 `MUL_MAT_ID` cases at
+n = 129 over tolerance (ADR-089 lists them). On an AMD Vega 3 (RADV, 1024 invocations) every
+op passes, 17 490 cases, and the device-parity gates run on it, so nothing changes where 512 fits. A
+conv2d tile for V3D was measured out ([Retro-094](../retros/retro-094-a-speedup-measured-against-a-run-with-different-output.md)).
