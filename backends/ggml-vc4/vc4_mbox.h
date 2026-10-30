@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -71,8 +72,14 @@ public:
     // around every QPU access. The ARM1176's L1 is the only cache between the two (QPU accesses use
     // the 0x8 alias, coherent with the VideoCore L2).
     explicit GpuBuffer(uint32_t size, bool cached = false) : size_(size), cached_(cached) {
+        // A failed constructor runs no destructor: close what was opened before saying why.
+        auto fail = [&](const char* what) {
+            const int e = errno;
+            release();
+            throw std::runtime_error(std::string(what) + ": " + strerror(e));
+        };
         vcsm_ = ::open("/dev/vcsm-cma", O_RDWR);
-        if (vcsm_ < 0) throw std::runtime_error(std::string("open /dev/vcsm-cma: ") + strerror(errno));
+        if (vcsm_ < 0) fail("open /dev/vcsm-cma");
         if (!cached) {
             struct {
                 uint32_t size, num, cached, pad;
@@ -84,16 +91,18 @@ public:
             memset(&a, 0, sizeof a);
             a.size = size; a.num = 1;
             strcpy(reinterpret_cast<char*>(a.name), "ggml-vc4");
-            if (ioctl(vcsm_, _IOR('J', 0x5A, decltype(a)), &a) < 0)
-                throw std::runtime_error(std::string("vcsm-cma alloc: ") + strerror(errno));
+            if (ioctl(vcsm_, _IOR('J', 0x5A, decltype(a)), &a) < 0) fail("vcsm-cma alloc");
             dmabuf_ = a.handle;
             bus_ = uint32_t(a.dma_addr);
         } else {
             heap_ = ::open("/dev/dma_heap/linux,cma", O_RDWR | O_CLOEXEC);
-            if (heap_ < 0) throw std::runtime_error(std::string("open /dev/dma_heap/linux,cma: ") + strerror(errno));
+            if (heap_ < 0) fail("open /dev/dma_heap/linux,cma");
             struct { uint64_t len; uint32_t fd, fd_flags; uint64_t heap_flags; } h = {size, 0, O_RDWR | O_CLOEXEC, 0};
-            if (ioctl(heap_, _IOWR('H', 0x0, decltype(h)), &h) < 0)
-                throw std::runtime_error(std::string("dma_heap alloc: ") + strerror(errno));
+            // Twice: a large first request can fail while the kernel is still migrating the movable
+            // pages it lent out of the pool -- 40 MB with 55 MB free failed with EBUSY on the Pi Zero,
+            // and a 56 MB request right after it succeeded (P4.46).
+            if (ioctl(heap_, _IOWR('H', 0x0, decltype(h)), &h) < 0 && ioctl(heap_, _IOWR('H', 0x0, decltype(h)), &h) < 0)
+                fail("dma_heap alloc");
             dmabuf_ = int(h.fd);
             struct {
                 int32_t dmabuf_fd;
@@ -107,21 +116,36 @@ public:
             memset(&im, 0, sizeof im);
             im.dmabuf_fd = dmabuf_; im.cached = 1;
             strcpy(reinterpret_cast<char*>(im.name), "ggml-vc4");
-            if (ioctl(vcsm_, _IOR('J', 0x5B, decltype(im)), &im) < 0)
-                throw std::runtime_error(std::string("vcsm-cma import: ") + strerror(errno));
+            if (ioctl(vcsm_, _IOR('J', 0x5B, decltype(im)), &im) < 0) fail("vcsm-cma import");
             import_ = im.handle;
             bus_ = uint32_t(im.dma_addr);
         }
         void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, dmabuf_, 0);
-        if (p == MAP_FAILED) throw std::runtime_error(std::string("mmap: ") + strerror(errno));
+        if (p == MAP_FAILED) fail("mmap");
         cpu_ = static_cast<uint8_t*>(p);
+        live_bytes() += size_;
     }
     ~GpuBuffer() {
-        if (cpu_) munmap(cpu_, size_);
-        if (import_ >= 0) ::close(import_);
-        if (dmabuf_ >= 0) ::close(dmabuf_);
-        if (heap_ >= 0) ::close(heap_);
-        if (vcsm_ >= 0) ::close(vcsm_);
+        if (cpu_) {
+            live_bytes() -= size_;
+            frees()++;
+        }
+        release();
+    }
+
+    // Bytes of the pool this process holds. The kernel's CmaFree cannot say how much of the pool is
+    // allocatable: it lends free pool pages to the page cache (CmaFree 44 MB of 64 with the pool idle,
+    // 56 after drop_caches) and a freed buffer does not show up in it again while the process lives,
+    // though the next allocation reuses it (P4.46, Pi Zero).
+    static std::atomic<size_t>& live_bytes() {
+        static std::atomic<size_t> n{0};
+        return n;
+    }
+    // Blocks this process has given back to the pool: while it stands still, a request the pool
+    // refused would be refused again (ensure_arena).
+    static std::atomic<uint64_t>& frees() {
+        static std::atomic<uint64_t> n{0};
+        return n;
     }
     GpuBuffer(const GpuBuffer&) = delete;
     GpuBuffer& operator=(const GpuBuffer&) = delete;
@@ -144,6 +168,16 @@ public:
 
 private:
     int vcsm_ = -1, heap_ = -1, dmabuf_ = -1, import_ = -1;
+
+    void release() {
+        if (cpu_) munmap(cpu_, size_);
+        if (import_ >= 0) ::close(import_);
+        if (dmabuf_ >= 0) ::close(dmabuf_);
+        if (heap_ >= 0) ::close(heap_);
+        if (vcsm_ >= 0) ::close(vcsm_);
+        cpu_ = nullptr;
+        import_ = dmabuf_ = heap_ = vcsm_ = -1;
+    }
     uint8_t* cpu_ = nullptr;
     uint32_t bus_ = 0, size_;
     bool cached_;

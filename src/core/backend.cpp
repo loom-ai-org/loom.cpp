@@ -137,6 +137,25 @@ bool is_host_memory(ggml_backend_dev_t dev) {
     return ggml_backend_buft_is_host(ggml_backend_dev_buffer_type(dev));
 }
 
+} // namespace
+
+ggml_backend_buffer_type_t weights_buffer_type(ggml_backend_dev_t dev) {
+    ggml_backend_buffer_type_t own = ggml_backend_dev_buffer_type(dev);
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU || !ggml_backend_buft_is_host(own)) return own;
+    ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(dev);
+    return host != nullptr && ggml_backend_buft_is_host(host) ? host : own;
+}
+
+ggml_backend_buffer_type_t state_buffer_type(ggml_backend_t backend) {
+    ggml_backend_buffer_type_t own = ggml_backend_get_default_buffer_type(backend);
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || weights_buffer_type(dev) == ggml_backend_dev_buffer_type(dev)) return own;
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    return cpu != nullptr ? ggml_backend_dev_buffer_type(cpu) : own;
+}
+
+namespace {
+
 // HOW "auto" RANKS DEVICES (BACKLOG.md P4.8b, corrected by P4.8e). Lower is preferred; 3 is never
 // selected.
 //
@@ -321,8 +340,11 @@ std::string human_size(size_t bytes) {
 // reporting total 0, so asking changed nothing. ggml-vc4 is also rank 1 -- host memory, CPU-mapped --
 // but its buffers come out of the GPU's contiguous pool (CMA, 64 MB by default on a Pi Zero), which it
 // reports. A model larger than that has to stay on the CPU and say why, not fail to allocate.
+//
+// A device whose weights stay in RAM (weights_buffer_type, P4.47) needs none of its memory for them.
 bool lacks_room(ggml_backend_dev_t dev, size_t weight_bytes, size_t* free_out) {
     if (weight_bytes == 0 || primary_rank(dev) > 1) return false;
+    if (weights_buffer_type(dev) != ggml_backend_dev_buffer_type(dev)) return false;
     size_t free = 0, total = 0;
     ggml_backend_dev_memory(dev, &free, &total);
     *free_out = free;

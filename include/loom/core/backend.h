@@ -105,6 +105,23 @@ struct DeviceInfo {
 // harmless. Has no effect on a build with backends linked in: those register themselves.
 void add_backend_search_path(const std::string& dir);
 
+// The buffer type a model's weights go in on `dev` (P4.47): the device's own, except on a device whose
+// tensors are host memory and which also offers a host buffer type -- ggml-vc4, whose own buffers are
+// the GPU's 64 MB pool and whose kernels read weights only through copies in their own layouts, kept in
+// that pool while it has room. Its weights then stay in RAM and take none of the pool. No other ggml
+// device has both: the CPU, BLAS and Metal offer no host buffer type, and the GPU backends that do
+// (Vulkan, CUDA, SYCL) have buffers of their own that are not host memory.
+ggml_backend_buffer_type_t weights_buffer_type(ggml_backend_dev_t dev);
+
+// The buffer type for what loom keeps on `backend` around its graphs -- the KV and conv-state caches,
+// retained outputs, declared inputs (P4.47): the backend's own, except on a device whose weights
+// weights_buffer_type moved to RAM. There, the CPU's, which leaves that device's pool to the
+// scheduler's compute buffers -- what its kernels write into. Measured on Pocket TTS 18m under
+// ggml-vc4: a 32 MB KV cache and the codec's 28 MB compute buffer held 61 of the 64 MB, and the QPUs
+// lost the codec's convolutions, which 7m (an 8 MB cache) runs on them. Not the device's host buffer
+// type: ggml-vc4 caches a copy of what it reads there by address, as weights that never change.
+ggml_backend_buffer_type_t state_buffer_type(ggml_backend_t backend);
+
 // Every registered device, in ggml's own registration order. Safe to call before any Device exists --
 // it is what initializes the backend registry.
 std::vector<DeviceInfo> available_devices();

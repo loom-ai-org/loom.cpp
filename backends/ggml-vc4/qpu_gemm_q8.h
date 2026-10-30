@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 namespace vc4 {
@@ -40,15 +41,21 @@ constexpr int Q8_WORDS_PER_ITER = 2;            // 8 k per loop iteration
 constexpr int Q8_KSTEP = 4 * Q8_WORDS_PER_ITER;
 
 inline int gemm_q8_kp(int K) { return (K + Q8_KSTEP - 1) / Q8_KSTEP * Q8_KSTEP; }
-// Repacked weight: [M][Kp] offset-binary bytes, then M float scales, then the TMU's over-read.
+// Repacked weight: M rows of Kp offset-binary bytes, gemm_q8_stride(K) apart (gemm_row_stride), then
+// M float scales, then the TMU's over-read.
+inline uint32_t gemm_q8_stride(int K) { return uint32_t(gemm_row_stride(size_t(gemm_q8_kp(K)))); }
 inline size_t gemm_q8_tail_bytes() { return size_t(GEMM_TMU_AHEAD + 1) * 4; }
-inline size_t gemm_q8_weight_bytes(int M, int K) {
-    return size_t(M) * gemm_q8_kp(K) + size_t(M) * 4 + gemm_q8_tail_bytes();
-}
+inline size_t gemm_q8_scales_at(int M, int K) { return size_t(M) * gemm_q8_stride(K); }
+inline size_t gemm_q8_weight_bytes(int M, int K) { return gemm_q8_scales_at(M, K) + size_t(M) * 4 + gemm_q8_tail_bytes(); }
 inline size_t gemm_q8_xpack_bytes(int N, int K) { return size_t((N + 15) / 16) * (size_t(gemm_q8_kp(K)) + 1) * 16 * 4; }
 
+// Epilogue (P4.46, qpu_gemm.h's Epilogue), for GEMM_OUT_M -- a 1x1 convolution, lanes its output
+// channels, accumulators its positions: the bias is one TMU read a tile and 16 fadds, the residual one
+// request per position as in qpu_conv1d.h, the mask 16 uniforms a tile (one per position). Read from
+// the tile's own stream, after its scale address.
+//
 // Register map: gemm_f32_wt_kernel's, plus rb10 the tile's scale address.
-inline Program gemm_q8_kernel() {
+inline Program gemm_q8_kernel(unsigned epi = 0) {
     const int ahead = GEMM_TMU_AHEAD;
     Program p;
     auto unif_to_a = [&](uint32_t ra) { p.mov(ra, 0, MUX_A, R_UNIFORM); };
@@ -136,6 +143,71 @@ inline Program gemm_q8_kernel() {
         p.alu(a);
     }
 
+    if (epi) {
+        // The epilogue's params follow the tile's in its stream, and the next tile's follow them, so
+        // the stream is read on from here and not switched again below. r3 is still min(l, valid-1)*4.
+        p.mov(W_UNIFORMS_ADDR, 0, MUX_B, R_NOP, 6);
+        p.nop(); p.nop();
+        if (epi & EPI_BIAS) {
+            { Alu a; a.op_add = A_ADD; a.waddr_add = W_TMU0_S; a.cond_add = C_ALWAYS; a.add_a = MUX_A;
+              a.raddr_a = R_UNIFORM; a.add_b = MUX_R3; p.alu(a); }
+            p.nop(SIG_LDTMU0);
+            for (uint32_t r = 0; r < 16; r++) {
+                Alu a; a.op_add = A_FADD; a.waddr_add = r; a.cond_add = C_ALWAYS; a.add_a = MUX_A; a.raddr_a = r;
+                a.add_b = MUX_R4; p.alu(a);
+            }
+        }
+        if (epi & EPI_RESIDUAL) {
+            // r3 <- min(l, valid-1) * the residual's row bytes; then position r's word of lane l's row
+            { Alu a; a.op_add = A_MIN; a.waddr_add = W_R3; a.cond_add = C_ALWAYS; a.add_a = MUX_A; a.add_b = MUX_B;
+              a.raddr_a = R_ELEMENT_NUMBER; a.raddr_b = 9; p.alu(a); }
+            { Alu a; a.op_mul = M_MUL24; a.waddr_mul = W_R3; a.cond_mul = C_ALWAYS; a.mul_a = MUX_R3; a.mul_b = MUX_A;
+              a.raddr_a = R_UNIFORM; p.alu(a); }
+            auto addr = [&](Alu & a) {
+                a.op_add = A_ADD; a.waddr_add = W_R0; a.cond_add = C_ALWAYS; a.add_a = MUX_A; a.raddr_a = R_UNIFORM;
+                a.add_b = MUX_R3;
+            };
+            auto request = [&](Alu & a) {
+                a.op_mul = M_V8MIN; a.waddr_mul = W_TMU0_S; a.cond_mul = C_ALWAYS; a.mul_a = MUX_R0; a.mul_b = MUX_R0;
+            };
+            { Alu a; addr(a); p.alu(a); }
+            for (int r = 0; r < 4; r++) { Alu a; request(a); if (r < 3) addr(a); p.alu(a); }
+            for (uint32_t r = 0; r < 16; r++) {
+                { Alu a; a.sig = SIG_LDTMU0; if (r + 4 < 16) addr(a); p.alu(a); }
+                { Alu a; a.op_add = A_FADD; a.waddr_add = r; a.cond_add = C_ALWAYS; a.add_a = MUX_A; a.raddr_a = r;
+                  a.add_b = MUX_R4; if (r + 4 < 16) request(a); p.alu(a); }
+            }
+        }
+        if ((epi & EPI_RELU) && (epi & EPI_MASK)) {
+            // r1 <- max(ra_i, 0) ; ra_(i-1) <- r1 * mask[n0 + i - 1] (a uniform), the mul writing regfile A
+            p.raw(ldi(W_R2, 0, 0));
+            for (uint32_t i = 0; i <= 16; i++) {
+                Alu a; a.ws = 1;
+                if (i < 16) {
+                    a.op_add = A_FMAX; a.waddr_add = W_R1; a.cond_add = C_ALWAYS; a.add_a = MUX_A; a.raddr_a = i;
+                    a.add_b = MUX_R2;
+                }
+                if (i > 0) {
+                    a.op_mul = M_FMUL; a.waddr_mul = i - 1; a.cond_mul = C_ALWAYS; a.mul_a = MUX_R1; a.mul_b = MUX_B;
+                    a.raddr_b = R_UNIFORM;
+                }
+                p.alu(a);
+            }
+        } else if (epi & EPI_RELU) {
+            for (uint32_t r = 0; r < 16; r++) {
+                Alu a; a.sig = SIG_SMALL_IMM; a.op_add = A_FMAX; a.waddr_add = r; a.cond_add = C_ALWAYS; a.add_a = MUX_A;
+                a.raddr_a = r; a.add_b = MUX_B; a.raddr_b = small_int(0);
+                p.alu(a);
+            }
+        } else if (epi & EPI_MASK) {
+            for (uint32_t r = 0; r < 16; r++) {
+                Alu a; a.ws = 1; a.op_mul = M_FMUL; a.waddr_mul = r; a.cond_mul = C_ALWAYS; a.mul_a = MUX_A; a.raddr_a = r;
+                a.mul_b = MUX_B; a.raddr_b = R_UNIFORM;
+                p.alu(a);
+            }
+        }
+    }
+
     p.mutex_acquire();
     p.mov(W_VPMVCD_SETUP, 1, MUX_B, R_NOP, 2);
     for (uint32_t r = 0; r < 16; r++) p.mov(W_VPM, 0, MUX_A, r);
@@ -145,7 +217,7 @@ inline Program gemm_q8_kernel() {
     p.mov(W_NOP, 0, MUX_B, R_NOP, R_VPM_ST_WAIT);
     p.mutex_release();
 
-    p.mov(W_UNIFORMS_ADDR, 0, MUX_B, R_NOP, 6);
+    if (!epi) p.mov(W_UNIFORMS_ADDR, 0, MUX_B, R_NOP, 6);
     { Alu a; a.sig = SIG_SMALL_IMM; a.op_add = A_SUB; a.waddr_add = 18; a.cond_add = C_ALWAYS;
       a.add_a = MUX_A; a.raddr_a = 18; a.add_b = MUX_B; a.raddr_b = small_int(1); a.sf = 1; p.alu(a); }
     p.branch(B_ALL_ZC, tile_loop);
@@ -170,33 +242,52 @@ inline Program gemm_q8_kernel() {
 template <class Block, class D2F>
 bool gemm_q8_repack(const Block * rows, int M, int K, D2F d_to_float, uint8_t * out) {
     const int nb = K / 32, Kp = gemm_q8_kp(K);
-    float * scales = reinterpret_cast<float *>(out + size_t(M) * Kp);
+    float * scales = reinterpret_cast<float *>(out + gemm_q8_scales_at(M, K));
     for (int m = 0; m < M; m++) {
         const Block * b = rows + size_t(m) * nb;
         for (int j = 1; j < nb; j++)
             if (b[j].d != b[0].d) return false;
-        uint8_t * o = out + size_t(m) * Kp;
+        uint8_t * o = out + size_t(m) * gemm_q8_stride(K);
         for (int j = 0; j < nb; j++)
             for (int i = 0; i < 32; i++) o[j * 32 + i] = uint8_t(int(b[j].qs[i]) + 128);
         for (int k = K; k < Kp; k++) o[k] = 128;
         scales[m] = d_to_float(b[0].d);
     }
-    std::fill(out + size_t(M) * Kp + size_t(M) * 4, out + gemm_q8_weight_bytes(M, K), uint8_t(0));
+    std::fill(out + gemm_q8_scales_at(M, K) + size_t(M) * 4, out + gemm_q8_weight_bytes(M, K), uint8_t(0));
     return true;
 }
 
-// X rows -> 255 * X, k-major in 16-row blocks zero-padded to Kp, each block followed by its 16
-// columns' 128 * sum_k x (summed in double: the subtraction cancels most of the accumulator).
-inline void gemm_q8_pack_x(const float * x, size_t x_stride, int N, int K, float * out) {
+// The inverse (P4.47): ggml's Q8_0 rows back from a repacked weight -- exact, since every block of a row
+// had the row's one fp16 scale -- for the CPU to run a node over it when the GPU pool refuses the call.
+template <class Block, class F2D>
+void gemm_q8_unpack(const uint8_t * in, int M, int K, F2D float_to_d, Block * rows) {
+    const int nb = K / 32;
+    const float * scales = reinterpret_cast<const float *>(in + gemm_q8_scales_at(M, K));
+    for (int m = 0; m < M; m++) {
+        const uint8_t * r = in + size_t(m) * gemm_q8_stride(K);
+        const auto d = float_to_d(scales[m]);
+        Block * b = rows + size_t(m) * nb;
+        for (int j = 0; j < nb; j++) {
+            b[j].d = d;
+            for (int i = 0; i < 32; i++) b[j].qs[i] = int8_t(int(r[j * 32 + i]) - 128);
+        }
+    }
+}
+
+// X -> 255 * X, k-major in 16-row blocks zero-padded to Kp, each block followed by its 16 columns'
+// 128 * sum_k x (summed in double: the subtraction cancels most of the accumulator). X[n][k] is
+// x[n * ns + k * ks]: ks = 1 for a MUL_MAT's activations, ns = 1 for a 1x1 convolution's [IC][T].
+inline void gemm_q8_pack_x(const float * x, size_t ns, size_t ks, int N, int K, float * out) {
     const int Kp = gemm_q8_kp(K), nb = (N + 15) / 16;
     for (int b = 0; b < nb; b++) {
         float * o = out + size_t(b) * (Kp + 1) * 16;
+        const float * xb = x + size_t(b) * 16 * ns;
         const int rows = std::min(16, N - b * 16);
         double sum[16] = {};
         for (int k = 0; k < K; k++, o += 16) {
             int r = 0;
             for (; r < rows; r++) {
-                const float v = x[size_t(b * 16 + r) * x_stride + k];
+                const float v = xb[size_t(r) * ns + size_t(k) * ks];
                 o[r] = 255.f * v;
                 sum[r] += v;
             }
@@ -207,35 +298,44 @@ inline void gemm_q8_pack_x(const float * x, size_t x_stride, int N, int K, float
         for (int r = 0; r < 16; r++) o[r] = float(128.0 * sum[r]);
     }
 }
+inline void gemm_q8_pack_x(const float * x, size_t x_stride, int N, int K, float * out) {
+    gemm_q8_pack_x(x, x_stride, 1, N, K, out);
+}
 
 struct GemmQ8Problem {
     int M, N, K;
-    uint32_t w, w_stride;   // repacked row 0 (bus), bytes between rows (gemm_q8_kp(K))
+    uint32_t w, w_stride;   // repacked row 0 (bus), bytes between rows (gemm_q8_stride(K))
     uint32_t scales;        // M floats (bus)
     uint32_t c, c_stride;   // dst row 0 (n = 0), bytes between dst rows
     uint32_t xpack;         // this slice's packed X (gemm_q8_xpack_bytes(N, K) bytes)
 };
 
+// The epilogue's operands for GEMM_OUT_M (one problem): the bias, M floats (bus); the residual's row 0
+// and the bytes between its rows of m (bus); the mask, N floats (host: they go into the uniforms).
+struct GemmQ8Epi {
+    unsigned flags = 0;
+    uint32_t bias = 0;
+    uint32_t residual = 0, residual_row = 0;
+    const float * mask = nullptr;
+};
+
 inline size_t gemm_q8_uniform_words(const std::vector<GemmQ8Problem> & probs, int nq) {
     size_t tiles = 0;
     for (auto & p : probs) tiles += size_t((p.M + 15) / 16) * ((p.N + 15) / 16);
-    return size_t(nq) * (9 + 16) + tiles * 8;
+    return size_t(nq) * (9 + 16) + tiles * (8 + 1 + 17 + 16);
 }
 
-// As gemm_wt_uniforms (m-major tiles, round-robin), with each tile's scale address.
+// As gemm_wt_uniforms, with each tile's scale address.
 template <class CpuMap>
 int gemm_q8_uniforms(CpuMap cpu, uint32_t unif, const std::vector<GemmQ8Problem> & probs, int nq_max,
-                     uint32_t done, uint32_t seq, std::vector<uint32_t> & starts) {
-    struct Tile { const GemmQ8Problem * p; int m0, n0; };
-    std::vector<Tile> tiles;
-    for (auto & p : probs)
-        for (int m0 = 0; m0 < p.M; m0 += 16)
-            for (int n0 = 0; n0 < p.N; n0 += 16) tiles.push_back({&p, m0, n0});
+                     uint32_t done, uint32_t seq, std::vector<uint32_t> & starts, GemmOut out = GEMM_OUT_N,
+                     int panel = 0, const GemmQ8Epi & epi = {}) {
+    std::vector<GemmTile> tiles;
+    for (size_t i = 0; i < probs.size(); i++) gemm_tiles(probs[i].M, probs[i].N, panel, int(i), tiles);
     const int nq = std::min<int>(nq_max, int(tiles.size()));
     starts.clear();
     if (nq == 0) return 0;
     const int K = probs[0].K, Kp = gemm_q8_kp(K);
-    const uint32_t vpm_hsetup = 1u << 12 | 1u << 11 | 2u << 8;
     const uint32_t done_vdw = 0x80000000u | 1u << 23 | 16u << 16 | 1u << 14;
     uint32_t at = unif;
     for (int q = 0; q < nq; q++) {
@@ -246,25 +346,35 @@ int gemm_q8_uniforms(CpuMap cpu, uint32_t unif, const std::vector<GemmQ8Problem>
         u[i++] = uint32_t(mine);
         u[i++] = probs[0].w_stride;
         u[i++] = uint32_t(Kp / Q8_KSTEP);
-        u[i++] = vpm_hsetup;
-        u[i++] = vpm_hsetup;
+        u[i++] = gemm_vpm_setup(out);
+        u[i++] = gemm_vpm_setup(GEMM_OUT_N);
         u[i++] = 0xc0000000u;
         u[i++] = done_vdw;
         u[i++] = done + q * 64;
         u[i++] = seq;
         for (size_t t = q; t < tiles.size(); t += nq) {
-            const Tile & T = tiles[t];
-            const GemmQ8Problem & P = *T.p;
+            const GemmTile & T = tiles[t];
+            const GemmQ8Problem & P = probs[T.p];
             const int mvalid = std::min(16, P.M - T.m0), nvalid = std::min(16, P.N - T.n0);
+            uint32_t stride_setup, vdw_setup, addr;
+            gemm_tile_vdw(out, P.c, P.c_stride, T.m0, T.n0, mvalid, nvalid, stride_setup, vdw_setup, addr);
             u[i++] = uint32_t(mvalid - 1);
             u[i++] = P.w + uint32_t(T.m0) * P.w_stride;
-            u[i++] = 0xc0000000u | (P.c_stride - uint32_t(mvalid) * 4);
-            u[i++] = 0x80000000u | uint32_t(nvalid) << 23 | uint32_t(mvalid) << 16 | 1u << 14;
-            u[i++] = P.c + uint32_t(T.n0) * P.c_stride + uint32_t(T.m0) * 4;
+            u[i++] = stride_setup;
+            u[i++] = vdw_setup;
+            u[i++] = addr;
             u[i++] = P.xpack + uint32_t(size_t(T.n0 / 16) * (Kp + 1) * 16 * 4);
             u[i] = at + uint32_t(i + 2) * 4;
             i++;
             u[i++] = P.scales + uint32_t(T.m0) * 4;
+            if (epi.flags & EPI_BIAS) u[i++] = epi.bias + uint32_t(T.m0) * 4;
+            if (epi.flags & EPI_RESIDUAL) {  // a position past N reads the last one (and is discarded)
+                u[i++] = epi.residual_row;
+                for (int r = 0; r < 16; r++)
+                    u[i++] = epi.residual + uint32_t(T.m0) * epi.residual_row + uint32_t(std::min(T.n0 + r, P.N - 1)) * 4;
+            }
+            if (epi.flags & EPI_MASK)
+                for (int r = 0; r < 16; r++) memcpy(&u[i++], &epi.mask[std::min(T.n0 + r, P.N - 1)], 4);
         }
         at = (at + uint32_t(i) * 4 + 63) & ~63u;
     }

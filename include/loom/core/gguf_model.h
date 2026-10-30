@@ -153,10 +153,13 @@ private:
     ggml_tensor* plain_copy(ggml_tensor* w);
     // P4.45: beside a host-memory primary that offers an extra buffer type of its own (ggml-vc4's
     // VC4_Q8), a MUL_MAT over a repacked weight that the primary would take with the weight there is
-    // given a copy there instead; null when that buffer cannot hold it.
+    // given a copy there instead (P4.46: a CONV_2D too); null when that buffer cannot hold it.
     bool primary_takes(const ggml_tensor* node, const ggml_tensor* w) const;
     ggml_tensor* primary_copy(ggml_tensor* w);
     ggml_backend_buffer_type_t primary_extra_buft_ = nullptr;
+    // Where the weights went (weights_buffer_type, P4.47): the primary's own buffer type, or the host
+    // buffer type of a primary whose kernels read weights through their own copies. Plain copies too.
+    ggml_backend_buffer_type_t weights_buft_ = nullptr;
     ggml_backend_buffer_ptr primary_probe_buf_;
     std::vector<ggml_backend_buffer_ptr> primary_bufs_;
     // The CPU backend whose extra buffer types hold `repacked_`: the primary, or the CPU fallback beside
