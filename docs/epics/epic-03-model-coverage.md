@@ -885,8 +885,17 @@ Flattened first, MOSS's rule.
 **Verified** (dev box): greedy codes against `generate(do_sample=False)` **810/810** (81 frames, same
 stop) and, cloned, **4000/4000** (400 frames); codec against `decode_audio` **4.6e-6** max abs; sampled
 takes read back by Parakeet-TDT, F32 and Q8_0. Q8_0's greedy codes differ from frame 0 (a 4096-way
-argmax flips). F32 2.4 GB, Q8_0 1.2 GB (the 156k-row token table stays F32 until `quantize_gathered`
-lands on main), codec 523 MB.
+argmax flips). F32 2.4 GB, Q8_0 650 MB, codec 523 MB.
+
+**The Q8_0 first shipped at 1.18 GB and was replaced on 2026-11-03** by passing `quantize_gathered`, which
+took the three token and code tables from 720 MB of F32 to 191 MB. The flag reaches every `GET_ROWS` table,
+and the rope's cos/sin are 64 wide and so block-aligned: Q8_0 would move them by up to 3.9e-3, as much as the
+bf16 rounding the export reads them off the module to keep, to save 770 KB. They are `keep_float`. Exact on
+the other two counts: only those three tensors differ from the old file, and F32 is byte-identical. Sampled
+and read back by Parakeet-TDT (12 sentences at seeds 1 and 2, 24 more at seed 1, 424 words), new Q8_0 is 5.19%
+WER, old Q8_0 3.30%, F32 3.54%. On the 24 unseen sentences the two Q8_0 files tie at 9 errors and F32 has 5; the
+whole gap between them comes from the first 12, so this is not evidence of damage, and it does not rule out a
+small cost either. Not exercised on a GPU: the Metal figures in Epic-04 §5.10 are the old file's.
 
 ### Family 9's third leaf, and the primitive that had to be added
 
