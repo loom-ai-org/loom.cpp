@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-10-30
+last_updated: 2026-11-03
 ---
 
 # Epic-03: Model Coverage
@@ -858,7 +858,7 @@ Audio8-TTS-Realistic-0.6B (`Edge0`, Apache-2.0 with a NOTICE, 0.6B, 23 languages
 Fish-S2-style DualAR: a 24-layer slow stack (896 wide, GQA 14/2, qkv bias) emits one SEMANTIC token per
 frame, and a 4-layer fast stack draws the frame's other nine codebooks. Codebook 0 is the semantic id
 minus `semantic_begin_id`. The checkpoint ships its codec as one file, `codec.pth`, byte-identical to
-Audio8-TTS-Preview's, so the pair is `audio8_tts_export` (family 10) and `audio_codec_export`'s
+Audio8-TTS-Preview's (the same leaf, which is not exported), so the pair is `audio8_tts_export` (family 10) and `audio_codec_export`'s
 `AUDIO8` member (family 11), the codec being the talker's `companions()`. Three phases: `embed` (one row
 = a token id + ten codes, an absent code's zero row standing in for the reference's
 `where(semantic, ...)`), `slow` (cached, head trimmed to the 4096 semantic rows + EOS) and `fast`
