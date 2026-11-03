@@ -168,10 +168,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   after the release that carries it. Weights are PolyForm Small Business / Noncommercial (Oruk AI), not
   the teacher's Apache-2.0. *Context: [ADR-094](../adrs/adr-094-a-speech-lm-recognizer-is-cut-at-quiet-points-and-its-cache-holds-one-piece.md),
   [Epic-03](../epics/epic-03-model-coverage.md)*
-* [ ] **Audio8 Q8_0: opt the token table into `quantize_gathered`.** `audio8_tts_export` does not pass it yet
-  (`oruk_loop_export` shows how), so `embed.text_weight` is still F32: 558 MB of the published 1.2 GB. Expected
-  size ~0.8 GB. Needs a fresh export, the gate and a re-upload. *Context:
-  [Epic-03](../epics/epic-03-model-coverage.md#the-fourth-leaf-was-audio8-tts-realistic-06b-and-its-sampler-was-not-transformers-2026-10-30)*
 * [ ] **Moonshine base**: the same leaf as tiny (`moonshine_v1_export.py`), on disk at `~/Dev/models/moonshine-base`, not exported
   or measured. *Context: [Epic-03](../epics/epic-03-model-coverage.md#family-2s-third-leaf-moonshine-v1-tiny)*
 * [ ] **MOSS-TTS + MOSS-Audio-Tokenizer: three open pieces.** Both are published
