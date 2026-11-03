@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: backends
-last_updated: 2026-10-30
+last_updated: 2026-11-03
 ---
 
 # Epic-04: Backends and Accelerators
@@ -1233,6 +1233,44 @@ at 4 MB, so the exact value the `sysctl` returns does not matter and the choice 
 key to read for the reason §5 gives (ggml's threads run on the performance cluster), just not a
 consequential one. **Closed: the arm is correct, it binds, and it is worth ~1.1x on two of the four
 families.**
+
+### 5.10 P4.48: Audio8 Q8_0 is slower on Metal, and the rotary op that might level it (2026-10-31)
+
+Audio8's text-to-codes loop on the M1 Pro, rc20 wheels, seven ABBA rounds, the same sentence, greedy:
+
+| ms per frame | F32 | Q8_0 | Q8_0 gain |
+|---|---|---|---|
+| Accelerate (CPU) | 53.5 | 22.9 | 2.34x |
+| Metal | 40.4 | 28.2 | 1.43x |
+
+**Compare per frame, not per run.** The Q8_0 arms emit different codes (89 frames on the CPU, 92 on Metal), so
+2.04 s against 2.60 s is not the same work. The F32 arms are identical, and match upstream's codes.
+
+**It is not a fallback.** `loom_cli`'s device report shows embed, slow and fast at one split each with no CPU
+nodes. A frame is about 2,850 compute nodes (the slow graph once, the fast graph nine times), about 15% of them
+matmuls. Fitting Metal to `c + bytes/bandwidth` over the two precisions gives `c` of about 23 ms per frame, or
+about 8 us per node. The fit is approximate: its bandwidth comes out above the M1 Pro's 200 GB/s peak. A latency
+floor is what the fit suggests, not something measured directly.
+
+**Where the rotary op comes in.** The export spells RoPE as gathered cos/sin tables and rotate-half, which costs
+six nodes for each of q and k: two multiplies, a copy of the half-vector, a negate, a concatenate and an add. That
+is 720 nodes per frame, 25% of them. `ggml_rope_ext`, already registered as `ROPE` and with Metal kernels, is one
+node for each, 120 per frame, so it removes 600 (21%).
+
+**Why the export does not use it.** `audio8_tts_export.py` reads the table off the module because upstream
+multiplies by bf16-rounded values, about 2^-9 off per rotation, and a greedy decode does not survive that
+difference. `ggml_rope_ext` computes cos/sin at full precision and cannot take a table: its frequency factors only
+scale the angles, and bf16 rounding is not an angle change, since the rounded (cos, sin) no longer has length 1.
+So the switch gives correct RoPE rather than upstream's RoPE. The codes diverge, as the Q8_0 codes already do, and
+the 810/810 greedy gate would have to become a WER gate for this model.
+
+**What it might buy.** If the floor scales with node count, about 5 ms, taking Metal Q8_0 to about 23 ms per frame,
+level with the CPU, whose own path gains a little too. That makes Metal stop losing rather than win, and it is an
+estimate from the fit. Read [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) first.
+
+**An exact alternative, untested.** Fold the minus sign into the sin table at export, so rotate-half is one
+concatenate of two views. That removes the copy and the negate (240 nodes per frame) without changing a number,
+provided ggml's concatenate accepts those views on every backend, which has not been checked.
 
 ## 6. GPU correctness: F32 matmul precision, the Metal norm, the CUDA mat-vec stride (2026-10-08)
 
