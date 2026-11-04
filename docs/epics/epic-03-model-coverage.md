@@ -895,7 +895,14 @@ the other two counts: only those three tensors differ from the old file, and F32
 and read back by Parakeet-TDT (12 sentences at seeds 1 and 2, 24 more at seed 1, 424 words), new Q8_0 is 5.19%
 WER, old Q8_0 3.30%, F32 3.54%. On the 24 unseen sentences the two Q8_0 files tie at 9 errors and F32 has 5; the
 whole gap between them comes from the first 12, so this is not evidence of damage, and it does not rule out a
-small cost either. Not exercised on a GPU: the Metal figures in Epic-04 §5.10 are the old file's.
+small cost either.
+
+On the M1 Pro with rc20, seven launches per arm, the new file takes 28.3 ms per frame on Metal and 22.8 on the
+CPU, against the old file's 28.2 and 23.1. Same speed, and P4.48 still stands, but load is about 0.2 s faster and
+peak RSS about 0.5 GB lower on both. The same draws read back by the unified ASR on the CPU give 11 errors in 424
+words for Metal new, 15 for Metal old and 14 for CPU new. A different reader, so these compare only with each
+other, and new beats old here where it lost above. The figures in Epic-04 §5.10 are still the old file's. CUDA
+and Vulkan have not run the new file: the workstation's GPU is on a training job.
 
 ### Family 9's third leaf, and the primitive that had to be added
 
