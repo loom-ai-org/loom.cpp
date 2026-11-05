@@ -1748,7 +1748,7 @@ of speech takes 4.8 s and 120 s takes 82 s, with a 4.0 GB peak.
 
 ### Family 1's stateless transducer: Zipformer small
 
-`pkufool/zipformer-small` (Apache-2.0, added 2026-11-05 at the user's request): icefall's
+`pkufool/zipformer-small` (Apache-2.0, published 2026-11-05 as `zipformer-small-loom` on rc20): icefall's
 `egs/librispeech/ASR/zipformer`, the paper's model, as a package without `k2`. `Yanguan619/zipformer` is an
 identical fork of it. `qualcomm/Zipformer` is not this model: it is the older
 `pruned_transducer_stateless7_streaming` (5 stacks) from another checkpoint. Non-streaming, transducer
@@ -1769,7 +1769,7 @@ relative shift spelled as NeMo's `rel_shift`, because the reference's `gather_al
 
 **It found two exporter bugs that nothing had exercised** ([Retro-103](../retros/retro-103-an-argument-the-lowering-did-not-read.md)):
 a 2-D convolution's stride, padding and dilation were written in torch's axis order, and `log1p` lost its
-`+ 1`. The first touches no published file: none of the 71 models on the Hub has an asymmetric 2-D
+`+ 1`. The first touches no published file: none of the 70 models then on the Hub has an asymmetric 2-D
 convolution. For the second, reading the reference code available locally found `log1p` only on paths these
 exports do not run; that reading does not cover every tree.
 
