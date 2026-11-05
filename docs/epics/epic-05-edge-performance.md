@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-10-24
+last_updated: 2026-11-05
 ---
 
 # Epic-05: Edge CPU Performance
@@ -4311,3 +4311,76 @@ peak gives ~9.3 ms), so the F32 GEMM is not what closes the gap. In order of siz
    converting element by element.
 
 Fusion is already worth 1.8 ms (`GGML_CPU_DISABLE_FUSION=1`: 11.1 -> 12.9).
+
+
+### P4.49-P4.53 — Zipformer's encoder is slower than PyTorch's — SCOPED 2026-11-05
+
+**Where it came from.** [Zipformer small](epic-03-model-coverage.md#family-1s-stateless-transducer-zipformer-small)
+is published at 7.05x real time on the dev box, and Metal on the M1 Pro is slower than the M1's CPU.
+Both read as fine until PyTorch eager ran the same 73 clips the same way (fbank, encoder and greedy
+search per clip, load excluded): **7.76x against loom's 7.75x**, and at 120 s PyTorch is ahead (20.8 s
+against 24.1). Timing the phases apart shows that tie is two errors cancelling. Encoder and decode loop
+timed separately, F32, min of three after a warm-up; loom through a copy of the GGUF whose driver adds
+an `encoder_only` entry point:
+
+| | encoder, torch | encoder, loom | decode, torch | decode, loom |
+|---|---|---|---|---|
+| dev box, 2 threads, 10 s | 0.47 s | 0.76 s | 0.67 s | 0.43 s |
+| dev box, 2 threads, 60 s | 3.84 s | **6.57 s** | 4.00 s | 2.96 s |
+| M1 Pro CPU, 8 threads, 10 s | 0.35 s | 0.16 s | 0.65 s | 0.21 s |
+| M1 Pro CPU, 8 threads, 60 s | 1.16 s | 1.09 s | 3.21 s | 1.12 s |
+| M1 Pro Metal, 60 s | | 1.62 s | | 1.75 s |
+
+**The encoder is 1.6-1.7x slower than PyTorch's on x86 at every length**, and the decode loop (a Lua
+loop against PyTorch's Python one) is what hides it. The default of two threads (the physical cores)
+beats four for both engines on this 2C/4T part. On the M1, where the CPU device is BLAS + Accelerate,
+loom is 2.7x ahead of PyTorch at 10 s and 2.0x at 60 s.
+
+**It is not mainly attention.** The quadratic parts (relative-position scores, `QK^T`/`AV`, softmax,
+the relative shift's copies) are 10% of the encoder's profiled time at 10 s and 30% at 60 s, so they are
+why the gap widens with length. They are not why it exists. Per encoder call at 60 s, profiled at two
+threads (8.56 s profiled against 6.57 s unprofiled), with PyTorch's profiler on the same input:
+
+| what | loom | PyTorch |
+|---|---|---|
+| linears, reached as `[C, 1, T]` and run as T matrix-vector products | 1.74 s, ~27 GFLOP/s | 0.73 s (`addmm`) |
+| relative-position scores, `K = pos_head_dim = 4` | 1.20 s, 1.5 GFLOP/s | ~0.3 s |
+| the subsampling stem's 7x7 depthwise conv (im2col + per-channel matmul) and two 1x1 convs through im2col | 1.23 s | 0.37 s, all 30 convs |
+| Swoosh activations: ~7 elementwise passes each, several `n_tasks = 1` | ~2.5 s profiled | ~0.9 s |
+| softmax | 0.12 s | 0.20 s |
+
+**Metal adds four of its own** (60 s, `$LOOM_PROFILE`'s per-node sync subtracted, so ordering more
+than timing). `ggml-metal` takes its simdgroup `mul_mm` only when `ne00 >= 64`
+(`ggml-metal-common.cpp`), and Zipformer's query head is 32 wide, so `QK^T` runs on the mat-vec kernel:
+172 ms against 8.8 ms on the CPU, for two calls. The `[C, 1, T]` linears land on mat-vec too (2.1x the
+CPU). BiasNorm's `x ** -0.5` exports as `POW`, a CPU `MAP_CUSTOM2`, so 13 fallback nodes cut the
+encoder into 27 splits. And the prediction network's `CONV_1D` at `groups = 128` is G slices and a
+concat by design (`conv_1d_grouped`), which here is 918 nodes a call: 1.97 ms on Metal against 0.70 ms
+on the CPU, 546 times in a 60 s clip.
+
+**The decode loop's floor is the joint**: a 512 x 11661 projection per frame, 24 MB of F32 weights read
+1498 times at 60 s, about 0.47 ms a call on every device. PyTorch pays it too.
+
+**The queue, in the user's order (2026-11-05).** Each lowering change below is generic, so each can move
+the numbers of models other than Zipformer: census first, then the engine gates and the card gate on
+what the census finds.
+
+1. **P4.49 — a 2-D weight against a batched activation is one GEMM.** When `MUL_MAT`'s first operand is
+   2-D and the second is contiguous, fold the second's batch axes into its columns and reshape the
+   product back. Same products, but ggml's CPU path then takes tinyBLAS (`n = T`) instead of a
+   `vec_dot` per frame, and Metal takes `mul_mm`; the summation order changes, so sums move by ulps.
+   Worth up to ~1 s of the 6.57.
+2. **P4.50 — `CONV_2D_DW` gets P4.31's direct path**, `ggml_conv_2d_dw_direct` with im2col as the
+   fallback, and a 1x1, stride-1, unpadded `CONV_2D` becomes a plain matmul. Worth up to ~1 s.
+3. **P4.51 — the `K = 4` relative-position matmul.** tinyBLAS refuses `k < 8` (P4.31 met the same
+   refusal), so it falls to the generic kernel. Candidates: zero-pad `pos_head_dim` to 8 in the
+   export, or a ggml patch for small-K products. Measure both. Worth up to ~0.9 s.
+4. **P4.52 — Metal's three**: `POW` with a constant exponent lowered to native ops (`-0.5` is
+   `1 / sqrt`), grouped `CONV_1D` as one batched matmul over G instead of G slices, and `mul_mm` at
+   `ne00 = 32`. The grouped convolution is not Metal-only: the CPU pays the same 918 nodes.
+5. **P4.53 — a chunked joint.** Run the joint for a block of frames against one decoder output (a GEMM),
+   take the first non-blank, and resume after it. The emissions stay identical to the frame-by-frame
+   loop. A driver and exporter change.
+
+**Measured and not queued**: Swoosh as fewer passes (needs a fused op or a cheaper composition), the
+relative shift's `CONT`/`PAD` copies (0.6 s profiled at 60 s), and Vulkan, which is not profiled.
