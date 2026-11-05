@@ -222,6 +222,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
     *Context: [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)*
 * [ ] **Qwen3-ASR-0.6B variants beyond the exported leaf** — `qwen3-asr-0.6b-hf` is shipped; the 1.7B
   and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
+* [ ] **Zipformer's other variants.** Small, non-streaming, transducer is built ([Epic-03](../epics/epic-03-model-coverage.md)). Medium and large should reuse the leaf; `-streaming` is a different leaf, with six cache tensors per layer. CUDA has not run it yet.
 * [ ] **P5 breadth: family 14 (music)**: MusicGen Small is published (2026-10-10); the next leaf is unscoped (see *Now*).
   Every earlier family in the coverage-per-effort order is complete or parked. Chatterbox showed that a leaf
   composes from the existing templates, so what the next one costs is its own front end and its own
