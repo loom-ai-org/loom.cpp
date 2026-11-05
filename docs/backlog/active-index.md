@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-10-30
+last_updated: 2026-11-03
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -168,12 +168,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   after the release that carries it. Weights are PolyForm Small Business / Noncommercial (Oruk AI), not
   the teacher's Apache-2.0. *Context: [ADR-094](../adrs/adr-094-a-speech-lm-recognizer-is-cut-at-quiet-points-and-its-cache-holds-one-piece.md),
   [Epic-03](../epics/epic-03-model-coverage.md)*
-* [ ] **Audio8-TTS-Realistic-0.6B + its codec: publish after rc20** (built 2026-10-30, talker F32 + Q8_0,
-  codec F32; `audio8-tts-realistic-0.6b-loom`, `audio8-tts-codec-loom`). The talker's sampler needs rc20's
-  `truncation`/`top_p_crossing` ([ADR-095](../adrs/adr-095-a-samplers-truncation-may-be-measured-before-its-temperature.md)).
-  Follow-ups: opt the token table into `quantize_gathered` once loom-exporter #69 (oruk) lands (Q8_0 1.2 GB -> ~0.8 GB);
-  Audio8-TTS-Preview-0.6b is the same leaf and the same codec, not exported. *Context:
-  [Epic-03](../epics/epic-03-model-coverage.md#the-fourth-leaf-was-audio8-tts-realistic-06b-and-its-sampler-was-not-transformers-2026-10-30)*
 * [ ] **Moonshine base**: the same leaf as tiny (`moonshine_v1_export.py`), on disk at `~/Dev/models/moonshine-base`, not exported
   or measured. *Context: [Epic-03](../epics/epic-03-model-coverage.md#family-2s-third-leaf-moonshine-v1-tiny)*
 * [ ] **MOSS-TTS + MOSS-Audio-Tokenizer: three open pieces.** Both are published
@@ -887,6 +881,14 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   1.5x on this backend" is a surprising thing to leave undocumented in the model cards.
   → [Epic-04 §5.8](../epics/epic-04-backends-and-accelerators.md),
   [ADR-017](../adrs/adr-017-no-k-quants.md)
+* [ ] **P4.48: try ggml's fused rotary op on Audio8, whose Q8_0 is slower on Metal than on the CPU** (28.2 against
+  22.9 ms per frame on the M1 Pro; F32 is the other way round). One `ROPE` node would replace six per q/k. The
+  export does not use it because `ggml_rope_ext` computes cos/sin at full precision and upstream multiplies by
+  bf16-rounded values, about 2^-9 off per rotation, so the codes would diverge from upstream's and the 810/810
+  greedy gate would have to become a WER gate for this model. If Metal's ~23 ms per-frame floor scales with node
+  count, it saves roughly 5 ms: level with the CPU, not ahead of it. That is an estimate from a fit, not a
+  measurement, so measure it first.
+  → [Epic-04 §5.10](../epics/epic-04-backends-and-accelerators.md#510-p448-audio8-q8_0-is-slower-on-metal-and-the-rotary-op-that-might-level-it-2026-10-31)
 * [ ] **Run `ggml-0024`'s tensor-API branch on a Mac that has one.** On an M5-class GPU, Metal's
   `mul_mm` uses the tensor API, which has no float-tile variant, so `ggml-0024` sends a `GGML_PREC_F32`
   F32 product to the mat-vec kernel instead. That branch compiles but has never run: the M1 Pro does not

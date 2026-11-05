@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-10-30
+last_updated: 2026-11-03
 ---
 
 # Epic-03: Model Coverage
@@ -858,7 +858,7 @@ Audio8-TTS-Realistic-0.6B (`Edge0`, Apache-2.0 with a NOTICE, 0.6B, 23 languages
 Fish-S2-style DualAR: a 24-layer slow stack (896 wide, GQA 14/2, qkv bias) emits one SEMANTIC token per
 frame, and a 4-layer fast stack draws the frame's other nine codebooks. Codebook 0 is the semantic id
 minus `semantic_begin_id`. The checkpoint ships its codec as one file, `codec.pth`, byte-identical to
-Audio8-TTS-Preview's, so the pair is `audio8_tts_export` (family 10) and `audio_codec_export`'s
+Audio8-TTS-Preview's (the same leaf, which is not exported), so the pair is `audio8_tts_export` (family 10) and `audio_codec_export`'s
 `AUDIO8` member (family 11), the codec being the talker's `companions()`. Three phases: `embed` (one row
 = a token id + ten codes, an absent code's zero row standing in for the reference's
 `where(semantic, ...)`), `slow` (cached, head trimmed to the 4096 semantic rows + EOS) and `fast`
@@ -885,8 +885,24 @@ Flattened first, MOSS's rule.
 **Verified** (dev box): greedy codes against `generate(do_sample=False)` **810/810** (81 frames, same
 stop) and, cloned, **4000/4000** (400 frames); codec against `decode_audio` **4.6e-6** max abs; sampled
 takes read back by Parakeet-TDT, F32 and Q8_0. Q8_0's greedy codes differ from frame 0 (a 4096-way
-argmax flips). F32 2.4 GB, Q8_0 1.2 GB (the 156k-row token table stays F32 until `quantize_gathered`
-lands on main), codec 523 MB.
+argmax flips). F32 2.4 GB, Q8_0 650 MB, codec 523 MB.
+
+**The Q8_0 first shipped at 1.18 GB and was replaced on 2026-11-03** by passing `quantize_gathered`, which
+took the three token and code tables from 720 MB of F32 to 191 MB. The flag reaches every `GET_ROWS` table,
+and the rope's cos/sin are 64 wide and so block-aligned: Q8_0 would move them by up to 3.9e-3, as much as the
+bf16 rounding the export reads them off the module to keep, to save 770 KB. They are `keep_float`. Exact on
+the other two counts: only those three tensors differ from the old file, and F32 is byte-identical. Sampled
+and read back by Parakeet-TDT (12 sentences at seeds 1 and 2, 24 more at seed 1, 424 words), new Q8_0 is 5.19%
+WER, old Q8_0 3.30%, F32 3.54%. On the 24 unseen sentences the two Q8_0 files tie at 9 errors and F32 has 5; the
+whole gap between them comes from the first 12, so this is not evidence of damage, and it does not rule out a
+small cost either.
+
+On the M1 Pro with rc20, seven launches per arm, the new file takes 28.3 ms per frame on Metal and 22.8 on the
+CPU, against the old file's 28.2 and 23.1. Same speed, and P4.48 still stands, but load is about 0.2 s faster and
+peak RSS about 0.5 GB lower on both. The same draws read back by the unified ASR on the CPU give 11 errors in 424
+words for Metal new, 15 for Metal old and 14 for CPU new. A different reader, so these compare only with each
+other, and new beats old here where it lost above. The figures in Epic-04 §5.10 are still the old file's. CUDA
+and Vulkan have not run the new file: the workstation's GPU is on a training job.
 
 ### Family 9's third leaf, and the primitive that had to be added
 
