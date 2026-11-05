@@ -43,7 +43,7 @@ defaulted arguments have not been audited.
 before reading the tokens.
 
 Both fixes are covered in `tests/ci/test_zipformer_export.py`, and those tests fail with the fixes reverted.
-The convolution fix changes no published file: a scan of the 71 models on the Hub found 9 with a 2-D convolution
+The convolution fix changes no published file: a scan of the 70 models then on the Hub found 9 with a 2-D convolution
 and none asymmetric. The `log1p` fix has no such scan, because a dropped epsilon leaves no mark in a GGUF. Reading
 the reference code available locally found `log1p` only on paths these exports do not run, such as beam search;
 that reading does not cover every tree.
