@@ -140,6 +140,53 @@ void test_mul_mat_identity() {
     LOOM_CHECK(get_f32(out) == b_data);
 }
 
+// P4.49: a 2-D weight against an activation whose batch axes are > 1 is ONE matrix product. Zipformer's
+// linears reach MUL_MAT as `[C, 1, T]`, and ggml broadcasting the weight over T ran T matrix-vector
+// products. The product has the shape ggml's broadcast gives, the values torch's, and the graph holds a
+// single MUL_MAT whose columns are every frame -- the last is what makes it fast, so it is checked.
+void test_mul_mat_2d_weight_against_batched_activation() {
+    struct Case { int64_t n1, n2, n3; };
+    for (const Case c : {Case{1, 4, 1}, Case{2, 2, 3}}) {
+        GgmlScratch s;
+        const int64_t K = 3, N = 2, cols = c.n1 * c.n2 * c.n3;
+        ggml_tensor* a = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, K, N);
+        ggml_set_input(a);
+        ggml_tensor* b = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, K, c.n1, c.n2, c.n3);
+        ggml_set_input(b);
+
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        ggml_tensor* out = op("MUL_MAT")(pc, {a, b}, {})[0];
+        LOOM_CHECK(out->ne[0] == N && out->ne[1] == c.n1 && out->ne[2] == c.n2 && out->ne[3] == c.n3);
+
+        ggml_cgraph* gf = s.expand(out);
+        int n_mul_mat = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor* node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_MUL_MAT) continue;
+            ++n_mul_mat;
+            LOOM_CHECK(node->src[1]->ne[1] == cols && node->src[1]->ne[2] == 1 && node->src[1]->ne[3] == 1);
+        }
+        LOOM_CHECK(n_mul_mat == 1);
+
+        std::vector<float> wa(K * N), wb(K * cols);
+        for (size_t i = 0; i < wa.size(); ++i) wa[i] = static_cast<float>(i + 1);
+        for (size_t i = 0; i < wb.size(); ++i) wb[i] = static_cast<float>(static_cast<int>(i % 7) - 3);
+        set_f32(a, wa);
+        set_f32(b, wb);
+        s.compute(gf);
+        // Small integers, so every sum is exact and the comparison can be too.
+        std::vector<float> want(N * cols);
+        for (int64_t j = 0; j < cols; ++j)
+            for (int64_t n = 0; n < N; ++n) {
+                float acc = 0;
+                for (int64_t k = 0; k < K; ++k) acc += wa[n * K + k] * wb[j * K + k];
+                want[j * N + n] = acc;
+            }
+        LOOM_CHECK(get_f32(out) == want);
+    }
+}
+
 void test_add_mul_silu() {
     GgmlScratch s;
     ggml_tensor* a = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 4);
@@ -2811,6 +2858,7 @@ int main() {
     test_get_rows_from_a_transposed_view();
     test_get_rows_mismatched_batch_throws();
     test_mul_mat_identity();
+    test_mul_mat_2d_weight_against_batched_activation();
     test_add_mul_silu();
     test_swiglu();
     test_rms_norm();
