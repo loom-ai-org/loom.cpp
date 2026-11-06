@@ -456,7 +456,19 @@ Outputs op_conv_2d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
 #endif
 
     ggml_tensor* im2col_src = fold.folded ? im2col_shape_carrier(pc.ctx, kernel, fold, /*is_2D=*/true) : kernel;
-    ggml_tensor* im2col = ggml_im2col(pc.ctx, im2col_src, data, s0, s1, p0, p1, d0, d1, /*is_2D=*/true, conv_im2col_type(kernel)); // [IC*KH*KW, OW, OH, N]
+    const int64_t kw = fold.folded ? fold.kw : kernel->ne[0];
+    const int64_t kh = fold.folded ? fold.kh : kernel->ne[1];
+    // A 1x1, stride-1, unpadded convolution's im2col is the input with its channel axis moved innermost,
+    // byte for byte, so it is built as exactly that (P4.50): `ggml_cont` of a transpose is 2-3x faster
+    // than ggml's general im2col at Zipformer's stem shapes (54.5 -> 26.2 ms at 384 channels, 26.1 ->
+    // 8.7 at 128, two threads) and bit-identical. F32 only, since im2col is where an F16 kernel's
+    // operand gets its cast.
+    ggml_tensor* im2col = (kw == 1 && kh == 1 && s0 == 1 && s1 == 1 && p0 == 0 && p1 == 0 &&
+                           conv_im2col_type(kernel) == GGML_TYPE_F32 && data->type == GGML_TYPE_F32)
+        ? ggml_reshape_4d(pc.ctx,
+              ggml_cont(pc.ctx, ggml_transpose(pc.ctx, ggml_reshape_3d(pc.ctx, data, data->ne[0] * data->ne[1], data->ne[2], data->ne[3]))),
+              data->ne[2], data->ne[0], data->ne[1], data->ne[3])                                                  // [IC, OW, OH, N]
+        : ggml_im2col(pc.ctx, im2col_src, data, s0, s1, p0, p1, d0, d1, /*is_2D=*/true, conv_im2col_type(kernel)); // [IC*KH*KW, OW, OH, N]
     ggml_tensor* im2col_2d = ggml_reshape_2d(pc.ctx, im2col, im2col->ne[0], im2col->ne[3] * im2col->ne[2] * im2col->ne[1]); // [IC*KH*KW, N*OH*OW]
     ggml_tensor* kernel_2d = fold.folded
         ? kernel
@@ -465,6 +477,11 @@ Outputs op_conv_2d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     ggml_tensor* result = (fold.folded || conv_kernel_is_packed(kernel))
         ? mul_mat_kernel_first(pc.ctx, kernel_2d, im2col_2d)
         : ggml_mul_mat(pc.ctx, im2col_2d, kernel_2d);                                                          // [N*OH*OW, OC]
+    // With one batch, [OW, OH, 1, OC] and [OW, OH, OC, 1] are the same bytes, so the permute's copy is
+    // skipped (P4.50).
+    if (im2col->ne[3] == 1) {
+        return {ggml_reshape_4d(pc.ctx, result, im2col->ne[1], im2col->ne[2], oc, 1)};                          // [OW, OH, OC, 1]
+    }
     result = ggml_reshape_4d(pc.ctx, result, im2col->ne[1], im2col->ne[2], im2col->ne[3], oc);                  // [OW, OH, N, OC]
     result = ggml_cont(pc.ctx, ggml_permute(pc.ctx, result, 0, 1, 3, 2));                                        // [OW, OH, OC, N]
     return {result};
@@ -490,6 +507,45 @@ Outputs op_conv_2d_dw(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
     const int d1 = static_cast<int>(resolve_attr_int(attrs, "d1", pc.symbols));
 
     if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
+
+    // Direct kernel first, as CONV_1D_DW has had since P4.31 (P4.50). The im2col recipe below writes
+    // KH*KW copies of the input and then runs a [KH*KW, OW*OH] x [KH*KW, 1] product per channel, n = 1,
+    // which no fast GEMM path takes: Zipformer's 7x7 stem conv wrote a 1.4 GB im2col for a 60 s clip and
+    // spent 0.89 s there and 0.17 s in the products, against 0.15 s for `ggml_conv_2d_dw_direct` on the
+    // same shape. FastConformer's stride-2 3x3 convs are 5.5-9.2x faster the same way (parakeet-tdt,
+    // 10 s: 0.25 s of im2col and per-channel products became 0.02 s). Same type conditions as the 1-D
+    // form, and the backend is asked first so a device without the op keeps the recipe it already ran.
+    if (data->type == GGML_TYPE_F32 && ggml_is_contiguous(kernel) &&
+        (kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16)) {
+        const int64_t KW = kernel->ne[0], KH = kernel->ne[1], C = kernel->ne[2] * kernel->ne[3];
+        ggml_tensor* k = kernel->type == GGML_TYPE_F16 ? ggml_cast(pc.ctx, kernel, GGML_TYPE_F32) : kernel;
+        k = ggml_reshape_4d(pc.ctx, k, KW, KH, 1, C);                                   // [KW, KH, 1, C]
+        // The direct kernel vectorizes along a row, over the outputs whose taps are all inside it, and
+        // runs the rest one bounds-checked tap at a time. Zipformer's stem rows are 19 wide against a
+        // 7-wide kernel, so 6 of 19 outputs take the slow loop, at 2996 rows per channel. Convolving the
+        // transpose puts the long axis in the row: 148 -> 44 ms including both transposes. It is
+        // restricted to stride 1 because the direct kernel's strided rows are scalar anyway, and to rows
+        // under four kernel widths because past that the transposes cost more than they save
+        // (FastConformer's 64-wide rows: 42 -> 80 ms the other way round). On Metal and Vulkan it
+        // measured neutral (0.923 vs 0.925 s, 3.77 vs 3.77 s, Zipformer's 60 s encoder), so it is not
+        // made CPU-only.
+        const int64_t OW = data->ne[0] + 2 * p0 - d0 * (KW - 1);   // stride 1, so the output row width
+        const bool long_axis_inner = s0 == 1 && s1 == 1 && OW < 4 * KW && data->ne[1] > 4 * data->ne[0];
+        if (long_axis_inner) {
+            ggml_tensor* kt = ggml_cont(pc.ctx, ggml_permute(pc.ctx, k, 1, 0, 2, 3));      // [KH, KW, 1, C]
+            ggml_tensor* xt = ggml_cont(pc.ctx, ggml_permute(pc.ctx, data, 1, 0, 2, 3));   // [H, W, C, N]
+            ggml_tensor* yt = ggml_conv_2d_dw_direct(pc.ctx, kt, xt, s1, s0, p1, p0, d1, d0);  // [OH, OW, C, N]
+            if (backend_can_run(pc, yt)) {
+                return {ggml_cont(pc.ctx, ggml_permute(pc.ctx, yt, 1, 0, 2, 3))};          // [OW, OH, C, N]
+            }
+        } else {
+            ggml_tensor* y = ggml_conv_2d_dw_direct(pc.ctx, k, data, s0, s1, p0, p1, d0, d1);  // [OW, OH, C, N]
+            if (backend_can_run(pc, y)) {
+                return {y};
+            }
+        }
+    }
+
     ggml_tensor* new_kernel = ggml_reshape_4d(pc.ctx, kernel, kernel->ne[0], kernel->ne[1], 1,
                                                kernel->ne[2] * kernel->ne[3]);
     ggml_tensor* im2col = ggml_im2col(pc.ctx, new_kernel,

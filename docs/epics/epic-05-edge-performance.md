@@ -4420,3 +4420,46 @@ wheel with this engine) found 13 models that reach the fold: f5-tts, granite-spe
 voxtral's 1.33-1.39x, oruk/qwen3-asr's 1.36x), and 0.95-1.07x where each batch already has many
 (f5's `[64, 1135, 16]`, moonshine's `[32, 457, 8]`, supertonic, miro). Whole-card wall times are
 dominated by loading and did not resolve a difference.
+
+#### P4.50 — DONE 2026-11-06: `CONV_2D_DW` direct, a 1x1 `CONV_2D` without im2col
+
+Three lowering changes in `primitives_conv.cpp`, each guarded so anything else keeps its old recipe:
+
+* **`CONV_2D_DW` takes `ggml_conv_2d_dw_direct`** (F32 data, F32 or F16 kernel, and only if the backend
+  runs it), as `CONV_1D_DW` has since P4.31. The im2col recipe wrote KH*KW copies of the input and then
+  ran a per-channel product with n = 1. Zipformer's 7x7 stem conv wrote a 1.4 GB im2col for a 60 s clip.
+* **With rows under four kernel widths, stride 1 and a column over four rows long, it convolves the
+  transpose.** The direct kernel vectorizes along a row and runs the edge outputs one bounds-checked tap
+  at a time, and Zipformer's rows are 19 wide against a 7-wide kernel. Op alone, two threads:
+  im2col 738 ms, direct 148 ms, transposed 44 ms including both transposes. FastConformer's 64-wide
+  rows go the other way (42 ms direct, 80 ms transposed), which is where the threshold comes from.
+  Neutral on Metal and Vulkan.
+* **A 1x1, stride-1, unpadded `CONV_2D`'s im2col is built as `ggml_cont` of a transpose**, which is the
+  same bytes, 2-3x faster. And **at one batch the output permute's copy is skipped**, since
+  `[OW, OH, 1, OC]` and `[OW, OH, OC, 1]` are the same layout.
+
+Zipformer encoder, F32, P4.50 off against on (P4.49 in both), same protocol as P4.49:
+
+| | 10 s | 60 s |
+|---|---|---|
+| dev box CPU, 2 threads | 0.70 → 0.59 s (1.19x) | 6.46 → 5.79 s (1.12x) |
+| M1 Pro CPU | 0.130 → 0.083 s (1.57x) | 0.953 → 0.672 s (1.42x) |
+| M1 Pro Metal | 0.125 → 0.094 s (1.33x) | 1.156 → 0.924 s (1.25x) |
+| dev box Vulkan, Radeon Vega 3 | 0.575 → 0.482 s (1.19x) | 4.47 → 3.75 s (1.19x) |
+
+On the M1's CPU the 60 s encoder is now 0.67 s against PyTorch's 1.16. On the dev box it is 5.79 s
+against 3.84: P4.51 and the Swoosh passes are most of what is left there.
+
+**Correctness.** Tokens are identical to the reference on all four devices at 10 s and 60 s. The engine
+gate passes 272/272 (jfk encoder max |d| 2.61e-5). The new ci test `test_conv_2d_lowerings_against_reference`
+covers one case per branch against a double reference, together with the graph each branch must build
+(no `IM2COL`, the expected `CONT` count). It fails 14 checks with P4.50 disabled and 2 with only the
+transposed form disabled.
+
+**The other models it touches.** Ten published models have `CONV_2D` or `CONV_2D_DW`: the six
+FastConformers (canary-1b-v2, lfm2.5-audio-asr, both nemotrons, parakeet-rnnt, parakeet-tdt),
+conformer-ctc-small, oruk, qwen3-asr and Zipformer. **All ten cards pass.** In parakeet-tdt at 10 s,
+the dw_striding stem's 145 ms of `IM2COL` and 107 ms of per-channel products became 25 ms of
+`CONV_2D_DW` (profiled). That is a few percent of a transcription, below what whole-model timing
+resolves on this box. qwen3-asr's convolutions run batched (N > 1), so its graph is node for node
+unchanged.
