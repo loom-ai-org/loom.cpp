@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-11-05
+last_updated: 2026-11-06
 ---
 
 # Epic-05: Edge CPU Performance
@@ -4384,3 +4384,39 @@ what the census finds.
 
 **Measured and not queued**: Swoosh as fewer passes (needs a fused op or a cheaper composition), the
 relative shift's `CONT`/`PAD` copies (0.6 s profiled at 60 s), and Vulkan, which is not profiled.
+
+#### P4.49 — DONE 2026-11-06: a 2-D weight against a batched activation is one GEMM
+
+`op_mul_mat` now folds `b`'s batch axes into its columns whenever `a` is 2-D and `b` has a batch, runs
+one `ggml_mul_mat`, and reshapes the product back. Both reshapes are views (`b` is made contiguous just
+above). This is a lowering choice rather than a ggml patch: ggml's broadcast is correct, it just picks
+its kernel per batch, and a batch of one column is a matrix-vector product on every backend.
+
+Zipformer encoder, F32, fold off against on, one process per arm, order alternated, min of three
+after a warm-up (`LOOM_N_THREADS=8` on the M1):
+
+| | 10 s | 60 s |
+|---|---|---|
+| dev box CPU, 2 threads | 0.746 → 0.630 s (1.18x) | 6.84 → 6.23 s (1.10x) |
+| M1 Pro CPU | 0.155 → 0.130 s (1.19x) | 1.095 → 0.956 s (1.15x) |
+| M1 Pro Metal | 0.198 → 0.125 s (1.59x) | 1.594 → 1.152 s (1.38x) |
+| dev box Vulkan, Radeon Vega 3 | 1.69 → 0.575 s (2.94x) | 11.25 → 4.48 s (2.51x) |
+
+The linears went from ~32 to ~58 GFLOP/s on the dev box, which is GEMM speed. End to end on the 73
+clips, the dev box went from 7.2-7.5x real time (the shipped wheel) to 8.1x. Vulkan at 60 s went from
+16.4 s to 9.6 s (3.6x → 6.3x real time). Its decode loop, ~5 s, is now the larger half.
+
+**Correctness.** Tokens are identical to the unfolded reference on every device: CPU, M1 CPU, Metal and
+Vulkan, at 10 s (116 tokens) and 60 s (546). The engine gate passes 272/272, with jfk's encoder at max
+|d| 2.66e-5 against 2.75e-5 unfolded (summation order). The new ci test
+`test_mul_mat_2d_weight_against_batched_activation` pins one `MUL_MAT` whose `src1` is 2-D, plus exact
+values, and fails with the fold disabled.
+
+**The other models it touches.** A census over the card gate (all 71 published cards, released rc20
+wheel with this engine) found 13 models that reach the fold: f5-tts, granite-speech, moonshine
+(3 cards), oruk, qwen3-asr, supertonic-2, vaniq-edge, miro, voxcpm2, voxtral-4b-tts and Zipformer.
+**All 71 cards pass.** The census shapes alone at two threads (`ggml_graph_compute`, fold off against on):
+1.3-5x where each batch has few columns (granite's `[1024, 3, 40]` 1.38-2.77x, voxcpm2's 1.95-2.18x,
+voxtral's 1.33-1.39x, oruk/qwen3-asr's 1.36x), and 0.95-1.07x where each batch already has many
+(f5's `[64, 1135, 16]`, moonshine's `[32, 457, 8]`, supertonic, miro). Whole-card wall times are
+dominated by loading and did not resolve a difference.

@@ -267,6 +267,21 @@ Outputs op_mul_mat(PrimitiveContext& pc, const Inputs& in, const Json&) {
                            std::to_string(b->ne[1]) + "," + std::to_string(b->ne[2]) + "," +
                            std::to_string(b->ne[3]) + "]");
     }
+
+    // A 2-D `a` against a batched `b` is ONE matrix product, so it is handed to ggml as one (P4.49).
+    // ggml broadcasts `a` over b's batch axes and multiplies batch by batch, which is right and, when
+    // each batch is a single column, slow: Zipformer's linears reach here as `[C, 1, T]`, and the CPU
+    // backend ran T matrix-vector products (`llamafile_sgemm` refuses n < 2) at ~27 GFLOP/s against
+    // 50-70 for the same weights as a 2-D GEMM -- 1.74 s of a 60 s encoder, where PyTorch's `addmm`
+    // takes 0.73. Metal and Vulkan pick their mat-vec kernels for the same reason. `b` is contiguous by
+    // now, so folding its batch axes into columns is a view, and so is putting them back. Measured on
+    // Zipformer's 60 s encoder: CPU 1.10x (dev box) / 1.15x (M1), Metal 1.38x, Vulkan 2.51x. Thirteen
+    // published models reach this branch; their shapes alone run 0.95-1.07x where each batch already
+    // has many columns and 1.3-5x where it has few, and all 71 cards pass. Epic-05 P4.49.
+    if (a->ne[2] == 1 && a->ne[3] == 1 && b->ne[2] * b->ne[3] > 1) {
+        ggml_tensor* b_2d = ggml_reshape_2d(pc.ctx, b, b->ne[0], b->ne[1] * b->ne[2] * b->ne[3]);
+        return {ggml_reshape_4d(pc.ctx, ggml_mul_mat(pc.ctx, a, b_2d), a->ne[1], b->ne[1], b->ne[2], b->ne[3])};
+    }
     return {ggml_mul_mat(pc.ctx, a, b)};
 }
 
