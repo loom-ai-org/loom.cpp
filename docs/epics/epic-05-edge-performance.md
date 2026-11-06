@@ -4463,3 +4463,41 @@ the dw_striding stem's 145 ms of `IM2COL` and 107 ms of per-channel products bec
 `CONV_2D_DW` (profiled). That is a few percent of a transcription, below what whole-model timing
 resolves on this box. qwen3-asr's convolutions run batched (N > 1), so its graph is node for node
 unchanged.
+
+#### P4.51 — DONE 2026-11-06: a product over K < 8 is K outer products
+
+`op_mul_mat` runs an F32 product whose K is under 8 as `ggml_out_prod` of the two transposed operands,
+when the graph runs on host memory (CPU, BLAS, vc4). ggml's GEMMs compute each output as a K-long dot
+product, and tinyBLAS refuses K < 8 on AVX2, so Zipformer's relative-position scores (K =
+`pos_head_dim` = 4, a [2T-1, T] matrix per head) ran one 4-long `vec_dot` per output. `ggml_out_prod`
+writes each output row as K contiguous AXPYs instead.
+
+Op alone, two threads, Zipformer's shapes: today / zero-padded to K = 8 for tinyBLAS / outer products,
+304 / 171 / 80 ms on the largest (5991 x 2996 x 4 heads), 3.7-5.4x across the five. Over K at three
+column counts the outer products won at every K below 8 (1.5-17x), still won at 8-16 on this box
+(1.2-3.4x, where tinyBLAS takes the product on other ISAs) and lost at 32 (0.65-0.80x), so the line is
+drawn at 8. The padded form was the alternative named when this was scoped, and needs no export change
+either; it is half the gain.
+
+**Not on a GPU.** Vulkan has an F32 `OUT_PROD`, and Zipformer's 60 s encoder was slower with it (3.75 ->
+3.91 s on the Vega 3). Metal has none. Both keep the `MUL_MAT`; Metal's small-K products are P4.52's.
+
+Zipformer encoder, F32, P4.51 off against on (P4.49 and P4.50 in both):
+
+| | 10 s | 60 s |
+|---|---|---|
+| dev box CPU, 2 threads | 0.583 → 0.563 s (1.04x) | 5.69 → 4.81 s (1.18x) |
+| M1 Pro CPU | 0.0828 → 0.0809 s (1.02x) | 0.668 → 0.615 s (1.09x) |
+
+**Correctness.** Tokens identical to the reference on every device at 10 s and 60 s. The new ci test
+`test_mul_mat_small_k_as_outer_products` checks shape, broadcast (per-head batches and a 2-D `a` against
+a batched `b`) and exact values, one `OUT_PROD` and no `MUL_MAT`, and that K = 8 stays a `MUL_MAT`; it
+fails 3 checks with the change disabled. The engine gate passes 272/272 (jfk encoder max |d| 2.97e-5). `test_f32_matmul_requests_f32_precision` counts the `OUT_PROD`
+its fixture now builds as the F32 product, since Vulkan's shader and CUDA's cuBLAS path for it are F32
+throughout.
+
+**The other models it touches.** 36 of the 71 published cards build at least one such product, and
+**all 71 pass**. Outside Zipformer, almost all are attention against a KV cache that still holds fewer
+than 8 positions in the first decode steps (audio8-tts-realistic built 10,328 over its card run,
+qwen3-tts 6,984, moss-tts-local 3,388, musicgen 384), plus `K = 1` broadcasts. These are small
+products, and the card timings do not resolve a change in them.

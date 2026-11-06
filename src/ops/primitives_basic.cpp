@@ -1,6 +1,8 @@
 #include "loom/ops/primitive_registry.h"
 #include "loom/loom_errors.h"
 
+#include <ggml-backend.h>
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -252,6 +254,25 @@ Outputs op_mul_mat(PrimitiveContext& pc, const Inputs& in, const Json&) {
         if (a->ne[0] != b->ne[0] && a->ne[0] == b->ne[1]) {
             b = ggml_transpose(pc.ctx, b);
         }
+    }
+
+    // A product over K < 8 is run as the sum of K outer products (P4.51). ggml's GEMMs compute each
+    // output as a dot product over K and tinyBLAS refuses K < 8 on AVX2, so Zipformer's relative-position
+    // scores (K = pos_head_dim = 4, a [T, 2T-1] matrix per head) took the generic path, one 4-long
+    // `vec_dot` per output: 1.2 s of a 60 s encoder at 1.5 GFLOP/s. `ggml_out_prod` writes each output row
+    // as K contiguous axpys instead. Op alone, two threads, Zipformer's largest shape: 304 ms today, 171
+    // padded to K = 8 for tinyBLAS, 80 as outer products. Below K = 8 it won at every shape measured
+    // (1.5-17x); at K = 32 it loses. Taken before the contiguity copy below because the transposes
+    // copy `b` anyway. F32 only, and only where the graph runs on host memory (CPU, BLAS, vc4): Vulkan
+    // has an OUT_PROD and was slower with it (Zipformer's 60 s encoder 3.75 -> 3.91 s on a Vega 3),
+    // and Metal has none.
+    const bool host_primary = pc.backends.primary == nullptr ||
+        ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(pc.backends.primary));
+    if (host_primary && a->ne[0] < 8 && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+        can_mul_mat(a, b)) {
+        ggml_tensor* y = ggml_out_prod(pc.ctx, ggml_cont(pc.ctx, ggml_transpose(pc.ctx, a)),
+                                       ggml_cont(pc.ctx, ggml_transpose(pc.ctx, b)));     // [M, N, b2, b3]
+        if (backend_can_run(pc, y)) return {y};
     }
 
     // Ensure the input tensor b is contiguous in memory for ggml_mul_mat execution. NOT a guess, and so

@@ -193,7 +193,10 @@ void test_reserve_does_not_break_subsequent_builds(loom::GgufModel& model, ggml_
 // request_f32_precision): without it Vulkan and Metal stage both operands in half precision, and a
 // value past 65504 comes back inf -- SenseVoice's mel projection was 99.5% NaN on both. The CPU ignores the
 // flag, so this checks the tag itself rather than any output. A weight exported at F16 keeps the default:
-// that precision was the export's choice, not the backend's.
+// that precision was the export's choice, not the backend's. This fixture's embedding is narrower than
+// 8, so its F32 product is built as an OUT_PROD (P4.51), which has no precision flag to set: Vulkan's
+// out_prod shader and CUDA's cuBLAS path are F32 throughout, and Metal has no OUT_PROD and keeps the
+// tagged MUL_MAT. That node is counted as the F32 product.
 void test_f32_matmul_requests_f32_precision(loom::GgufModel& model, ggml_backend_t backend) {
     const char* json = R"JSON({
       "version": 1,
@@ -212,6 +215,10 @@ void test_f32_matmul_requests_f32_precision(loom::GgufModel& model, ggml_backend
     int n_f32 = 0, n_f16 = 0;
     for (int i = 0; i < ggml_graph_n_nodes(result.graph); ++i) {
         const ggml_tensor* node = ggml_graph_node(result.graph, i);
+        if (node->op == GGML_OP_OUT_PROD && node->src[0]->type == GGML_TYPE_F32) {
+            ++n_f32;
+            continue;
+        }
         if (node->op != GGML_OP_MUL_MAT) continue;
         const int32_t prec = node->op_params[0];
         if (node->src[0]->type == GGML_TYPE_F32) {
