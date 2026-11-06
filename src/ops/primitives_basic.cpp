@@ -9,6 +9,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace loom {
@@ -590,6 +591,36 @@ void pow_custom_op(ggml_tensor* dst, const ggml_tensor* a, const ggml_tensor* b,
 Outputs op_pow(PrimitiveContext& pc, const Inputs& in, const Json&) {
     // pow(base=in[0], exponent=in[1])
     expect_n_inputs("POW", in, 2);
+    // A constant exponent this common is spelled in ggml's own ops (P4.52). The custom op below exists
+    // only on the CPU, so on a device every POW is a fallback node and a split: Zipformer's BiasNorm is
+    // `x ** -0.5` against one constant, 13 of them in its encoder, which cut the Metal graph into 27
+    // splits. The exponent is read at build time when it is a one-element weight; anything else -- a
+    // computed exponent, a value not listed -- keeps the custom op. `-0.5` is `1 / sqrt(x)` with the 1
+    // made from the sqrt itself, so it is two roundings against std::pow's one, and it differs from
+    // std::pow only at x = +inf (NaN against 0).
+    //
+    // NOT ON VULKAN, for now (P4.54). Without the fallbacks Zipformer's encoder reaches ggml-vulkan as
+    // one 2657-node graph instead of 27 splits, and after it has run once every later small graph in the
+    // process is ~45% slower on a Radeon Vega 3 -- the decoder's 546 calls 1.23 -> 1.79 s, the same
+    // after a 10 s or a 60 s encoder and after a 10 s pause; not allocation (identical), not the
+    // build-time read of the exponent, not fusion, descriptor reuse, graph optimize, async or
+    // nodes-per-submit. The encoder itself does not change, so Vulkan keeps the custom op until that is
+    // understood: Zipformer's full 60 s transcription went 8.9 -> 9.8 s with the lowering.
+    ggml_backend_dev_t primary_dev = pc.backends.primary != nullptr ? ggml_backend_get_device(pc.backends.primary)
+                                                                    : nullptr;
+    const bool vulkan_primary = primary_dev != nullptr &&
+        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(primary_dev)), "Vulkan") == 0;
+    if (!vulkan_primary && ggml_nelements(in[1]) == 1 && in[0]->type == GGML_TYPE_F32) {
+        const float e = scalar_value_or(in[1], std::nanf(""));
+        if (e == 1.0f) return {in[0]};
+        ggml_tensor* x = ensure_packed(pc.ctx, in[0]);
+        if (e == 2.0f) return {ggml_sqr(pc.ctx, x)};
+        if (e == 0.5f) return {ggml_sqrt(pc.ctx, x)};
+        if (e == -0.5f || e == -1.0f) {
+            ggml_tensor* d = e == -0.5f ? ggml_sqrt(pc.ctx, x) : x;
+            return {ggml_div(pc.ctx, ggml_scale_bias(pc.ctx, d, 0.0f, 1.0f), d)};
+        }
+    }
     return {ggml_map_custom2(pc.ctx, ensure_packed(pc.ctx, in[0]), ensure_packed(pc.ctx, in[1]), pow_custom_op, GGML_N_TASKS_MAX, nullptr)};
 }
 

@@ -2154,6 +2154,27 @@ its 44 convolutions on the QPUs, 13.43 s; with it all 44, 6.09 s; de051, wake an
 On a GPU primary nothing moves (RADV, Vega 3: device-parity gates, 2 069 nodes on the device, 0
 fallback, before and after).
 
+## PR 53 — `metal`: an F32 x F32 product takes `mul_mm` at any K
+
+*(`cmake/patches/ggml-0057-metal-f32-mul-mm-any-k.patch`; reads with PR 24's float tiles)*
+
+**Problem.** `ggml_metal_op_mul_mat_use_mm` admits the matrix-matrix kernel only at `ne00 >= 64`, so
+an F32 product over a short K (attention at a 32-wide head, a relative-position score at K = 4) runs
+on the mat-vec kernel however many columns it has. On an M1 Pro that is 93.0 ms for a K = 32,
+3000 x 3000 x 4-head `QK^T` that `mul_mm` does in 1.18.
+
+**Change.** `(ne00 >= 64 || (src0 F32 && src1 F32))`. Every other condition stays, `ne11 > 8` among
+them. A K that is not a multiple of the kernel's 32 already takes its bounds-checked input load
+(`bc_inp`), so no kernel changes.
+
+**Measured** (M1 Pro, F32 x F32 under `GGML_PREC_F32`, min of 20): `mul_mm` against `mul_mv` is
+1.3x (16 columns) to 79x (3000) faster at K = 8 to 48, 2.6x at K = 4 on a 5991 x 2996 x 4 product,
+and level at K = 4 with 16 columns.
+768 cases (K 1-64, odd and even, 1-300 rows, 9-300 columns, broadcast batches) agree with a double
+reference to 2.8e-7 relative. Zipformer's 60 s encoder on Metal goes 0.916 -> 0.619 s, with tokens
+identical. The rule was not tried on F16 or quantized weights, nor on a GPU with the tensor API, which
+PR 24 already sends to mat-vec for F32 x F32.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the

@@ -258,6 +258,36 @@ Outputs conv_1d_grouped(PrimitiveContext& pc, ggml_tensor* kernel, ggml_tensor* 
     }
     const int64_t oc_per_group = oc / groups;
 
+    // A SMALL GROUPED CONVOLUTION IS ONE BATCHED PRODUCT (P4.52): one im2col over every channel, whose
+    // rows are already grouped (a row is `ic * K + k`), viewed as G batches of [IC/G * K] and multiplied
+    // against the kernel viewed the same way. The per-group loop below is ~7 nodes a group. Zipformer's
+    // prediction network is a K = 2 convolution at groups = 128 run once per decoded symbol, so that was
+    // 918 nodes a call: 1.97 ms on Metal and 0.70 ms on the CPU, 546 times in a 60 s clip. Bounded by the
+    // im2col's size because the loop's per-group direct convolutions never materialise one, and a
+    // large grouped convolution (wav2vec2's positional conv, K = 128 over 768 channels at groups = 16:
+    // ~200 MB of im2col at 500 frames) is better off without. F32 or F16, unfolded, unpacked.
+    const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
+    const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
+    const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
+    const int64_t K = kernel->ne[0], N = data->ne[2];
+    const int64_t OL = (data->ne[0] + 2 * p0 - d0 * (K - 1) - 1) / s0 + 1;
+    if (!folded && !conv_kernel_is_packed(kernel) &&
+        (kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16) && data->type == GGML_TYPE_F32 &&
+        data->ne[3] == 1 && ic * K * OL * N <= (int64_t{1} << 20)) {
+        // The kernel as im2col's shape carrier: [K, IC, OC/G] has exactly its element count.
+        ggml_tensor* carrier = ggml_reshape_3d(pc.ctx, kernel, K, ic, oc_per_group);
+        ggml_tensor* im2col = ggml_im2col(pc.ctx, carrier, data, s0, 0, p0, 0, d0, 0, /*is_2D=*/false,
+                                          conv_im2col_type(kernel));                          // [IC*K, OL, N]
+        GGML_ASSERT(im2col->ne[1] == OL);
+        ggml_tensor* cols = ggml_cont(pc.ctx, ggml_permute(pc.ctx,
+            ggml_reshape_3d(pc.ctx, im2col, ic_per_group * K, groups, OL * N), 0, 2, 1, 3));  // [IC/G*K, OL*N, G]
+        ggml_tensor* kernel_g = ggml_reshape_3d(pc.ctx, kernel, K * ic_per_group, oc_per_group, groups); // [IC/G*K, OC/G, G]
+        ggml_tensor* r = ggml_mul_mat(pc.ctx, cols, kernel_g);                                // [OL*N, OC/G, G]
+        if (N == 1) return {ggml_reshape_3d(pc.ctx, r, OL, oc, 1)};                           // [OL, OC, 1]
+        r = ggml_reshape_4d(pc.ctx, r, OL, N, oc_per_group, groups);
+        return {ggml_reshape_3d(pc.ctx, ggml_cont(pc.ctx, ggml_permute(pc.ctx, r, 0, 3, 1, 2)), OL, oc, N)};
+    }
+
     // `attrs` minus `groups`, so the per-group call takes the dense path rather than recursing here
     // forever. Everything else -- s0/p0/d0 and any fold declaration -- is per-group unchanged.
     Json group_attrs = attrs;
