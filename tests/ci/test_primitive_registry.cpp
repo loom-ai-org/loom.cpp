@@ -799,6 +799,99 @@ void test_conv_1d_grouped_permuted_input() {
     run_grouped_conv_1d(/*permuted=*/true);
 }
 
+// P4.52: a small grouped convolution is one im2col and one MUL_MAT batched over the groups; one whose
+// im2col would pass 1M elements keeps the per-group loop (CONCAT). Both against a double reference, at
+// one batch and two, strided, padded and dilated.
+void test_conv_1d_grouped_batched_against_reference() {
+    struct Case { int64_t IL, IC, OC, G, K, N; int s, p, d; bool batched; };
+    const Case cases[] = {
+        {2, 16, 16, 4, 2, 1, 1, 0, 1, true},      // Zipformer's decoder conv, scaled down
+        {11, 12, 6, 3, 3, 2, 2, 1, 1, true},      // two batches, strided, padded
+        {13, 8, 16, 2, 3, 1, 1, 2, 2, true},      // dilated, OC/G > IC/G
+        {200, 64, 64, 4, 128, 1, 1, 64, 1, false},  // 64 * 128 * 201 > 1M: the loop
+    };
+    for (const Case& c : cases) {
+        GgmlScratch s(64 * 1024 * 1024);
+        const int64_t ICG = c.IC / c.G, OCG = c.OC / c.G;
+        ggml_tensor* kernel = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, c.K, ICG, c.OC);
+        ggml_set_input(kernel);
+        ggml_tensor* data = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, c.IL, c.IC, c.N);
+        ggml_set_input(data);
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        nlohmann::json attrs = {{"s0", c.s}, {"p0", c.p}, {"d0", c.d}, {"groups", c.G}};
+        ggml_tensor* out = op("CONV_1D")(pc, {kernel, data}, attrs)[0];
+        const int64_t OL = (c.IL + 2 * c.p - c.d * (c.K - 1) - 1) / c.s + 1;
+        LOOM_CHECK(out->ne[0] == OL && out->ne[1] == c.OC && out->ne[2] == c.N);
+
+        ggml_cgraph* gf = s.expand(out);
+        int n_mul_mat = 0, n_concat = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            n_mul_mat += ggml_graph_node(gf, i)->op == GGML_OP_MUL_MAT;
+            n_concat += ggml_graph_node(gf, i)->op == GGML_OP_CONCAT;
+        }
+        LOOM_CHECK(c.batched ? (n_mul_mat == 1 && n_concat == 0) : n_concat == c.G - 1);
+
+        std::vector<float> wk(static_cast<size_t>(ggml_nelements(kernel))), wx(static_cast<size_t>(ggml_nelements(data)));
+        for (size_t i = 0; i < wk.size(); ++i) wk[i] = conv_input(static_cast<int64_t>(i), 3);
+        for (size_t i = 0; i < wx.size(); ++i) wx[i] = conv_input(static_cast<int64_t>(i), 5);
+        set_f32(kernel, wk);
+        set_f32(data, wx);
+        s.compute(gf);
+        const std::vector<float> got = get_f32(out);
+        double worst = 0;
+        for (int64_t n = 0; n < c.N; ++n)
+            for (int64_t oc = 0; oc < c.OC; ++oc)
+                for (int64_t ol = 0; ol < OL; ++ol) {
+                    double acc = 0;
+                    const int64_t g = oc / OCG;
+                    for (int64_t icg = 0; icg < ICG; ++icg)
+                        for (int64_t k = 0; k < c.K; ++k) {
+                            const int64_t x = ol * c.s + k * c.d - c.p;
+                            if (x < 0 || x >= c.IL) continue;
+                            acc += static_cast<double>(wk[(oc * ICG + icg) * c.K + k]) * wx[(n * c.IC + g * ICG + icg) * c.IL + x];
+                        }
+                    worst = std::max(worst, std::fabs(got[(n * c.OC + oc) * OL + ol] - acc));
+                }
+        if (worst > 1e-4) std::fprintf(stderr, "grouped conv G=%lld K=%lld N=%lld: max |d| %.3g\n", (long long)c.G, (long long)c.K, (long long)c.N, worst);
+        LOOM_CHECK(worst <= 1e-4);
+    }
+}
+
+// P4.52: POW with a one-element constant exponent of 2, 0.5, -0.5 or -1 is built from ggml's own ops,
+// so a device runs it; any other exponent keeps the CPU custom op. The exponent has to be a weight --
+// allocated before the graph is built -- for its value to be read at build time.
+void test_pow_constant_exponent_is_native() {
+    for (const float e : {2.0f, 0.5f, -0.5f, -1.0f, 3.0f}) {
+        GgmlScratch s;
+        ggml_context_ptr wctx(ggml_init(ggml_init_params{ggml_tensor_overhead() * 2, nullptr, /*no_alloc=*/true}));
+        ggml_tensor* exponent = ggml_new_tensor_1d(wctx.get(), GGML_TYPE_F32, 1);
+        ggml_backend_buffer_ptr wbuf(ggml_backend_alloc_ctx_tensors(wctx.get(), s.backend));
+        set_f32(exponent, {e});
+
+        ggml_tensor* x = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 5, 3);
+        ggml_set_input(x);
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        ggml_tensor* out = op("POW")(pc, {x, exponent}, {})[0];
+        LOOM_CHECK(out->ne[0] == 5 && out->ne[1] == 3);
+        ggml_cgraph* gf = s.expand(out);
+        int n_custom = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) n_custom += ggml_graph_node(gf, i)->op == GGML_OP_MAP_CUSTOM2;
+        LOOM_CHECK(n_custom == (e == 3.0f ? 1 : 0));
+
+        std::vector<float> wx(15);
+        for (size_t i = 0; i < wx.size(); ++i) wx[i] = 0.03f + 0.7f * static_cast<float>(i);
+        set_f32(x, wx);
+        s.compute(gf);
+        const std::vector<float> got = get_f32(out);
+        for (size_t i = 0; i < wx.size(); ++i) {
+            const float want = std::pow(wx[i], e);
+            LOOM_CHECK(std::fabs(got[i] - want) <= 2e-7f * std::fabs(want));
+        }
+    }
+}
+
 // A grouped kernel reaching the DEPTHWISE op must say so rather than abort inside ggml_im2col, whose
 // own assert names neither the op nor the channel count. This is the other half of Retro-046: the
 // exporter decides depthwise on the kernel's shape now, and this is what catches a file that predates
@@ -3012,6 +3105,8 @@ int main() {
     test_conv_1d_dw();
     test_conv_1d_grouped();
     test_conv_1d_grouped_permuted_input();
+    test_conv_1d_grouped_batched_against_reference();
+    test_pow_constant_exponent_is_native();
     test_conv_1d_dw_rejects_a_grouped_kernel();
     test_depthwise_conv_transpose_1d_via_composition();
     test_reshape_permute_cont();

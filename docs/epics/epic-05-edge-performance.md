@@ -4501,3 +4501,71 @@ throughout.
 than 8 positions in the first decode steps (audio8-tts-realistic built 10,328 over its card run,
 qwen3-tts 6,984, moss-tts-local 3,388, musicgen 384), plus `K = 1` broadcasts. These are small
 products, and the card timings do not resolve a change in them.
+
+#### P4.52 — DONE 2026-11-06: Metal's three on Zipformer
+
+Three changes, one per cause found in the Metal profile. The first two are engine changes: the
+grouped convolution on every backend, the `POW` lowering on every backend but Vulkan. The third is a
+ggml patch for Metal only.
+
+**`POW` against a constant exponent is ggml's own ops.** `op_pow` was a CPU custom op, so on any
+device each `POW` was a fallback node and a split. Zipformer's BiasNorm is `x ** -0.5`, 13 of them in
+the encoder, which cut the Metal graph into 27 splits. When the exponent is a one-element weight, it
+is read at build time. The values 1, 2, 0.5, -0.5 and -1 become identity, `SQR`, `SQRT` and a `DIV`
+of a ones tensor built from the operand itself. Anything else keeps the custom op. `-0.5` rounds
+twice, against `std::pow`'s once, and the two differ only at `+inf`. Across the 71 published cards,
+only Zipformer has a constant-exponent `POW`.
+
+**Not on Vulkan, for now (P4.54).** On the dev box's Radeon Vega 3 the lowering made Zipformer's full
+60 s transcription slower, 8.9 → 9.8 s, and POW is not why. Without the fallbacks the encoder reaches
+ggml-vulkan as one 2657-node graph instead of 27 splits. After that has run once, every later small
+graph in the process is about 45% slower: the decoder's 546 calls go 1.23 → 1.79 s. It is the same
+after a 10 s or a 60 s encoder, and after a 10 s pause. Ruled out: allocations (identical in both
+arms), the build-time read of the exponent, and ggml-vulkan's fusion, descriptor reuse, graph
+optimize, async and nodes-per-submit switches. GPU kernel time per decoder call rose 2.32 → 2.59 ms,
+so most of the loss is on the host. The encoder itself does not change on Vulkan, so a Vulkan primary
+keeps the custom op until P4.54 explains this.
+
+**A small grouped `CONV_1D` is one batched product.** `conv_1d_grouped` sliced the groups, about
+7 nodes per group. Zipformer's prediction network is a K = 2 convolution with groups = 128, run once
+per emitted symbol, so each decoder call was 918 nodes: 1.97 ms on Metal and 0.70 ms on the CPU,
+546 times in a 60 s clip. The rows of one im2col over every channel are already grouped, so it is
+viewed as G batches and multiplied against the kernel viewed the same way, in one `MUL_MAT`. This is
+bounded at 1M im2col elements, because the loop's per-group direct convolutions never materialise
+one. wav2vec2's positional convolution (K = 128 over 768 channels, groups = 16) would need ~200 MB at
+500 frames, so it keeps the loop. Five published cards have a grouped `CONV_1D`: zipformer-small,
+data2vec-audio-base-960h, hubert-large-ls960-ft, f5-tts-v1-base and fun-cosyvoice3-0.5b.
+
+**Metal's `mul_mm` at any K for F32 x F32** (ggml-0057, UPSTREAM PR 53).
+`ggml_metal_op_mul_mat_use_mm` admitted the matrix-matrix kernel only at `ne00 >= 64`. Zipformer's
+`QK^T` at head dim 32 therefore ran on mat-vec, at about 20x the CPU's time. M1 Pro, `mul_mm` against `mul_mv`:
+
+- K = 32 at 3000 x 3000 x 4 heads: 1.18 ms against 93.0 ms.
+- K = 4 at 5991 x 2996 x 4: 2.6x faster.
+- K = 8 to 48: 1.3x (16 columns) to 79x faster.
+- K = 4 with 16 columns: a tie.
+
+A ragged K already takes the kernel's bounds-checked load. 768 cases agree with a double reference
+to 2.8e-7 relative. The patch is restricted to F32 x F32 because it was not measured on F16 or
+quantized weights. Measured alone, Zipformer's 60 s encoder on Metal went 0.916 → 0.619 s.
+
+Full transcription (encoder + decode), F32, POW and the grouped conv off against on (P4.49-P4.51 in
+both):
+
+| | 10 s | 60 s |
+|---|---|---|
+| M1 Pro Metal | 0.433 → 0.234 s (1.85x) | 2.655 → 1.755 s (1.51x) |
+| M1 Pro CPU | 0.286 → 0.220 s (1.30x) | 1.70 → 1.42 s (1.20x) |
+| dev box CPU, 2 threads | 1.039 → 0.964 s (1.08x) | 7.56 → 7.25 s (1.04x) |
+| dev box Vulkan, Radeon Vega 3 (grouped conv only) | 1.49 → 1.24 s (1.21x) | 9.31 → 8.24 s (1.13x) |
+
+With all three, Metal's 60 s encoder takes 0.600 s, and its full transcription 1.434 s against the
+M1 CPU's 1.433. **Metal is no longer slower than the CPU it shares the chip with.** It is not faster
+either: the decode loop is a GEMV per frame, which P4.53 addresses.
+
+**Correctness.** Tokens are identical to the reference on every device at 10 s and 60 s.
+The engine gate passes 272/272. Two new ci tests check graph shape and values against a double reference.
+`test_conv_1d_grouped_batched_against_reference` covers 4 cases; the last one is past the bound and
+keeps the loop. It fails 3 checks with the change disabled. `test_pow_constant_exponent_is_native`
+checks that no custom op remains. It fails 4 checks with the change disabled.
+**All five cards with a grouped `CONV_1D` pass.**
