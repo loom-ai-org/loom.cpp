@@ -1746,6 +1746,62 @@ The engine gate `test_e2e_nemotron_asr_mil_export` checks all three prompt cases
 (6/6). The card gate passes on the released rc16 wheel (WER 0.00 on JFK). On the 4-core dev box, 11 s
 of speech takes 4.8 s and 120 s takes 82 s, with a 4.0 GB peak.
 
+### Family 1's stateless transducer: Zipformer small
+
+`pkufool/zipformer-small` (Apache-2.0, published 2026-11-05 as `zipformer-small-loom` on rc20): icefall's
+`egs/librispeech/ASR/zipformer`, the paper's model, as a package without `k2`. `Yanguan619/zipformer` is an
+identical fork of it. `qualcomm/Zipformer` is not this model: it is the older
+`pruned_transducer_stateless7_streaming` (5 stacks) from another checkpoint. Non-streaming, transducer
+head. Loaded from a pinned clone, `LOOM_ZIPFORMER_REPO`, with its training-only imports stubbed. Comparing it
+with icefall by AST found no change to the inference maths in the functions read: `k2` removed, renames and
+trace guards.
+
+**No engine change, and not the transducer template.** `transducer_export.py` is built around an `nn.LSTM`;
+this prediction network is an embedding and a grouped convolution over the last two labels. So three phases
+(`encoder`, `decoder`, `joint`) and one loop in `zipformer_driver/`, at most one symbol per frame. The
+checkpoint ships no configuration, so `_read_architecture` reads it off the weights.
+
+**The encoder's modules run as they are, and five things around them do not**, all exact and all so that
+the length stays symbolic: a kaldi fbank with `snip_edges=False` (a reflection of two constant widths),
+`CompactRelPositionalEncoding` computed rather than cached, `SimpleDownsample` as a depthwise strided
+convolution over a maximum pad, `SimpleUpsample` plus its trim as a lookup of `floor(t / ds)`, and the
+relative shift spelled as NeMo's `rel_shift`, because the reference's `gather_along_axis` has no engine op.
+
+**It found two exporter bugs that nothing had exercised** ([Retro-103](../retros/retro-103-an-argument-the-lowering-did-not-read.md)):
+a 2-D convolution's stride, padding and dilation were written in torch's axis order, and `log1p` lost its
+`+ 1`. The first touches no published file: none of the 70 models then on the Hub has an asymmetric 2-D
+convolution. For the second, reading the reference code available locally found `log1p` only on paths these
+exports do not run; that reading does not cover every tree.
+
+**Verified** against the reference's `AsrModel` + `greedy_search` on the released rc20 wheel:
+
+| | F32 | Q8_0 |
+|---|---|---|
+| size | 140 MB | 58 MB |
+| tokens, 73 LibriSpeech-dummy clips | 73/73 | 63/73 |
+| WER, same clips (reference 7.22%) | 7.22% | 7.39% |
+| tokens, en / zh / jfk samples | 181/181, 29/29, 26/26 | 181/181, 29/29, 26/26 |
+| encoder output (absmax about 4.5) | at most 2.8e-5 | 0.16 |
+| speed, 4 threads on the dev box | 7.05x real time, 0.97 GB | 7.16x, 0.90 GB |
+
+The encoder stays within 1e-5 of the wrapper at 15 lengths from 1500 samples to 16.7 s. Upstream's 3.78% is
+LibriSpeech test-clean, a different set. The engine gate `test_e2e_zipformer_mil_export` checks the encoder
+tensor, tokens and text on three clips; run on Q8_0 it fails on the tensor, so it can fail. Cost grows faster
+than the clip, since the first stack attends over every 20 ms frame: 120 s takes 25 s and 3.4 GB at either
+precision.
+
+**On the GPUs, rc20, same 73 clips.** F32 is token-identical to the reference on every backend. Q8_0's numerics
+move a little per backend, and the Apple backends differ on one clip's tokens but not in WER. **Metal is
+slower than the CPU on the M1 Pro**, as for Audio8's Q8_0 (P4.48). CUDA has not run this model: the
+workstation's GPU is on a training job.
+
+| | F32 tokens | F32 speed | Q8_0 tokens | Q8_0 WER | Q8_0 speed |
+|---|---|---|---|---|---|
+| x86 CPU, 4 threads | 73/73 | 7.05x | 63/73 | 7.39% | 7.16x |
+| Vulkan, Radeon Vega 3 (RADV) | 73/73 | 3.81x | 64/73 | 7.39% | 6.44x |
+| M1 Pro CPU, 8 threads | 73/73 | 27.1x | 65/73 | 7.30% | 33.0x |
+| Metal, M1 Pro | 73/73 | 13.3x | 65/73 | 7.30% | 16.8x |
+
 ### Family 1's CTC leaf at 10M: Citrinet-256 (LibriSpeech)
 
 `nvidia/stt_en_citrinet_256_ls` (CC-BY-4.0, 2026-10-10), requested for the Pi Zero after Moonshine tiny
