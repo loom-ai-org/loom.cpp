@@ -1,0 +1,19 @@
+diff --git a/src/ggml-metal/ggml-metal-common.cpp b/src/ggml-metal/ggml-metal-common.cpp
+--- a/src/ggml-metal/ggml-metal-common.cpp
++++ b/src/ggml-metal/ggml-metal-common.cpp
+@@ -36,9 +36,14 @@ bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgr
+     const int64_t ne00 = op->src[0]->ne[0];
+     const int64_t ne11 = op->src[1]->ne[1];
+ 
++    // loom (ggml-0057): an F32 x F32 product takes the matrix-matrix kernel at any K; below 64 it went to
++    // the mat-vec kernel. M1 Pro, F32 x F32 under GGML_PREC_F32 (ggml-0024's float tiles), mul_mm against
++    // mul_mv: K = 32 at 3000 x 3000 x 4 heads 1.18 vs 93.0 ms, K = 4 at 5991 x 2996 x 4 3.16 vs 8.19 ms,
++    // K = 8..48 1.3-79x, a tie at K = 4 and 16 columns. A K that is not a multiple of 32 takes the
++    // kernel's bounds-checked load (bc_inp); every output checksum agreed.
+     return !ggml_is_transposed(op->src[0]) &&
+            !ggml_is_transposed(op->src[1]) &&
+-           has_simdgroup_mm && ne00 >= 64 && ne11 > 8;
++           has_simdgroup_mm && (ne00 >= 64 || (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32)) && ne11 > 8;
+ }
+ 
+ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {

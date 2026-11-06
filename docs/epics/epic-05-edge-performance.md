@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-10-24
+last_updated: 2026-11-06
 ---
 
 # Epic-05: Edge CPU Performance
@@ -4311,3 +4311,382 @@ peak gives ~9.3 ms), so the F32 GEMM is not what closes the gap. In order of siz
    converting element by element.
 
 Fusion is already worth 1.8 ms (`GGML_CPU_DISABLE_FUSION=1`: 11.1 -> 12.9).
+
+
+### P4.49-P4.53 — Zipformer's encoder is slower than PyTorch's — SCOPED 2026-11-05
+
+**Where it came from.** [Zipformer small](epic-03-model-coverage.md#family-1s-stateless-transducer-zipformer-small)
+is published at 7.05x real time on the dev box, and Metal on the M1 Pro is slower than the M1's CPU.
+Both read as fine until PyTorch eager ran the same 73 clips the same way (fbank, encoder and greedy
+search per clip, load excluded): **7.76x against loom's 7.75x**, and at 120 s PyTorch is ahead (20.8 s
+against 24.1). Timing the phases apart shows that tie is two errors cancelling. Encoder and decode loop
+timed separately, F32, min of three after a warm-up; loom through a copy of the GGUF whose driver adds
+an `encoder_only` entry point:
+
+| | encoder, torch | encoder, loom | decode, torch | decode, loom |
+|---|---|---|---|---|
+| dev box, 2 threads, 10 s | 0.47 s | 0.76 s | 0.67 s | 0.43 s |
+| dev box, 2 threads, 60 s | 3.84 s | **6.57 s** | 4.00 s | 2.96 s |
+| M1 Pro CPU, 8 threads, 10 s | 0.35 s | 0.16 s | 0.65 s | 0.21 s |
+| M1 Pro CPU, 8 threads, 60 s | 1.16 s | 1.09 s | 3.21 s | 1.12 s |
+| M1 Pro Metal, 60 s | | 1.62 s | | 1.75 s |
+
+**The encoder is 1.6-1.7x slower than PyTorch's on x86 at every length**, and the decode loop (a Lua
+loop against PyTorch's Python one) is what hides it. The default of two threads (the physical cores)
+beats four for both engines on this 2C/4T part. On the M1, where the CPU device is BLAS + Accelerate,
+loom is 2.7x ahead of PyTorch at 10 s and 2.0x at 60 s.
+
+**It is not mainly attention.** The quadratic parts (relative-position scores, `QK^T`/`AV`, softmax,
+the relative shift's copies) are 10% of the encoder's profiled time at 10 s and 30% at 60 s, so they are
+why the gap widens with length. They are not why it exists. Per encoder call at 60 s, profiled at two
+threads (8.56 s profiled against 6.57 s unprofiled), with PyTorch's profiler on the same input:
+
+| what | loom | PyTorch |
+|---|---|---|
+| linears, reached as `[C, 1, T]` and run as T matrix-vector products | 1.74 s, ~27 GFLOP/s | 0.73 s (`addmm`) |
+| relative-position scores, `K = pos_head_dim = 4` | 1.20 s, 1.5 GFLOP/s | ~0.3 s |
+| the subsampling stem's 7x7 depthwise conv (im2col + per-channel matmul) and two 1x1 convs through im2col | 1.23 s | 0.37 s, all 30 convs |
+| Swoosh activations: ~7 elementwise passes each, several `n_tasks = 1` | ~2.5 s profiled | ~0.9 s |
+| softmax | 0.12 s | 0.20 s |
+
+**Metal adds four of its own** (60 s, `$LOOM_PROFILE`'s per-node sync subtracted, so ordering more
+than timing). `ggml-metal` takes its simdgroup `mul_mm` only when `ne00 >= 64`
+(`ggml-metal-common.cpp`), and Zipformer's query head is 32 wide, so `QK^T` runs on the mat-vec kernel:
+172 ms against 8.8 ms on the CPU, for two calls. The `[C, 1, T]` linears land on mat-vec too (2.1x the
+CPU). BiasNorm's `x ** -0.5` exports as `POW`, a CPU `MAP_CUSTOM2`, so 13 fallback nodes cut the
+encoder into 27 splits. And the prediction network's `CONV_1D` at `groups = 128` is G slices and a
+concat by design (`conv_1d_grouped`), which here is 918 nodes a call: 1.97 ms on Metal against 0.70 ms
+on the CPU, 546 times in a 60 s clip.
+
+**The decode loop's floor is the joint**: a 512 x 11661 projection per frame, 24 MB of F32 weights read
+1498 times at 60 s, about 0.47 ms a call on every device. PyTorch pays it too.
+
+**The queue, in the user's order (2026-11-05).** Each lowering change below is generic, so each can move
+the numbers of models other than Zipformer: census first, then the engine gates and the card gate on
+what the census finds.
+
+1. **P4.49 — a 2-D weight against a batched activation is one GEMM.** When `MUL_MAT`'s first operand is
+   2-D and the second is contiguous, fold the second's batch axes into its columns and reshape the
+   product back. Same products, but ggml's CPU path then takes tinyBLAS (`n = T`) instead of a
+   `vec_dot` per frame, and Metal takes `mul_mm`; the summation order changes, so sums move by ulps.
+   Worth up to ~1 s of the 6.57.
+2. **P4.50 — `CONV_2D_DW` gets P4.31's direct path**, `ggml_conv_2d_dw_direct` with im2col as the
+   fallback, and a 1x1, stride-1, unpadded `CONV_2D` becomes a plain matmul. Worth up to ~1 s.
+3. **P4.51 — the `K = 4` relative-position matmul.** tinyBLAS refuses `k < 8` (P4.31 met the same
+   refusal), so it falls to the generic kernel. Candidates: zero-pad `pos_head_dim` to 8 in the
+   export, or a ggml patch for small-K products. Measure both. Worth up to ~0.9 s.
+4. **P4.52 — Metal's three**: `POW` with a constant exponent lowered to native ops (`-0.5` is
+   `1 / sqrt`), grouped `CONV_1D` as one batched matmul over G instead of G slices, and `mul_mm` at
+   `ne00 = 32`. The grouped convolution is not Metal-only: the CPU pays the same 918 nodes.
+5. **P4.53 — a chunked joint.** Run the joint for a block of frames against one decoder output (a GEMM),
+   take the first non-blank, and resume after it. The emissions stay identical to the frame-by-frame
+   loop. A driver and exporter change.
+
+**Measured and not queued**: Swoosh as fewer passes (needs a fused op or a cheaper composition), the
+relative shift's `CONT`/`PAD` copies (0.6 s profiled at 60 s), and Vulkan, which is not profiled.
+
+#### P4.49 — DONE 2026-11-06: a 2-D weight against a batched activation is one GEMM
+
+`op_mul_mat` now folds `b`'s batch axes into its columns whenever `a` is 2-D and `b` has a batch, runs
+one `ggml_mul_mat`, and reshapes the product back. Both reshapes are views (`b` is made contiguous just
+above). This is a lowering choice rather than a ggml patch: ggml's broadcast is correct, it just picks
+its kernel per batch, and a batch of one column is a matrix-vector product on every backend.
+
+Zipformer encoder, F32, fold off against on, one process per arm, order alternated, min of three
+after a warm-up (`LOOM_N_THREADS=8` on the M1):
+
+| | 10 s | 60 s |
+|---|---|---|
+| dev box CPU, 2 threads | 0.746 → 0.630 s (1.18x) | 6.84 → 6.23 s (1.10x) |
+| M1 Pro CPU | 0.155 → 0.130 s (1.19x) | 1.095 → 0.956 s (1.15x) |
+| M1 Pro Metal | 0.198 → 0.125 s (1.59x) | 1.594 → 1.152 s (1.38x) |
+| dev box Vulkan, Radeon Vega 3 | 1.69 → 0.575 s (2.94x) | 11.25 → 4.48 s (2.51x) |
+
+The linears went from ~32 to ~58 GFLOP/s on the dev box, which is GEMM speed. End to end on the 73
+clips, the dev box went from 7.2-7.5x real time (the shipped wheel) to 8.1x. Vulkan at 60 s went from
+16.4 s to 9.6 s (3.6x → 6.3x real time). Its decode loop, ~5 s, is now the larger half.
+
+**Correctness.** Tokens are identical to the unfolded reference on every device: CPU, M1 CPU, Metal and
+Vulkan, at 10 s (116 tokens) and 60 s (546). The engine gate passes 272/272, with jfk's encoder at max
+|d| 2.66e-5 against 2.75e-5 unfolded (summation order). The new ci test
+`test_mul_mat_2d_weight_against_batched_activation` pins one `MUL_MAT` whose `src1` is 2-D, plus exact
+values, and fails with the fold disabled.
+
+**The other models it touches.** A census over the card gate (all 71 published cards, released rc20
+wheel with this engine) found 13 models that reach the fold: f5-tts, granite-speech, moonshine
+(3 cards), oruk, qwen3-asr, supertonic-2, vaniq-edge, miro, voxcpm2, voxtral-4b-tts and Zipformer.
+**All 71 cards pass.** The census shapes alone at two threads (`ggml_graph_compute`, fold off against on):
+1.3-5x where each batch has few columns (granite's `[1024, 3, 40]` 1.38-2.77x, voxcpm2's 1.95-2.18x,
+voxtral's 1.33-1.39x, oruk/qwen3-asr's 1.36x), and 0.95-1.07x where each batch already has many
+(f5's `[64, 1135, 16]`, moonshine's `[32, 457, 8]`, supertonic, miro). Whole-card wall times are
+dominated by loading and did not resolve a difference.
+
+#### P4.50 — DONE 2026-11-06: `CONV_2D_DW` direct, a 1x1 `CONV_2D` without im2col
+
+Three lowering changes in `primitives_conv.cpp`, each guarded so anything else keeps its old recipe:
+
+* **`CONV_2D_DW` takes `ggml_conv_2d_dw_direct`** (F32 data, F32 or F16 kernel, and only if the backend
+  runs it), as `CONV_1D_DW` has since P4.31. The im2col recipe wrote KH*KW copies of the input and then
+  ran a per-channel product with n = 1. Zipformer's 7x7 stem conv wrote a 1.4 GB im2col for a 60 s clip.
+* **With rows under four kernel widths, stride 1 and a column over four rows long, it convolves the
+  transpose.** The direct kernel vectorizes along a row and runs the edge outputs one bounds-checked tap
+  at a time, and Zipformer's rows are 19 wide against a 7-wide kernel. Op alone, two threads:
+  im2col 738 ms, direct 148 ms, transposed 44 ms including both transposes. FastConformer's 64-wide
+  rows go the other way (42 ms direct, 80 ms transposed), which is where the threshold comes from.
+  Neutral on Metal and Vulkan.
+* **A 1x1, stride-1, unpadded `CONV_2D`'s im2col is built as `ggml_cont` of a transpose**, which is the
+  same bytes, 2-3x faster. And **at one batch the output permute's copy is skipped**, since
+  `[OW, OH, 1, OC]` and `[OW, OH, OC, 1]` are the same layout.
+
+Zipformer encoder, F32, P4.50 off against on (P4.49 in both), same protocol as P4.49:
+
+| | 10 s | 60 s |
+|---|---|---|
+| dev box CPU, 2 threads | 0.70 → 0.59 s (1.19x) | 6.46 → 5.79 s (1.12x) |
+| M1 Pro CPU | 0.130 → 0.083 s (1.57x) | 0.953 → 0.672 s (1.42x) |
+| M1 Pro Metal | 0.125 → 0.094 s (1.33x) | 1.156 → 0.924 s (1.25x) |
+| dev box Vulkan, Radeon Vega 3 | 0.575 → 0.482 s (1.19x) | 4.47 → 3.75 s (1.19x) |
+
+On the M1's CPU the 60 s encoder is now 0.67 s against PyTorch's 1.16. On the dev box it is 5.79 s
+against 3.84: P4.51 and the Swoosh passes are most of what is left there.
+
+**Correctness.** Tokens are identical to the reference on all four devices at 10 s and 60 s. The engine
+gate passes 272/272 (jfk encoder max |d| 2.61e-5). The new ci test `test_conv_2d_lowerings_against_reference`
+covers one case per branch against a double reference, together with the graph each branch must build
+(no `IM2COL`, the expected `CONT` count). It fails 14 checks with P4.50 disabled and 2 with only the
+transposed form disabled.
+
+**The other models it touches.** Ten published models have `CONV_2D` or `CONV_2D_DW`: the six
+FastConformers (canary-1b-v2, lfm2.5-audio-asr, both nemotrons, parakeet-rnnt, parakeet-tdt),
+conformer-ctc-small, oruk, qwen3-asr and Zipformer. **All ten cards pass.** In parakeet-tdt at 10 s,
+the dw_striding stem's 145 ms of `IM2COL` and 107 ms of per-channel products became 25 ms of
+`CONV_2D_DW` (profiled). That is a few percent of a transcription, below what whole-model timing
+resolves on this box. qwen3-asr's convolutions run batched (N > 1), so its graph is node for node
+unchanged.
+
+#### P4.51 — DONE 2026-11-06: a product over K < 8 is K outer products
+
+`op_mul_mat` runs an F32 product whose K is under 8 as `ggml_out_prod` of the two transposed operands,
+when the graph runs on host memory (CPU, BLAS, vc4). ggml's GEMMs compute each output as a K-long dot
+product, and tinyBLAS refuses K < 8 on AVX2, so Zipformer's relative-position scores (K =
+`pos_head_dim` = 4, a [2T-1, T] matrix per head) ran one 4-long `vec_dot` per output. `ggml_out_prod`
+writes each output row as K contiguous AXPYs instead.
+
+Op alone, two threads, Zipformer's shapes: today / zero-padded to K = 8 for tinyBLAS / outer products,
+304 / 171 / 80 ms on the largest (5991 x 2996 x 4 heads), 3.7-5.4x across the five. Over K at three
+column counts the outer products won at every K below 8 (1.5-17x), still won at 8-16 on this box
+(1.2-3.4x, where tinyBLAS takes the product on other ISAs) and lost at 32 (0.65-0.80x), so the line is
+drawn at 8. The padded form was the alternative named when this was scoped, and needs no export change
+either; it is half the gain.
+
+**Not on a GPU.** Vulkan has an F32 `OUT_PROD`, and Zipformer's 60 s encoder was slower with it (3.75 ->
+3.91 s on the Vega 3). Metal has none. Both keep the `MUL_MAT`; Metal's small-K products are P4.52's.
+
+Zipformer encoder, F32, P4.51 off against on (P4.49 and P4.50 in both):
+
+| | 10 s | 60 s |
+|---|---|---|
+| dev box CPU, 2 threads | 0.583 → 0.563 s (1.04x) | 5.69 → 4.81 s (1.18x) |
+| M1 Pro CPU | 0.0828 → 0.0809 s (1.02x) | 0.668 → 0.615 s (1.09x) |
+
+**Correctness.** Tokens identical to the reference on every device at 10 s and 60 s. The new ci test
+`test_mul_mat_small_k_as_outer_products` checks shape, broadcast (per-head batches and a 2-D `a` against
+a batched `b`) and exact values, one `OUT_PROD` and no `MUL_MAT`, and that K = 8 stays a `MUL_MAT`; it
+fails 3 checks with the change disabled. The engine gate passes 272/272 (jfk encoder max |d| 2.97e-5). `test_f32_matmul_requests_f32_precision` counts the `OUT_PROD`
+its fixture now builds as the F32 product, since Vulkan's shader and CUDA's cuBLAS path for it are F32
+throughout.
+
+**The other models it touches.** 36 of the 71 published cards build at least one such product, and
+**all 71 pass**. Outside Zipformer, almost all are attention against a KV cache that still holds fewer
+than 8 positions in the first decode steps (audio8-tts-realistic built 10,328 over its card run,
+qwen3-tts 6,984, moss-tts-local 3,388, musicgen 384), plus `K = 1` broadcasts. These are small
+products, and the card timings do not resolve a change in them.
+
+#### P4.52 — DONE 2026-11-06: Metal's three on Zipformer
+
+Three changes, one per cause found in the Metal profile. The first two are engine changes: the
+grouped convolution on every backend, the `POW` lowering on every backend but Vulkan (on Vulkan too
+since P4.54). The third is a ggml patch for Metal only.
+
+**`POW` against a constant exponent is ggml's own ops.** `op_pow` was a CPU custom op, so on any
+device each `POW` was a fallback node and a split. Zipformer's BiasNorm is `x ** -0.5`, 13 of them in
+the encoder, which cut the Metal graph into 27 splits. When the exponent is a one-element weight, it
+is read at build time. The values 1, 2, 0.5, -0.5 and -1 become identity, `SQR`, `SQRT` and a `DIV`
+of a ones tensor built from the operand itself. Anything else keeps the custom op. `-0.5` rounds
+twice, against `std::pow`'s once, and the two differ only at `+inf`. Across the 71 published cards,
+only Zipformer has a constant-exponent `POW`.
+
+**Not on Vulkan, for now (P4.54).** On the dev box's Radeon Vega 3 the lowering made Zipformer's full
+60 s transcription slower, 8.9 → 9.8 s, and POW is not why. Without the fallbacks the encoder reaches
+ggml-vulkan as one 2657-node graph instead of 27 splits. After that has run once, every later small
+graph in the process is about 45% slower: the decoder's 546 calls go 1.23 → 1.79 s. It is the same
+after a 10 s or a 60 s encoder, and after a 10 s pause. Ruled out: allocations (identical in both
+arms), the build-time read of the exponent, and ggml-vulkan's fusion, descriptor reuse, graph
+optimize, async and nodes-per-submit switches. GPU kernel time per decoder call rose 2.32 → 2.59 ms,
+so most of the loss is on the host. The encoder itself does not change on Vulkan, so a Vulkan primary
+kept the custom op until P4.54 explained this. *Superseded by P4.54:* the cause is ggml-vulkan's
+command pool, ggml-0058 fixes it, and the lowering now runs on every backend.
+
+**A small grouped `CONV_1D` is one batched product.** `conv_1d_grouped` sliced the groups, about
+7 nodes per group. Zipformer's prediction network is a K = 2 convolution with groups = 128, run once
+per emitted symbol, so each decoder call was 918 nodes: 1.97 ms on Metal and 0.70 ms on the CPU,
+546 times in a 60 s clip. The rows of one im2col over every channel are already grouped, so it is
+viewed as G batches and multiplied against the kernel viewed the same way, in one `MUL_MAT`. This is
+bounded at 1M im2col elements, because the loop's per-group direct convolutions never materialise
+one. wav2vec2's positional convolution (K = 128 over 768 channels, groups = 16) would need ~200 MB at
+500 frames, so it keeps the loop. Five published cards have a grouped `CONV_1D`: zipformer-small,
+data2vec-audio-base-960h, hubert-large-ls960-ft, f5-tts-v1-base and fun-cosyvoice3-0.5b.
+
+**Metal's `mul_mm` at any K for F32 x F32** (ggml-0057, UPSTREAM PR 53).
+`ggml_metal_op_mul_mat_use_mm` admitted the matrix-matrix kernel only at `ne00 >= 64`. Zipformer's
+`QK^T` at head dim 32 therefore ran on mat-vec, at about 20x the CPU's time. M1 Pro, `mul_mm` against `mul_mv`:
+
+- K = 32 at 3000 x 3000 x 4 heads: 1.18 ms against 93.0 ms.
+- K = 4 at 5991 x 2996 x 4: 2.6x faster.
+- K = 8 to 48: 1.3x (16 columns) to 79x faster.
+- K = 4 with 16 columns: a tie.
+
+A ragged K already takes the kernel's bounds-checked load. 768 cases agree with a double reference
+to 2.8e-7 relative. The patch is restricted to F32 x F32 because it was not measured on F16 or
+quantized weights. Measured alone, Zipformer's 60 s encoder on Metal went 0.916 → 0.619 s.
+
+Full transcription (encoder + decode), F32, POW and the grouped conv off against on (P4.49-P4.51 in
+both):
+
+| | 10 s | 60 s |
+|---|---|---|
+| M1 Pro Metal | 0.433 → 0.234 s (1.85x) | 2.655 → 1.755 s (1.51x) |
+| M1 Pro CPU | 0.286 → 0.220 s (1.30x) | 1.70 → 1.42 s (1.20x) |
+| dev box CPU, 2 threads | 1.039 → 0.964 s (1.08x) | 7.56 → 7.25 s (1.04x) |
+| dev box Vulkan, Radeon Vega 3 (grouped conv only) | 1.49 → 1.24 s (1.21x) | 9.31 → 8.24 s (1.13x) |
+
+With all three, Metal's 60 s encoder takes 0.600 s, and its full transcription 1.434 s against the
+M1 CPU's 1.433. **Metal is no longer slower than the CPU it shares the chip with.** It is not faster
+either: the decode loop is a GEMV per frame, which P4.53 addresses.
+
+**Correctness.** Tokens are identical to the reference on every device at 10 s and 60 s.
+The engine gate passes 272/272. Two new ci tests check graph shape and values against a double reference.
+`test_conv_1d_grouped_batched_against_reference` covers 4 cases; the last one is past the bound and
+keeps the loop. It fails 3 checks with the change disabled. `test_pow_constant_exponent_is_native`
+checks that no custom op remains. It fails 4 checks with the change disabled.
+**All five cards with a grouped `CONV_1D` pass.**
+
+#### P4.54 — DONE 2026-11-06: a large Vulkan graph slowed every later small one (ggml-0058)
+
+**The symptom.** P4.52's `POW` lowering removed Zipformer's 13 CPU fallbacks. Its encoder then
+reached ggml-vulkan as one 3963-node ggml graph instead of 27 splits. After that graph had run once, every
+later small graph in the process was slower on the dev box's Radeon Vega 3 (RADV). With P4.52's
+grouped convolution in place, the decoder's 546 calls went 0.23 → 0.98 s. The size of the clip and a
+10 s pause made no difference.
+
+**Ruled out first:**
+- allocations (identical in both arms);
+- the build-time read of the exponent;
+- power state;
+- ggml-vulkan's fusion, descriptor-reuse, graph-optimize, async and nodes-per-submit switches.
+
+**The cause.** A ggml-vulkan built from this tree, instrumented around synchronize and cleanup,
+showed it. The context's command pool only grows: the graph left 563 command buffers behind, against
+21 for the split graph. On RADV, `vkResetCommandPool` costs in proportion to the buffers allocated
+from the pool, so each later call's cleanup went from ~0.01 to ~0.8 ms, and its synchronize from
+~0.28 to ~0.75 ms.
+
+**Not on Intel.** The workstation's Arrow Lake iGPU was tested through Intel's Mesa driver only (its
+RTX 5090 was busy and never touched). The same sequence costs nothing there: the decoder loop is
+0.17 s before and after. So this is RADV-specific.
+
+**The fix is in the backend, not the op (user's call).** ggml-0058 (UPSTREAM PR 54) frees command
+buffers past the first 32 at each pool reset. It keeps their deque slots, because an event may still
+hold a pointer to one. With it, the 546 calls take 0.23 s after the large graph too. `op_pow` lowers
+on every backend again, with no device check. Two other options were considered:
+
+- A per-backend override in the primitive registry: new machinery for one case, and "Vulkan" would
+  still be named in the engine.
+- A device property in place of the name, as P4.51 uses host memory: none separates the cases. Metal,
+  the Vega 3 and the Intel iGPU all share memory with the CPU.
+
+Carrying an upstreamable backend fix was preferred to dispatching on a backend's name inside an op.
+
+Zipformer, full transcription at 60 s, Vega 3:
+
+| | |
+|---|---|
+| POW kept on the CPU (P4.52) | 8.38 s |
+| POW lowered, without ggml-0058 | 10.1 s |
+| POW lowered, with ggml-0058 | 8.34 s |
+| POW kept on the CPU, with ggml-0058 | 8.35 s |
+
+The lowering gains nothing on the Vega 3: its encoder is 3.95 s either way. ggml-0058 changes nothing
+where the pool stays small: Qwen3-0.6B's 251-token prefill plus 64 steps is 18.0 s with and without
+it.
+
+**Open: Intel's full transcription.** On the Intel iGPU the lowering makes the encoder faster:
+0.90 → 0.857 s at 60 s, 0.135 → 0.111 s at 10 s. But interleaved uninstrumented runs put the full
+60 s transcription slower: median 2.52 → 2.91 s, with or without ggml-0058, and the loss is in the
+per-frame joint loop. An instrumented run reversed the arms. In it, per-call synchronize time drifted
+from 0.25 to 0.5 ms over the loop in both arms, which looks like the iGPU's clock governor (it cannot
+be pinned without root). P4.53 removes most of those per-frame calls, so this is re-measured after
+it.
+
+*Answered in P4.53: with block 4 the runs are stable and the lowering is slightly ahead (1.619 against
+1.625 s).*
+
+#### P4.53 — DONE 2026-11-06: the transducer joint takes a block of frames and returns ids
+
+**The floor it removes.** Zipformer's greedy decode ran its joint once per encoder frame, about 1500
+calls for a 60 s clip. Each call was a 512 x 11661 F32 GEMV whose logits the driver then downloaded
+and reduced. That made the decode loop the floor on every device, larger than the encoder on Vulkan
+(4.20 s against 3.95).
+
+**A block of frames per call.** The joint now takes up to `JOINT_BLOCK` = 4 encoder rows against the
+one decoder output (`n_enc_frames`, exporter `JOINT_BLOCK`). The decoder is a pure function of the
+context, which only an emission moves. So every frame up to a block's first emission saw the decoder
+output the frame-by-frame loop would have given it. The driver takes the first non-blank row, drops
+the rows after it, and starts the next block at the frame after the emission: the same tokens as the
+reference, one symbol per frame at most.
+
+**The argmax moves into the graph.** A first version returned the block's logits, and on Vulkan it
+was slower than one frame per call: block 8 decode 4.09 -> 6.10 s at 60 s. Joint calls timed alone
+showed why. The Vega 3 computes 1 / 4 / 8 rows in 2.17 / 2.35 / 2.56 ms, but downloading 11661
+logits a row for the host's argmax added ~1 ms a row (10.1 ms a call at 8 rows). The joint wrapper
+now ends in `argmax(-1)`, which lowers to a new engine primitive, `ARGMAX` (`ggml_argmax`: each row
+over ne[0], I32). A call downloads 4 ids. The exporter lowers MIL `reduce_argmax` over the last axis
+only, and refuses any other. `OP_FIRST_RUNTIME` marks `ARGMAX` as needing `loom-py-rt` 1.0.0rc21, so a
+republished Zipformer waits for that release.
+
+**Why 4.** About one frame in three emits (546 symbols, ~1500 frames), so a long block mostly computes
+rows it throws away. Decode at 60 s, dev box, per frame against blocks 2 / 4 / 8:
+
+| | per frame | 2 | 4 | 8 |
+|---|---|---|---|---|
+| CPU, 2 threads | 2.45 s | 1.74 | **1.60** | 1.73 |
+| Vega 3 (Vulkan) | 4.20 s | 2.41 | **1.88** | 1.84 |
+
+Full transcription, F32, per-frame export against block 4 (same engine, P4.49-P4.54 in both):
+
+| | 10 s | 60 s |
+|---|---|---|
+| dev box CPU | 0.972 -> 0.895 s (1.09x) | 7.39 -> 6.61 s (1.12x) |
+| dev box Vulkan, Vega 3 | 1.183 -> 0.831 s (1.42x) | 8.00 -> 5.66 s (1.41x) |
+| M1 Pro CPU, 8 threads | 0.221 -> 0.172 s (1.28x) | 1.363 -> 1.091 s (1.25x) |
+| M1 Pro Metal | 0.223 -> 0.174 s (1.28x) | 1.435 -> 1.089 s (1.32x) |
+| workstation Vulkan, Intel iGPU (Arrow Lake) | 0.374 -> 0.269 s (1.39x) | 2.70 -> 1.62 s (1.67x) |
+
+The dev box rows are the Python API, min of three; the M1 and Intel rows are `mprobe`, best min of
+three over two (M1) or three (Intel) interleaved rounds. The encoder does not move on any device (Metal 0.603 s at 60 s in both arms), so all of the
+gain is the decode loop. Metal and the M1's CPU tie again, now at 1.09 s.
+
+**Correctness.** Tokens are identical to the reference at 10 s and 60 s on every device. The engine
+gate passes 272/272 for F32; Q8_0 shows the 269/272 it always has (encoder tolerance against the F32
+oracle, every token matching). The zipformer-small card passes with the new GGUFs. `ARGMAX` has a
+registry test (shape, I32, values across batches) that fails with the output axes swapped. The
+exporter's `test_argmax_lowering` fails both of its cases with the rule unregistered. Ties are not
+torch's: ggml's CPU kernel keeps the last tied index and Vulkan's reduction an arbitrary one, where
+torch keeps the first. No reference token was affected.
+
+**P4.54's open question, answered.** On the Intel iGPU, the `POW` lowering's full transcription is now
+measurable. The per-frame export still scatters: with the lowering on and off interleaved over three
+rounds, the arms swap places, 2.58-2.94 s at 60 s. That is the per-frame loop's synchronize drift, not
+the lowering. With block 4 the runs are stable, and the lowering is slightly ahead: 1.619 against
+1.625 s best of three, medians 1.63 against 1.68 s. At 10 s it is 0.269 against 0.270 s. So `op_pow`
+lowers on every backend, as P4.54 left it.

@@ -1,6 +1,8 @@
 #include "loom/ops/primitive_registry.h"
 #include "loom/loom_errors.h"
 
+#include <ggml-backend.h>
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -254,6 +256,25 @@ Outputs op_mul_mat(PrimitiveContext& pc, const Inputs& in, const Json&) {
         }
     }
 
+    // A product over K < 8 is run as the sum of K outer products (P4.51). ggml's GEMMs compute each
+    // output as a dot product over K and tinyBLAS refuses K < 8 on AVX2, so Zipformer's relative-position
+    // scores (K = pos_head_dim = 4, a [T, 2T-1] matrix per head) took the generic path, one 4-long
+    // `vec_dot` per output: 1.2 s of a 60 s encoder at 1.5 GFLOP/s. `ggml_out_prod` writes each output row
+    // as K contiguous axpys instead. Op alone, two threads, Zipformer's largest shape: 304 ms today, 171
+    // padded to K = 8 for tinyBLAS, 80 as outer products. Below K = 8 it won at every shape measured
+    // (1.5-17x); at K = 32 it loses. Taken before the contiguity copy below because the transposes
+    // copy `b` anyway. F32 only, and only where the graph runs on host memory (CPU, BLAS, vc4): Vulkan
+    // has an OUT_PROD and was slower with it (Zipformer's 60 s encoder 3.75 -> 3.91 s on a Vega 3),
+    // and Metal has none.
+    const bool host_primary = pc.backends.primary == nullptr ||
+        ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(pc.backends.primary));
+    if (host_primary && a->ne[0] < 8 && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+        can_mul_mat(a, b)) {
+        ggml_tensor* y = ggml_out_prod(pc.ctx, ggml_cont(pc.ctx, ggml_transpose(pc.ctx, a)),
+                                       ggml_cont(pc.ctx, ggml_transpose(pc.ctx, b)));     // [M, N, b2, b3]
+        if (backend_can_run(pc, y)) return {y};
+    }
+
     // Ensure the input tensor b is contiguous in memory for ggml_mul_mat execution. NOT a guess, and so
     // deliberately outside the guard above: ggml_mul_mat requires it regardless.
     if (!ggml_is_contiguous(b)) {
@@ -266,6 +287,21 @@ Outputs op_mul_mat(PrimitiveContext& pc, const Inputs& in, const Json&) {
                            std::to_string(a->ne[3]) + "] b=[" + std::to_string(b->ne[0]) + "," +
                            std::to_string(b->ne[1]) + "," + std::to_string(b->ne[2]) + "," +
                            std::to_string(b->ne[3]) + "]");
+    }
+
+    // A 2-D `a` against a batched `b` is ONE matrix product, so it is handed to ggml as one (P4.49).
+    // ggml broadcasts `a` over b's batch axes and multiplies batch by batch, which is right and, when
+    // each batch is a single column, slow: Zipformer's linears reach here as `[C, 1, T]`, and the CPU
+    // backend ran T matrix-vector products (`llamafile_sgemm` refuses n < 2) at ~27 GFLOP/s against
+    // 50-70 for the same weights as a 2-D GEMM -- 1.74 s of a 60 s encoder, where PyTorch's `addmm`
+    // takes 0.73. Metal and Vulkan pick their mat-vec kernels for the same reason. `b` is contiguous by
+    // now, so folding its batch axes into columns is a view, and so is putting them back. Measured on
+    // Zipformer's 60 s encoder: CPU 1.10x (dev box) / 1.15x (M1), Metal 1.38x, Vulkan 2.51x. Thirteen
+    // published models reach this branch; their shapes alone run 0.95-1.07x where each batch already
+    // has many columns and 1.3-5x where it has few, and all 71 cards pass. Epic-05 P4.49.
+    if (a->ne[2] == 1 && a->ne[3] == 1 && b->ne[2] * b->ne[3] > 1) {
+        ggml_tensor* b_2d = ggml_reshape_2d(pc.ctx, b, b->ne[0], b->ne[1] * b->ne[2] * b->ne[3]);
+        return {ggml_reshape_4d(pc.ctx, ggml_mul_mat(pc.ctx, a, b_2d), a->ne[1], b->ne[1], b->ne[2], b->ne[3])};
     }
     return {ggml_mul_mat(pc.ctx, a, b)};
 }
@@ -554,6 +590,28 @@ void pow_custom_op(ggml_tensor* dst, const ggml_tensor* a, const ggml_tensor* b,
 Outputs op_pow(PrimitiveContext& pc, const Inputs& in, const Json&) {
     // pow(base=in[0], exponent=in[1])
     expect_n_inputs("POW", in, 2);
+    // A constant exponent this common is spelled in ggml's own ops (P4.52). The custom op below exists
+    // only on the CPU, so on a device every POW is a fallback node and a split: Zipformer's BiasNorm is
+    // `x ** -0.5` against one constant, 13 of them in its encoder, which cut the Metal graph into 27
+    // splits. The exponent is read at build time when it is a one-element weight; anything else -- a
+    // computed exponent, a value not listed -- keeps the custom op. `-0.5` is `1 / sqrt(x)` with the 1
+    // made from the sqrt itself, so it is two roundings against std::pow's one, and it differs from
+    // std::pow only at x = +inf (NaN against 0).
+    //
+    // On Vulkan this needs ggml-0058 (P4.54): without the splits the encoder reaches ggml-vulkan as one
+    // 3963-node graph, whose 563 command buffers made every later small graph's cleanup ~1.2 ms slower
+    // on RADV until the pool is trimmed.
+    if (ggml_nelements(in[1]) == 1 && in[0]->type == GGML_TYPE_F32) {
+        const float e = scalar_value_or(in[1], std::nanf(""));
+        if (e == 1.0f) return {in[0]};
+        ggml_tensor* x = ensure_packed(pc.ctx, in[0]);
+        if (e == 2.0f) return {ggml_sqr(pc.ctx, x)};
+        if (e == 0.5f) return {ggml_sqrt(pc.ctx, x)};
+        if (e == -0.5f || e == -1.0f) {
+            ggml_tensor* d = e == -0.5f ? ggml_sqrt(pc.ctx, x) : x;
+            return {ggml_div(pc.ctx, ggml_scale_bias(pc.ctx, d, 0.0f, 1.0f), d)};
+        }
+    }
     return {ggml_map_custom2(pc.ctx, ensure_packed(pc.ctx, in[0]), ensure_packed(pc.ctx, in[1]), pow_custom_op, GGML_N_TASKS_MAX, nullptr)};
 }
 
