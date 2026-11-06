@@ -4505,8 +4505,8 @@ products, and the card timings do not resolve a change in them.
 #### P4.52 — DONE 2026-11-06: Metal's three on Zipformer
 
 Three changes, one per cause found in the Metal profile. The first two are engine changes: the
-grouped convolution on every backend, the `POW` lowering on every backend but Vulkan. The third is a
-ggml patch for Metal only.
+grouped convolution on every backend, the `POW` lowering on every backend but Vulkan (on Vulkan too
+since P4.54). The third is a ggml patch for Metal only.
 
 **`POW` against a constant exponent is ggml's own ops.** `op_pow` was a CPU custom op, so on any
 device each `POW` was a fallback node and a split. Zipformer's BiasNorm is `x ** -0.5`, 13 of them in
@@ -4524,7 +4524,8 @@ after a 10 s or a 60 s encoder, and after a 10 s pause. Ruled out: allocations (
 arms), the build-time read of the exponent, and ggml-vulkan's fusion, descriptor reuse, graph
 optimize, async and nodes-per-submit switches. GPU kernel time per decoder call rose 2.32 → 2.59 ms,
 so most of the loss is on the host. The encoder itself does not change on Vulkan, so a Vulkan primary
-keeps the custom op until P4.54 explains this.
+kept the custom op until P4.54 explained this. *Superseded by P4.54:* the cause is ggml-vulkan's
+command pool, ggml-0058 fixes it, and the lowering now runs on every backend.
 
 **A small grouped `CONV_1D` is one batched product.** `conv_1d_grouped` sliced the groups, about
 7 nodes per group. Zipformer's prediction network is a K = 2 convolution with groups = 128, run once
@@ -4569,3 +4570,60 @@ The engine gate passes 272/272. Two new ci tests check graph shape and values ag
 keeps the loop. It fails 3 checks with the change disabled. `test_pow_constant_exponent_is_native`
 checks that no custom op remains. It fails 4 checks with the change disabled.
 **All five cards with a grouped `CONV_1D` pass.**
+
+#### P4.54 — DONE 2026-11-06: a large Vulkan graph slowed every later small one (ggml-0058)
+
+**The symptom.** P4.52's `POW` lowering removed Zipformer's 13 CPU fallbacks. Its encoder then
+reached ggml-vulkan as one 3963-node ggml graph instead of 27 splits. After that graph had run once, every
+later small graph in the process was slower on the dev box's Radeon Vega 3 (RADV). With P4.52's
+grouped convolution in place, the decoder's 546 calls went 0.23 → 0.98 s. The size of the clip and a
+10 s pause made no difference.
+
+**Ruled out first:**
+- allocations (identical in both arms);
+- the build-time read of the exponent;
+- power state;
+- ggml-vulkan's fusion, descriptor-reuse, graph-optimize, async and nodes-per-submit switches.
+
+**The cause.** A ggml-vulkan built from this tree, instrumented around synchronize and cleanup,
+showed it. The context's command pool only grows: the graph left 563 command buffers behind, against
+21 for the split graph. On RADV, `vkResetCommandPool` costs in proportion to the buffers allocated
+from the pool, so each later call's cleanup went from ~0.01 to ~0.8 ms, and its synchronize from
+~0.28 to ~0.75 ms.
+
+**Not on Intel.** The workstation's Arrow Lake iGPU was tested through Intel's Mesa driver only (its
+RTX 5090 was busy and never touched). The same sequence costs nothing there: the decoder loop is
+0.17 s before and after. So this is RADV-specific.
+
+**The fix is in the backend, not the op (user's call).** ggml-0058 (UPSTREAM PR 54) frees command
+buffers past the first 32 at each pool reset. It keeps their deque slots, because an event may still
+hold a pointer to one. With it, the 546 calls take 0.23 s after the large graph too. `op_pow` lowers
+on every backend again, with no device check. Two other options were considered:
+
+- A per-backend override in the primitive registry: new machinery for one case, and "Vulkan" would
+  still be named in the engine.
+- A device property in place of the name, as P4.51 uses host memory: none separates the cases. Metal,
+  the Vega 3 and the Intel iGPU all share memory with the CPU.
+
+Carrying an upstreamable backend fix was preferred to dispatching on a backend's name inside an op.
+
+Zipformer, full transcription at 60 s, Vega 3:
+
+| | |
+|---|---|
+| POW kept on the CPU (P4.52) | 8.38 s |
+| POW lowered, without ggml-0058 | 10.1 s |
+| POW lowered, with ggml-0058 | 8.34 s |
+| POW kept on the CPU, with ggml-0058 | 8.35 s |
+
+The lowering gains nothing on the Vega 3: its encoder is 3.95 s either way. ggml-0058 changes nothing
+where the pool stays small: Qwen3-0.6B's 251-token prefill plus 64 steps is 18.0 s with and without
+it.
+
+**Open: Intel's full transcription.** On the Intel iGPU the lowering makes the encoder faster:
+0.90 → 0.857 s at 60 s, 0.135 → 0.111 s at 10 s. But interleaved uninstrumented runs put the full
+60 s transcription slower: median 2.52 → 2.91 s, with or without ggml-0058, and the loss is in the
+per-frame joint loop. An instrumented run reversed the arms. In it, per-call synchronize time drifted
+from 0.25 to 0.5 ms over the loop in both arms, which looks like the iGPU's clock governor (it cannot
+be pinned without root). P4.53 removes most of those per-frame calls, so this is re-measured after
+it.

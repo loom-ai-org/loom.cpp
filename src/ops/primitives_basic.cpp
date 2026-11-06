@@ -9,7 +9,6 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <vector>
 
 namespace loom {
@@ -599,18 +598,10 @@ Outputs op_pow(PrimitiveContext& pc, const Inputs& in, const Json&) {
     // made from the sqrt itself, so it is two roundings against std::pow's one, and it differs from
     // std::pow only at x = +inf (NaN against 0).
     //
-    // NOT ON VULKAN, for now (P4.54). Without the fallbacks Zipformer's encoder reaches ggml-vulkan as
-    // one 2657-node graph instead of 27 splits, and after it has run once every later small graph in the
-    // process is ~45% slower on a Radeon Vega 3 -- the decoder's 546 calls 1.23 -> 1.79 s, the same
-    // after a 10 s or a 60 s encoder and after a 10 s pause; not allocation (identical), not the
-    // build-time read of the exponent, not fusion, descriptor reuse, graph optimize, async or
-    // nodes-per-submit. The encoder itself does not change, so Vulkan keeps the custom op until that is
-    // understood: Zipformer's full 60 s transcription went 8.9 -> 9.8 s with the lowering.
-    ggml_backend_dev_t primary_dev = pc.backends.primary != nullptr ? ggml_backend_get_device(pc.backends.primary)
-                                                                    : nullptr;
-    const bool vulkan_primary = primary_dev != nullptr &&
-        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(primary_dev)), "Vulkan") == 0;
-    if (!vulkan_primary && ggml_nelements(in[1]) == 1 && in[0]->type == GGML_TYPE_F32) {
+    // On Vulkan this needs ggml-0058 (P4.54): without the splits the encoder reaches ggml-vulkan as one
+    // 3963-node graph, whose 563 command buffers made every later small graph's cleanup ~1.2 ms slower
+    // on RADV until the pool is trimmed.
+    if (ggml_nelements(in[1]) == 1 && in[0]->type == GGML_TYPE_F32) {
         const float e = scalar_value_or(in[1], std::nanf(""));
         if (e == 1.0f) return {in[0]};
         ggml_tensor* x = ensure_packed(pc.ctx, in[0]);

@@ -2175,6 +2175,33 @@ reference to 2.8e-7 relative. Zipformer's 60 s encoder on Metal goes 0.916 -> 0.
 identical. The rule was not tried on F16 or quantized weights, nor on a GPU with the tensor API, which
 PR 24 already sends to mat-vec for F32 x F32.
 
+## PR 54 — `vulkan`: a command pool gives back what one large graph allocated
+
+*(`cmake/patches/ggml-0058-vulkan-trim-the-command-pool.patch`)*
+
+**Problem.** A context's command pool only grows. A graph takes a fresh command buffer for each submit
+and none goes back until `ggml_vk_command_pool_cleanup` resets the pool, which keeps every buffer it
+ever allocated. On RADV `vkResetCommandPool`'s cost scales with the buffers allocated from the pool,
+used or not. So one large graph leaves every later small graph paying for it, for the life of the
+context. On a Radeon Vega 3 (RADV), a 3963-node graph left 563 buffers. Each later graph's cleanup
+went from ~0.01 to ~0.8 ms, and its synchronize from ~0.28 to ~0.75 ms. A loop of 546 small graphs
+went 0.23 → 0.98 s after one run of the large one. The same sequence on an Intel Arrow Lake iGPU
+(ANV) shows no cost.
+
+**Change.** At each cleanup, after the reset, buffers past the first 32 are freed with
+`vkFreeCommandBuffers`. Their deque slots stay, because an event may still hold a pointer to one. A
+freed slot gets a null handle and a `use_counter` bump, so a stale event's later reset skips it.
+`ggml_vk_get_or_create_cmd_buffer` allocates a handle again when it hands out a freed slot. Nothing
+else allocates command buffers.
+
+**Measured** (Vega 3, Zipformer small, 60 s clip): the 546-call loop after the large graph is
+0.98 → 0.23 s, the same as before it ran. Full 60 s transcription is 8.3 s in all three arms:
+- the large graph with the patch;
+- the same model split into 27 graphs, with the patch;
+- the split model without it.
+So the buffers the next large graph re-allocates do not show. Qwen3-0.6B (251-token prefill, 64
+steps) is unchanged, 18.0 s.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
