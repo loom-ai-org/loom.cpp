@@ -1,0 +1,39 @@
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1260,6 +1260,24 @@ void ggml_vk_command_pool_cleanup(vk_device& device, vk_command_pool& p) {
+     for (auto& cmd_buffer : p.cmd_buffers) {
+         cmd_buffer.in_use = false;
+     }
++
++    // loom (ggml-0058): give back what one large graph allocated. The pool only ever grows -- a graph
++    // takes a fresh buffer per submit and frees none until this reset -- and resetCommandPool's cost on
++    // RADV scales with the buffers allocated from the pool, used or not. On a Radeon Vega 3 a 3963-node
++    // graph left 563 buffers, and every later small graph's cleanup and synchronize then cost ~1.2 ms
++    // more: Zipformer's 546 decoder calls 0.23 -> 0.98 s after one encoder run. Entries past the first
++    // kKeep keep their slot -- an event may still hold a pointer to it -- but lose their handle, and the
++    // use_counter bump makes such an event's later reset skip them. ggml_vk_get_or_create_cmd_buffer
++    // allocates a handle again when it hands out a trimmed slot.
++    static constexpr size_t kKeep = 32;
++    for (size_t i = kKeep; i < p.cmd_buffers.size(); i++) {
++        vk_command_buffer& cmd_buffer = p.cmd_buffers[i];
++        if (cmd_buffer.buf) {
++            device->device.freeCommandBuffers(p.pool, cmd_buffer.buf);
++            cmd_buffer.buf = nullptr;
++            cmd_buffer.use_counter++;
++        }
++    }
+ }
+ 
+ void ggml_vk_queue_command_pools_cleanup(vk_device& device) {
+@@ -5971,6 +5989,10 @@ vk_subbuffer ggml_vk_tensor_subbuffer(
+ static vk_command_buffer* ggml_vk_get_or_create_cmd_buffer(vk_device& device, vk_command_pool& pool) {
+     for (auto& cmd_buffer : pool.cmd_buffers) {
+         if (!cmd_buffer.in_use) {
++            if (!cmd_buffer.buf) {   // trimmed by ggml_vk_command_pool_cleanup (ggml-0058)
++                vk::CommandBufferAllocateInfo alloc_info(pool.pool, vk::CommandBufferLevel::ePrimary, 1);
++                cmd_buffer.buf = device->device.allocateCommandBuffers(alloc_info).front();
++            }
+             cmd_buffer.use_counter++;
+             cmd_buffer.in_use = true;
+             return &cmd_buffer;
