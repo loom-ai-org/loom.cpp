@@ -148,7 +148,7 @@ void test_mul_mat_2d_weight_against_batched_activation() {
     struct Case { int64_t n1, n2, n3; };
     for (const Case c : {Case{1, 4, 1}, Case{2, 2, 3}}) {
         GgmlScratch s;
-        const int64_t K = 3, N = 2, cols = c.n1 * c.n2 * c.n3;
+        const int64_t K = 9, N = 2, cols = c.n1 * c.n2 * c.n3;   // K >= 8: under 8 is P4.51's outer products
         ggml_tensor* a = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, K, N);
         ggml_set_input(a);
         ggml_tensor* b = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, K, c.n1, c.n2, c.n3);
@@ -183,6 +183,53 @@ void test_mul_mat_2d_weight_against_batched_activation() {
                 for (int64_t k = 0; k < K; ++k) acc += wa[n * K + k] * wb[j * K + k];
                 want[j * N + n] = acc;
             }
+        LOOM_CHECK(get_f32(out) == want);
+    }
+}
+
+// P4.51: a product over K < 8 is the sum of K outer products -- one OUT_PROD node and no MUL_MAT,
+// with mul_mat's shape and broadcast (per-head batches, and a 2-D `a` against a batched `b`), and the
+// same values. K = 8 stays a MUL_MAT. Small integers, so every sum is exact.
+void test_mul_mat_small_k_as_outer_products() {
+    struct Case { int64_t K, M, N, a2, a3, b2, b3; bool outer; };
+    for (const Case c : {Case{4, 5, 6, 1, 3, 1, 3, true}, Case{3, 4, 2, 1, 1, 2, 1, true},
+                         Case{1, 3, 5, 2, 1, 2, 2, true}, Case{8, 3, 4, 1, 2, 1, 2, false}}) {
+        GgmlScratch s;
+        ggml_tensor* a = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, c.K, c.M, c.a2, c.a3);
+        ggml_set_input(a);
+        ggml_tensor* b = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, c.K, c.N, c.b2, c.b3);
+        ggml_set_input(b);
+
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        ggml_tensor* out = op("MUL_MAT")(pc, {a, b}, {})[0];
+        LOOM_CHECK(out->ne[0] == c.M && out->ne[1] == c.N && out->ne[2] == c.b2 && out->ne[3] == c.b3);
+
+        ggml_cgraph* gf = s.expand(out);
+        int n_out_prod = 0, n_mul_mat = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            n_out_prod += ggml_graph_node(gf, i)->op == GGML_OP_OUT_PROD;
+            n_mul_mat += ggml_graph_node(gf, i)->op == GGML_OP_MUL_MAT;
+        }
+        LOOM_CHECK(n_out_prod == (c.outer ? 1 : 0) && n_mul_mat == (c.outer ? 0 : 1));
+
+        std::vector<float> wa(static_cast<size_t>(ggml_nelements(a))), wb(static_cast<size_t>(ggml_nelements(b)));
+        for (size_t i = 0; i < wa.size(); ++i) wa[i] = static_cast<float>(static_cast<int>(i % 5) - 2);
+        for (size_t i = 0; i < wb.size(); ++i) wb[i] = static_cast<float>(static_cast<int>(i % 7) - 3);
+        set_f32(a, wa);
+        set_f32(b, wb);
+        s.compute(gf);
+        std::vector<float> want(static_cast<size_t>(ggml_nelements(out)));
+        for (int64_t i3 = 0; i3 < c.b3; ++i3)
+            for (int64_t i2 = 0; i2 < c.b2; ++i2)
+                for (int64_t n = 0; n < c.N; ++n)
+                    for (int64_t m = 0; m < c.M; ++m) {
+                        const int64_t a_off = ((i3 / (c.b3 / c.a3)) * c.a2 + i2 / (c.b2 / c.a2)) * c.M * c.K;
+                        const int64_t b_off = (i3 * c.b2 + i2) * c.N * c.K;
+                        float acc = 0;
+                        for (int64_t k = 0; k < c.K; ++k) acc += wa[a_off + m * c.K + k] * wb[b_off + n * c.K + k];
+                        want[((i3 * c.b2 + i2) * c.N + n) * c.M + m] = acc;
+                    }
         LOOM_CHECK(get_f32(out) == want);
     }
 }
@@ -2946,6 +2993,7 @@ int main() {
     test_get_rows_mismatched_batch_throws();
     test_mul_mat_identity();
     test_mul_mat_2d_weight_against_batched_activation();
+    test_mul_mat_small_k_as_outer_products();
     test_conv_2d_lowerings_against_reference();
     test_add_mul_silu();
     test_swiglu();
