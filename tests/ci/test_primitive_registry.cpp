@@ -861,6 +861,33 @@ void test_conv_1d_grouped_batched_against_reference() {
 // P4.52: POW with a one-element constant exponent of 2, 0.5, -0.5 or -1 is built from ggml's own ops,
 // so a device runs it; any other exponent keeps the CPU custom op. The exponent has to be a weight --
 // allocated before the graph is built -- for its value to be read at build time.
+// P4.53: ARGMAX is each row's argmax over ne[0], I32, with ne[0] dropped -- across ne[2] batches too,
+// which a joint over a block of frames never needs but a reshape bug would show as the wrong rows.
+void test_argmax_rows() {
+    GgmlScratch s;
+    ggml_tensor* x = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, 7, 3, 2);
+    ggml_set_input(x);
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("ARGMAX")(pc, {x}, {})[0];
+    LOOM_CHECK(out->type == GGML_TYPE_I32);
+    LOOM_CHECK(out->ne[0] == 3 && out->ne[1] == 2 && out->ne[2] == 1 && out->ne[3] == 1);
+
+    std::vector<float> v(42);
+    std::vector<int32_t> want(6);
+    for (int r = 0; r < 6; ++r) {
+        const int peak = (r * 5 + 2) % 7;   // 2, 0, 5, 3, 1, 6: every column but 4, both ends included
+        for (int k = 0; k < 7; ++k) v[r * 7 + k] = static_cast<float>(k == peak ? 10 + r : -(k + r));
+        want[static_cast<size_t>(r)] = peak;
+    }
+    ggml_cgraph* gf = s.expand(out);
+    set_f32(x, v);
+    s.compute(gf);
+    std::vector<int32_t> got(6);
+    ggml_backend_tensor_get(out, got.data(), 0, sizeof(int32_t) * got.size());
+    LOOM_CHECK(got == want);
+}
+
 void test_pow_constant_exponent_is_native() {
     for (const float e : {2.0f, 0.5f, -0.5f, -1.0f, 3.0f}) {
         GgmlScratch s;
@@ -3107,6 +3134,7 @@ int main() {
     test_conv_1d_grouped_permuted_input();
     test_conv_1d_grouped_batched_against_reference();
     test_pow_constant_exponent_is_native();
+    test_argmax_rows();
     test_conv_1d_dw_rejects_a_grouped_kernel();
     test_depthwise_conv_transpose_1d_via_composition();
     test_reshape_permute_cont();

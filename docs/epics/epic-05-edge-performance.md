@@ -4627,3 +4627,66 @@ per-frame joint loop. An instrumented run reversed the arms. In it, per-call syn
 from 0.25 to 0.5 ms over the loop in both arms, which looks like the iGPU's clock governor (it cannot
 be pinned without root). P4.53 removes most of those per-frame calls, so this is re-measured after
 it.
+
+*Answered in P4.53: with block 4 the runs are stable and the lowering is slightly ahead (1.619 against
+1.625 s).*
+
+#### P4.53 — DONE 2026-11-06: the transducer joint takes a block of frames and returns ids
+
+**The floor it removes.** Zipformer's greedy decode ran its joint once per encoder frame, about 1500
+calls for a 60 s clip. Each call was a 512 x 11661 F32 GEMV whose logits the driver then downloaded
+and reduced. That made the decode loop the floor on every device, larger than the encoder on Vulkan
+(4.20 s against 3.95).
+
+**A block of frames per call.** The joint now takes up to `JOINT_BLOCK` = 4 encoder rows against the
+one decoder output (`n_enc_frames`, exporter `JOINT_BLOCK`). The decoder is a pure function of the
+context, which only an emission moves. So every frame up to a block's first emission saw the decoder
+output the frame-by-frame loop would have given it. The driver takes the first non-blank row, drops
+the rows after it, and starts the next block at the frame after the emission: the same tokens as the
+reference, one symbol per frame at most.
+
+**The argmax moves into the graph.** A first version returned the block's logits, and on Vulkan it
+was slower than one frame per call: block 8 decode 4.09 -> 6.10 s at 60 s. Joint calls timed alone
+showed why. The Vega 3 computes 1 / 4 / 8 rows in 2.17 / 2.35 / 2.56 ms, but downloading 11661
+logits a row for the host's argmax added ~1 ms a row (10.1 ms a call at 8 rows). The joint wrapper
+now ends in `argmax(-1)`, which lowers to a new engine primitive, `ARGMAX` (`ggml_argmax`: each row
+over ne[0], I32). A call downloads 4 ids. The exporter lowers MIL `reduce_argmax` over the last axis
+only, and refuses any other. `OP_FIRST_RUNTIME` marks `ARGMAX` as needing `loom-py-rt` 1.0.0rc21, so a
+republished Zipformer waits for that release.
+
+**Why 4.** About one frame in three emits (546 symbols, ~1500 frames), so a long block mostly computes
+rows it throws away. Decode at 60 s, dev box, per frame against blocks 2 / 4 / 8:
+
+| | per frame | 2 | 4 | 8 |
+|---|---|---|---|---|
+| CPU, 2 threads | 2.45 s | 1.74 | **1.60** | 1.73 |
+| Vega 3 (Vulkan) | 4.20 s | 2.41 | **1.88** | 1.84 |
+
+Full transcription, F32, per-frame export against block 4 (same engine, P4.49-P4.54 in both):
+
+| | 10 s | 60 s |
+|---|---|---|
+| dev box CPU | 0.972 -> 0.895 s (1.09x) | 7.39 -> 6.61 s (1.12x) |
+| dev box Vulkan, Vega 3 | 1.183 -> 0.831 s (1.42x) | 8.00 -> 5.66 s (1.41x) |
+| M1 Pro CPU, 8 threads | 0.221 -> 0.172 s (1.28x) | 1.363 -> 1.091 s (1.25x) |
+| M1 Pro Metal | 0.223 -> 0.174 s (1.28x) | 1.435 -> 1.089 s (1.32x) |
+| workstation Vulkan, Intel iGPU (Arrow Lake) | 0.374 -> 0.269 s (1.39x) | 2.70 -> 1.62 s (1.67x) |
+
+The dev box rows are the Python API, min of three; the M1 and Intel rows are `mprobe`, best min of
+three over two (M1) or three (Intel) interleaved rounds. The encoder does not move on any device (Metal 0.603 s at 60 s in both arms), so all of the
+gain is the decode loop. Metal and the M1's CPU tie again, now at 1.09 s.
+
+**Correctness.** Tokens are identical to the reference at 10 s and 60 s on every device. The engine
+gate passes 272/272 for F32; Q8_0 shows the 269/272 it always has (encoder tolerance against the F32
+oracle, every token matching). The zipformer-small card passes with the new GGUFs. `ARGMAX` has a
+registry test (shape, I32, values across batches) that fails with the output axes swapped. The
+exporter's `test_argmax_lowering` fails both of its cases with the rule unregistered. Ties are not
+torch's: ggml's CPU kernel keeps the last tied index and Vulkan's reduction an arbitrary one, where
+torch keeps the first. No reference token was affected.
+
+**P4.54's open question, answered.** On the Intel iGPU, the `POW` lowering's full transcription is now
+measurable. The per-frame export still scatters: with the lowering on and off interleaved over three
+rounds, the arms swap places, 2.58-2.94 s at 60 s. That is the per-frame loop's synchronize drift, not
+the lowering. With block 4 the runs are stable, and the lowering is slightly ahead: 1.619 against
+1.625 s best of three, medians 1.63 against 1.68 s. At 10 s it is 0.269 against 0.270 s. So `op_pow`
+lowers on every backend, as P4.54 left it.
