@@ -140,6 +140,187 @@ void test_mul_mat_identity() {
     LOOM_CHECK(get_f32(out) == b_data);
 }
 
+// P4.49: a 2-D weight against an activation whose batch axes are > 1 is ONE matrix product. Zipformer's
+// linears reach MUL_MAT as `[C, 1, T]`, and ggml broadcasting the weight over T ran T matrix-vector
+// products. The product has the shape ggml's broadcast gives, the values torch's, and the graph holds a
+// single MUL_MAT whose columns are every frame -- the last is what makes it fast, so it is checked.
+void test_mul_mat_2d_weight_against_batched_activation() {
+    struct Case { int64_t n1, n2, n3; };
+    for (const Case c : {Case{1, 4, 1}, Case{2, 2, 3}}) {
+        GgmlScratch s;
+        const int64_t K = 9, N = 2, cols = c.n1 * c.n2 * c.n3;   // K >= 8: under 8 is P4.51's outer products
+        ggml_tensor* a = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, K, N);
+        ggml_set_input(a);
+        ggml_tensor* b = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, K, c.n1, c.n2, c.n3);
+        ggml_set_input(b);
+
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        ggml_tensor* out = op("MUL_MAT")(pc, {a, b}, {})[0];
+        LOOM_CHECK(out->ne[0] == N && out->ne[1] == c.n1 && out->ne[2] == c.n2 && out->ne[3] == c.n3);
+
+        ggml_cgraph* gf = s.expand(out);
+        int n_mul_mat = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor* node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_MUL_MAT) continue;
+            ++n_mul_mat;
+            LOOM_CHECK(node->src[1]->ne[1] == cols && node->src[1]->ne[2] == 1 && node->src[1]->ne[3] == 1);
+        }
+        LOOM_CHECK(n_mul_mat == 1);
+
+        std::vector<float> wa(K * N), wb(K * cols);
+        for (size_t i = 0; i < wa.size(); ++i) wa[i] = static_cast<float>(i + 1);
+        for (size_t i = 0; i < wb.size(); ++i) wb[i] = static_cast<float>(static_cast<int>(i % 7) - 3);
+        set_f32(a, wa);
+        set_f32(b, wb);
+        s.compute(gf);
+        // Small integers, so every sum is exact and the comparison can be too.
+        std::vector<float> want(N * cols);
+        for (int64_t j = 0; j < cols; ++j)
+            for (int64_t n = 0; n < N; ++n) {
+                float acc = 0;
+                for (int64_t k = 0; k < K; ++k) acc += wa[n * K + k] * wb[j * K + k];
+                want[j * N + n] = acc;
+            }
+        LOOM_CHECK(get_f32(out) == want);
+    }
+}
+
+// P4.51: a product over K < 8 is the sum of K outer products -- one OUT_PROD node and no MUL_MAT,
+// with mul_mat's shape and broadcast (per-head batches, and a 2-D `a` against a batched `b`), and the
+// same values. K = 8 stays a MUL_MAT. Small integers, so every sum is exact.
+void test_mul_mat_small_k_as_outer_products() {
+    struct Case { int64_t K, M, N, a2, a3, b2, b3; bool outer; };
+    for (const Case c : {Case{4, 5, 6, 1, 3, 1, 3, true}, Case{3, 4, 2, 1, 1, 2, 1, true},
+                         Case{1, 3, 5, 2, 1, 2, 2, true}, Case{8, 3, 4, 1, 2, 1, 2, false}}) {
+        GgmlScratch s;
+        ggml_tensor* a = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, c.K, c.M, c.a2, c.a3);
+        ggml_set_input(a);
+        ggml_tensor* b = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, c.K, c.N, c.b2, c.b3);
+        ggml_set_input(b);
+
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        ggml_tensor* out = op("MUL_MAT")(pc, {a, b}, {})[0];
+        LOOM_CHECK(out->ne[0] == c.M && out->ne[1] == c.N && out->ne[2] == c.b2 && out->ne[3] == c.b3);
+
+        ggml_cgraph* gf = s.expand(out);
+        int n_out_prod = 0, n_mul_mat = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            n_out_prod += ggml_graph_node(gf, i)->op == GGML_OP_OUT_PROD;
+            n_mul_mat += ggml_graph_node(gf, i)->op == GGML_OP_MUL_MAT;
+        }
+        LOOM_CHECK(n_out_prod == (c.outer ? 1 : 0) && n_mul_mat == (c.outer ? 0 : 1));
+
+        std::vector<float> wa(static_cast<size_t>(ggml_nelements(a))), wb(static_cast<size_t>(ggml_nelements(b)));
+        for (size_t i = 0; i < wa.size(); ++i) wa[i] = static_cast<float>(static_cast<int>(i % 5) - 2);
+        for (size_t i = 0; i < wb.size(); ++i) wb[i] = static_cast<float>(static_cast<int>(i % 7) - 3);
+        set_f32(a, wa);
+        set_f32(b, wb);
+        s.compute(gf);
+        std::vector<float> want(static_cast<size_t>(ggml_nelements(out)));
+        for (int64_t i3 = 0; i3 < c.b3; ++i3)
+            for (int64_t i2 = 0; i2 < c.b2; ++i2)
+                for (int64_t n = 0; n < c.N; ++n)
+                    for (int64_t m = 0; m < c.M; ++m) {
+                        const int64_t a_off = ((i3 / (c.b3 / c.a3)) * c.a2 + i2 / (c.b2 / c.a2)) * c.M * c.K;
+                        const int64_t b_off = (i3 * c.b2 + i2) * c.N * c.K;
+                        float acc = 0;
+                        for (int64_t k = 0; k < c.K; ++k) acc += wa[a_off + m * c.K + k] * wb[b_off + n * c.K + k];
+                        want[((i3 * c.b2 + i2) * c.N + n) * c.M + m] = acc;
+                    }
+        LOOM_CHECK(get_f32(out) == want);
+    }
+}
+
+// P4.50: the 2-D convolutions' lowerings against a double reference, one case per branch, and the graph
+// each branch is supposed to build -- the point of every branch is the im2col or copy it leaves out.
+// CONV_2D_DW: direct; direct over the transpose (rows under four kernel widths, stride 1), dilated too;
+// an F16 kernel. CONV_2D: a 1x1 whose im2col is a transpose, at one batch and two; a 3x3 at one batch,
+// which skips the output permute's copy.
+float conv_input(int64_t i, int salt) { return static_cast<float>(((i * 7 + salt) % 13) - 6) * 0.125f; }
+
+void test_conv_2d_lowerings_against_reference() {
+    struct Case { const char* op; int64_t W, H, IC, OC, N, KW, KH; int s, p, d; bool f16, transposed; };
+    const Case cases[] = {
+        {"CONV_2D_DW", 9, 7, 2, 2, 2, 3, 3, 2, 1, 1, false, false},   // FastConformer-like: stride 2
+        {"CONV_2D_DW", 5, 24, 3, 3, 1, 3, 3, 1, 1, 1, false, true},   // short rows: over the transpose
+        {"CONV_2D_DW", 6, 30, 2, 2, 1, 3, 2, 1, 2, 2, false, true},   // ... dilated, non-square kernel
+        {"CONV_2D_DW", 7, 6, 2, 2, 1, 3, 3, 1, 1, 1, true, false},    // F16 kernel, cast once
+        {"CONV_2D", 4, 3, 5, 3, 1, 1, 1, 1, 0, 1, false, false},      // 1x1: transpose, no im2col
+        {"CONV_2D", 4, 3, 5, 3, 2, 1, 1, 1, 0, 1, false, false},      // ... at two batches
+        {"CONV_2D", 6, 5, 2, 3, 1, 3, 3, 1, 1, 1, false, false},      // 3x3, one batch: no output copy
+    };
+    for (const Case& c : cases) {
+        const bool dw = std::string(c.op) == "CONV_2D_DW";
+        GgmlScratch s;
+        const ggml_type kt = c.f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        ggml_tensor* kernel = ggml_new_tensor_4d(s.ctx.get(), kt, c.KW, c.KH, dw ? 1 : c.IC, c.OC);
+        ggml_set_input(kernel);
+        ggml_tensor* data = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, c.W, c.H, c.IC, c.N);
+        ggml_set_input(data);
+
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        nlohmann::json attrs = {{"s0", c.s}, {"s1", c.s}, {"p0", c.p}, {"p1", c.p}, {"d0", c.d}, {"d1", c.d}};
+        ggml_tensor* out = op(c.op)(pc, {kernel, data}, attrs)[0];
+        const int64_t OW = (c.W + 2 * c.p - c.d * (c.KW - 1) - 1) / c.s + 1;
+        const int64_t OH = (c.H + 2 * c.p - c.d * (c.KH - 1) - 1) / c.s + 1;
+        LOOM_CHECK(out->ne[0] == OW && out->ne[1] == OH && out->ne[2] == c.OC && out->ne[3] == c.N);
+
+        ggml_cgraph* gf = s.expand(out);
+        int n_im2col = 0, n_dw = 0, n_cont = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_op o = ggml_graph_node(gf, i)->op;
+            n_im2col += o == GGML_OP_IM2COL;
+            n_dw += o == GGML_OP_CONV_2D_DW;
+            n_cont += o == GGML_OP_CONT;
+        }
+        LOOM_CHECK(n_im2col == (dw || (c.KW == 1 && c.KH == 1) ? 0 : 1));
+        if (dw) {
+            LOOM_CHECK(n_dw == 1);
+            LOOM_CHECK(n_cont == (c.transposed ? 3 : 0));   // kernel, data and result transposes
+        } else {
+            LOOM_CHECK(n_cont == (c.KW == 1 && c.KH == 1 ? 1 : 0) + (c.N > 1 ? 1 : 0));
+        }
+
+        std::vector<float> wk(static_cast<size_t>(ggml_nelements(kernel))), wx(static_cast<size_t>(ggml_nelements(data)));
+        for (size_t i = 0; i < wk.size(); ++i) wk[i] = conv_input(static_cast<int64_t>(i), 3);
+        for (size_t i = 0; i < wx.size(); ++i) wx[i] = conv_input(static_cast<int64_t>(i), 5);
+        if (c.f16) {
+            std::vector<ggml_fp16_t> h(wk.size());
+            for (size_t i = 0; i < wk.size(); ++i) h[i] = ggml_fp32_to_fp16(wk[i]);   // exact: multiples of 1/8
+            ggml_backend_tensor_set(kernel, h.data(), 0, h.size() * sizeof(ggml_fp16_t));
+        } else {
+            set_f32(kernel, wk);
+        }
+        set_f32(data, wx);
+        s.compute(gf);
+
+        const std::vector<float> got = get_f32(out);
+        double worst = 0;
+        for (int64_t n = 0; n < c.N; ++n)
+            for (int64_t oc = 0; oc < c.OC; ++oc)
+                for (int64_t oh = 0; oh < OH; ++oh)
+                    for (int64_t ow = 0; ow < OW; ++ow) {
+                        double acc = 0;
+                        for (int64_t ic = dw ? oc : 0; ic < (dw ? oc + 1 : c.IC); ++ic)
+                            for (int64_t kh = 0; kh < c.KH; ++kh)
+                                for (int64_t kw = 0; kw < c.KW; ++kw) {
+                                    const int64_t x = ow * c.s + kw * c.d - c.p, y = oh * c.s + kh * c.d - c.p;
+                                    if (x < 0 || x >= c.W || y < 0 || y >= c.H) continue;
+                                    const int64_t ki = dw ? (oc * c.KH + kh) * c.KW + kw : ((oc * c.IC + ic) * c.KH + kh) * c.KW + kw;
+                                    acc += static_cast<double>(wk[ki]) * wx[((n * c.IC + ic) * c.H + y) * c.W + x];
+                                }
+                        const double g = got[((n * c.OC + oc) * OH + oh) * OW + ow];
+                        worst = std::max(worst, std::fabs(g - acc));
+                    }
+        if (worst > 1e-5) std::fprintf(stderr, "%s %lldx%lld s%d d%d N=%lld: max |d| %.3g\n", c.op, (long long)c.KW, (long long)c.KH, c.s, c.d, (long long)c.N, worst);
+        LOOM_CHECK(worst <= 1e-5);
+    }
+}
+
 void test_add_mul_silu() {
     GgmlScratch s;
     ggml_tensor* a = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 4);
@@ -616,6 +797,126 @@ void test_conv_1d_grouped() {
 // the argmaxes still agreeing. `conv_1d_grouped` makes the activation contiguous before slicing.
 void test_conv_1d_grouped_permuted_input() {
     run_grouped_conv_1d(/*permuted=*/true);
+}
+
+// P4.52: a small grouped convolution is one im2col and one MUL_MAT batched over the groups; one whose
+// im2col would pass 1M elements keeps the per-group loop (CONCAT). Both against a double reference, at
+// one batch and two, strided, padded and dilated.
+void test_conv_1d_grouped_batched_against_reference() {
+    struct Case { int64_t IL, IC, OC, G, K, N; int s, p, d; bool batched; };
+    const Case cases[] = {
+        {2, 16, 16, 4, 2, 1, 1, 0, 1, true},      // Zipformer's decoder conv, scaled down
+        {11, 12, 6, 3, 3, 2, 2, 1, 1, true},      // two batches, strided, padded
+        {13, 8, 16, 2, 3, 1, 1, 2, 2, true},      // dilated, OC/G > IC/G
+        {200, 64, 64, 4, 128, 1, 1, 64, 1, false},  // 64 * 128 * 201 > 1M: the loop
+    };
+    for (const Case& c : cases) {
+        GgmlScratch s(64 * 1024 * 1024);
+        const int64_t ICG = c.IC / c.G, OCG = c.OC / c.G;
+        ggml_tensor* kernel = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, c.K, ICG, c.OC);
+        ggml_set_input(kernel);
+        ggml_tensor* data = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, c.IL, c.IC, c.N);
+        ggml_set_input(data);
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        nlohmann::json attrs = {{"s0", c.s}, {"p0", c.p}, {"d0", c.d}, {"groups", c.G}};
+        ggml_tensor* out = op("CONV_1D")(pc, {kernel, data}, attrs)[0];
+        const int64_t OL = (c.IL + 2 * c.p - c.d * (c.K - 1) - 1) / c.s + 1;
+        LOOM_CHECK(out->ne[0] == OL && out->ne[1] == c.OC && out->ne[2] == c.N);
+
+        ggml_cgraph* gf = s.expand(out);
+        int n_mul_mat = 0, n_concat = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            n_mul_mat += ggml_graph_node(gf, i)->op == GGML_OP_MUL_MAT;
+            n_concat += ggml_graph_node(gf, i)->op == GGML_OP_CONCAT;
+        }
+        LOOM_CHECK(c.batched ? (n_mul_mat == 1 && n_concat == 0) : n_concat == c.G - 1);
+
+        std::vector<float> wk(static_cast<size_t>(ggml_nelements(kernel))), wx(static_cast<size_t>(ggml_nelements(data)));
+        for (size_t i = 0; i < wk.size(); ++i) wk[i] = conv_input(static_cast<int64_t>(i), 3);
+        for (size_t i = 0; i < wx.size(); ++i) wx[i] = conv_input(static_cast<int64_t>(i), 5);
+        set_f32(kernel, wk);
+        set_f32(data, wx);
+        s.compute(gf);
+        const std::vector<float> got = get_f32(out);
+        double worst = 0;
+        for (int64_t n = 0; n < c.N; ++n)
+            for (int64_t oc = 0; oc < c.OC; ++oc)
+                for (int64_t ol = 0; ol < OL; ++ol) {
+                    double acc = 0;
+                    const int64_t g = oc / OCG;
+                    for (int64_t icg = 0; icg < ICG; ++icg)
+                        for (int64_t k = 0; k < c.K; ++k) {
+                            const int64_t x = ol * c.s + k * c.d - c.p;
+                            if (x < 0 || x >= c.IL) continue;
+                            acc += static_cast<double>(wk[(oc * ICG + icg) * c.K + k]) * wx[(n * c.IC + g * ICG + icg) * c.IL + x];
+                        }
+                    worst = std::max(worst, std::fabs(got[(n * c.OC + oc) * OL + ol] - acc));
+                }
+        if (worst > 1e-4) std::fprintf(stderr, "grouped conv G=%lld K=%lld N=%lld: max |d| %.3g\n", (long long)c.G, (long long)c.K, (long long)c.N, worst);
+        LOOM_CHECK(worst <= 1e-4);
+    }
+}
+
+// P4.52: POW with a one-element constant exponent of 2, 0.5, -0.5 or -1 is built from ggml's own ops,
+// so a device runs it; any other exponent keeps the CPU custom op. The exponent has to be a weight --
+// allocated before the graph is built -- for its value to be read at build time.
+// P4.53: ARGMAX is each row's argmax over ne[0], I32, with ne[0] dropped -- across ne[2] batches too,
+// which a joint over a block of frames never needs but a reshape bug would show as the wrong rows.
+void test_argmax_rows() {
+    GgmlScratch s;
+    ggml_tensor* x = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, 7, 3, 2);
+    ggml_set_input(x);
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("ARGMAX")(pc, {x}, {})[0];
+    LOOM_CHECK(out->type == GGML_TYPE_I32);
+    LOOM_CHECK(out->ne[0] == 3 && out->ne[1] == 2 && out->ne[2] == 1 && out->ne[3] == 1);
+
+    std::vector<float> v(42);
+    std::vector<int32_t> want(6);
+    for (int r = 0; r < 6; ++r) {
+        const int peak = (r * 5 + 2) % 7;   // 2, 0, 5, 3, 1, 6: every column but 4, both ends included
+        for (int k = 0; k < 7; ++k) v[r * 7 + k] = static_cast<float>(k == peak ? 10 + r : -(k + r));
+        want[static_cast<size_t>(r)] = peak;
+    }
+    ggml_cgraph* gf = s.expand(out);
+    set_f32(x, v);
+    s.compute(gf);
+    std::vector<int32_t> got(6);
+    ggml_backend_tensor_get(out, got.data(), 0, sizeof(int32_t) * got.size());
+    LOOM_CHECK(got == want);
+}
+
+void test_pow_constant_exponent_is_native() {
+    for (const float e : {2.0f, 0.5f, -0.5f, -1.0f, 3.0f}) {
+        GgmlScratch s;
+        ggml_context_ptr wctx(ggml_init(ggml_init_params{ggml_tensor_overhead() * 2, nullptr, /*no_alloc=*/true}));
+        ggml_tensor* exponent = ggml_new_tensor_1d(wctx.get(), GGML_TYPE_F32, 1);
+        ggml_backend_buffer_ptr wbuf(ggml_backend_alloc_ctx_tensors(wctx.get(), s.backend));
+        set_f32(exponent, {e});
+
+        ggml_tensor* x = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 5, 3);
+        ggml_set_input(x);
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        ggml_tensor* out = op("POW")(pc, {x, exponent}, {})[0];
+        LOOM_CHECK(out->ne[0] == 5 && out->ne[1] == 3);
+        ggml_cgraph* gf = s.expand(out);
+        int n_custom = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) n_custom += ggml_graph_node(gf, i)->op == GGML_OP_MAP_CUSTOM2;
+        LOOM_CHECK(n_custom == (e == 3.0f ? 1 : 0));
+
+        std::vector<float> wx(15);
+        for (size_t i = 0; i < wx.size(); ++i) wx[i] = 0.03f + 0.7f * static_cast<float>(i);
+        set_f32(x, wx);
+        s.compute(gf);
+        const std::vector<float> got = get_f32(out);
+        for (size_t i = 0; i < wx.size(); ++i) {
+            const float want = std::pow(wx[i], e);
+            LOOM_CHECK(std::fabs(got[i] - want) <= 2e-7f * std::fabs(want));
+        }
+    }
 }
 
 // A grouped kernel reaching the DEPTHWISE op must say so rather than abort inside ggml_im2col, whose
@@ -2811,6 +3112,9 @@ int main() {
     test_get_rows_from_a_transposed_view();
     test_get_rows_mismatched_batch_throws();
     test_mul_mat_identity();
+    test_mul_mat_2d_weight_against_batched_activation();
+    test_mul_mat_small_k_as_outer_products();
+    test_conv_2d_lowerings_against_reference();
     test_add_mul_silu();
     test_swiglu();
     test_rms_norm();
@@ -2828,6 +3132,9 @@ int main() {
     test_conv_1d_dw();
     test_conv_1d_grouped();
     test_conv_1d_grouped_permuted_input();
+    test_conv_1d_grouped_batched_against_reference();
+    test_pow_constant_exponent_is_native();
+    test_argmax_rows();
     test_conv_1d_dw_rejects_a_grouped_kernel();
     test_depthwise_conv_transpose_1d_via_composition();
     test_reshape_permute_cont();

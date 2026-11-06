@@ -106,6 +106,20 @@ Outputs op_maximum(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_scale(pc.ctx, add_diff, 0.5f)};
 }
 
+Outputs op_argmax(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    // The index of each row's maximum over ne[0], as I32 with ne[0] dropped: MIL's `reduce_argmax` over
+    // the last axis without keep_dims, which is all the exporter emits (P4.53). It exists so a greedy
+    // choice can stay on the device: Zipformer's joint returned 11661 logits per frame for the driver to
+    // reduce, and on a Vega 3 downloading them cost ~1 ms a row -- a block of 8 frames 10.1 ms a call
+    // against 2.6 ms with the argmax in the graph. An exact tie is not torch's: ggml's CPU kernel keeps
+    // the LAST tied index and Vulkan's tree reduction whichever survives it, where torch keeps the first.
+    expect_n_inputs("ARGMAX", in, 1);
+    ggml_tensor* x = ensure_packed(pc.ctx, in[0]);
+    const int64_t rows = x->ne[1] * x->ne[2] * x->ne[3];
+    ggml_tensor* ids = ggml_argmax(pc.ctx, ggml_reshape_2d(pc.ctx, x, x->ne[0], rows));   // I32 [rows]
+    return {ggml_reshape_3d(pc.ctx, ids, x->ne[1], x->ne[2], x->ne[3])};
+}
+
 Outputs op_reduce_sum(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // Real per-axis reduction, driven by an explicit "axis" (ne-order) + "keep_dims" attr the exporter
     // now writes (tools/loom_mil_compiler/exporter.py's dedicated "reduce_sum" translation) -- MIL's
@@ -363,6 +377,7 @@ struct MilDialectRegistrar {
         reg.register_op("MINIMUM", op_minimum);
         reg.register_op("MAXIMUM", op_maximum);
         reg.register_op("REDUCE_SUM", op_reduce_sum);
+        reg.register_op("ARGMAX", op_argmax);
         reg.register_op("IDENTITY", op_identity);
         reg.register_op("RANGE_1D", op_range_1d);
         reg.register_op("LESS_EQUAL", op_less_equal);
