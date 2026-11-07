@@ -13,6 +13,7 @@
 // nothing is placed and the two arms are the same run -- the test says so and still compares them.
 
 #include "test_util.h"
+#include "posix_env.h"
 
 #include "loom/loom.h"
 
