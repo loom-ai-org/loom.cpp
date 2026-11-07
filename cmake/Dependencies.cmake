@@ -142,24 +142,32 @@ add_subdirectory(${ggml_SOURCE_DIR} ${ggml_BINARY_DIR})
 # PUBLIC and on `ggml-base` rather than on our own targets: the symbol is ggml's, so the DT_NEEDED
 # belongs on the library that references it. Everything downstream -- loom_engine, the tools, the
 # tests, loom-py's `_loom` -- then needs no change and cannot forget.
+#
+# Not asked under MSVC: it has no `__atomic` builtins, so the probe would fail to compile and the
+# search for a libatomic that Windows has no use for would stop the configure. ggml's CPU backend
+# spells its atomics through its own MSVC shim (`ggml-cpu.c`), which needs no library.
 include(CheckCSourceCompiles)
-check_c_source_compiles("
+if(MSVC)
+    set(LOOM_HAVE_BUILTIN_ATOMIC64 TRUE)
+else()
+    check_c_source_compiles("
 #include <stdint.h>
 static uint64_t counter = 1;
 int main(void) { return (int) __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED); }
 " LOOM_HAVE_BUILTIN_ATOMIC64)
-if(NOT LOOM_HAVE_BUILTIN_ATOMIC64)
-    find_library(LOOM_LIBATOMIC NAMES atomic libatomic.so.1)
-    if(NOT LOOM_LIBATOMIC)
-        message(FATAL_ERROR
-            "This toolchain compiles a 64-bit __atomic_fetch_add into a libatomic call (no "
-            "double-word exclusive on ${CMAKE_SYSTEM_PROCESSOR}) and libatomic was not found. "
-            "Install it -- on Debian/Raspbian it is libatomic1 plus the gcc dev package. Without "
-            "it the libraries still build and the first executable, or the first `dlopen`, does "
-            "not.")
+    if(NOT LOOM_HAVE_BUILTIN_ATOMIC64)
+        find_library(LOOM_LIBATOMIC NAMES atomic libatomic.so.1)
+        if(NOT LOOM_LIBATOMIC)
+            message(FATAL_ERROR
+                "This toolchain compiles a 64-bit __atomic_fetch_add into a libatomic call (no "
+                "double-word exclusive on ${CMAKE_SYSTEM_PROCESSOR}) and libatomic was not found. "
+                "Install it -- on Debian/Raspbian it is libatomic1 plus the gcc dev package. Without "
+                "it the libraries still build and the first executable, or the first `dlopen`, does "
+                "not.")
+        endif()
+        target_link_libraries(ggml-base PUBLIC ${LOOM_LIBATOMIC})
+        message(STATUS "64-bit atomics need libatomic on this target: ${LOOM_LIBATOMIC}")
     endif()
-    target_link_libraries(ggml-base PUBLIC ${LOOM_LIBATOMIC})
-    message(STATUS "64-bit atomics need libatomic on this target: ${LOOM_LIBATOMIC}")
 endif()
 
 # LuaJIT: embedded Lua VM for the procedural-generalization orchestration layer (see
@@ -185,6 +193,14 @@ if(NOT luajit_POPULATED)
 endif()
 
 set(LUAJIT_SRC_DIR ${luajit_SOURCE_DIR}/src)
+
+# Windows (MSVC) builds LuaJIT's bootstrap as CMake targets instead of driving a Makefile; that file
+# says why msvcbuild.bat is not the answer either. It defines the same `luajit::luajit`.
+if(MSVC)
+    include(${CMAKE_CURRENT_LIST_DIR}/LuaJitMsvc.cmake)
+    return()
+endif()
+
 set(LUAJIT_LIBRARY ${LUAJIT_SRC_DIR}/libluajit.a)
 
 include(ProcessorCount)

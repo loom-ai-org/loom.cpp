@@ -3,7 +3,8 @@
 // ggml's own node-loop helper, `ggml_graph_view`, lives in a PRIVATE header -- it returns a
 // `ggml_cgraph` by value, so the complete type is required and `ggml.h`'s opaque forward declaration is
 // not enough. This is the one translation unit in the engine that reaches into ggml's `src/`, and the
-// CMakeLists adds that directory to this target's include path for it alone.
+// CMakeLists adds that directory to this target's include path for it alone. Being private it is also
+// not exported, which only matters for a Windows DLL -- `cmake/patches/ggml-0059` marks it GGML_API.
 //
 // The intimacy is affordable here specifically because `cmake/GgmlPin.cmake` pins ggml to an exact
 // revision: a private header cannot shift under us without somebody deliberately bumping that pin, at
@@ -191,7 +192,11 @@ bool sched_callback(ggml_tensor* t, bool ask, void* user_data) {
     return true;   // keep going; false would abandon the rest of the split
 }
 
+// The format check is a GCC/Clang attribute; MSVC has no spelling for it on a definition, and the
+// calls are checked on every other compiler this builds with.
+#if defined(__GNUC__) || defined(__clang__)
 __attribute__((format(printf, 2, 3)))
+#endif
 void append(std::string& out, const char* fmt, ...) {
     char line[256];
     va_list args;
