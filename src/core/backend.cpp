@@ -20,6 +20,16 @@
 #include <sys/sysctl.h>
 #endif
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace loom {
 namespace {
 
@@ -511,10 +521,58 @@ int physical_core_count() {
     if (sysctlbyname("hw.physicalcpu", &n, &len, nullptr, 0) == 0 && n > 0) return n;
     return 0;
 
+#elif defined(_WIN32)
+    // The Linux rule in Windows' vocabulary: one RelationProcessorCore record per physical core, each
+    // carrying the mask of its logical processors, counted when that mask meets this process's
+    // affinity -- so `start /affinity` is honoured the way a cpuset is, and an SMT pair counts once.
+    // And the Apple rule for hybrid parts: only the cores of the HIGHEST EfficiencyClass count (an
+    // Alder Lake's P-cores; on a homogeneous part every core is class 0, so all of them do).
+    //
+    // GetProcessAffinityMask speaks for the process's own processor group only, so cores are matched
+    // within the group this thread runs in. A machine with more than 64 logical processors has several
+    // groups and a process starts in one of them, so that is also the set its pool can use.
+    DWORD_PTR process_mask = 0, system_mask = 0;
+    GROUP_AFFINITY thread_group = {};
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) ||
+        !GetThreadGroupAffinity(GetCurrentThread(), &thread_group)) {
+        return 0;
+    }
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || len == 0) return 0;
+    std::vector<char> buf(len);
+    if (!GetLogicalProcessorInformationEx(
+            RelationProcessorCore, reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data()),
+            &len)) {
+        return 0;
+    }
+    int best_class = -1;
+    int count = 0;
+    for (DWORD off = 0; off < len;) {
+        const auto* rec = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
+        const PROCESSOR_RELATIONSHIP& core = rec->Processor;
+        bool usable = false;
+        for (WORD g = 0; g < core.GroupCount; ++g) {
+            if (core.GroupMask[g].Group == thread_group.Group && (core.GroupMask[g].Mask & process_mask) != 0) {
+                usable = true;
+            }
+        }
+        if (usable) {
+            const int cls = core.EfficiencyClass;
+            if (cls > best_class) {
+                best_class = cls;
+                count = 0;
+            }
+            if (cls == best_class) ++count;
+        }
+        off += rec->Size;
+    }
+    return count;
+
 #else
-    // Every platform this project builds and tests on is covered above -- loom-py publishes manylinux
-    // and macOS wheels and nothing else. Anywhere else keeps ggml's 4 and can be raised with
-    // $LOOM_N_THREADS, which is a better outcome than an untested guess at a topology API.
+    // Every platform this project builds and tests on is covered above -- Linux, macOS and Windows.
+    // Anywhere else keeps ggml's 4 and can be raised with $LOOM_N_THREADS, which is a better outcome
+    // than an untested guess at a topology API.
     return 0;
 #endif
 }

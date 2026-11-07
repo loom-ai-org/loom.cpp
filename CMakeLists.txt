@@ -86,6 +86,22 @@ target_include_directories(loom_engine PUBLIC
 )
 target_link_libraries(loom_engine PUBLIC ggml nlohmann_json::nlohmann_json luajit::luajit)
 
+# MSVC. Three things GCC and Clang give for free:
+#   * EXPORTS. A DLL exports nothing unless told, and this library has no export macro -- on ELF and
+#     Mach-O every symbol is visible by default, which is the arrangement it was written for.
+#     WINDOWS_EXPORT_ALL_SYMBOLS restores that (functions and vtables; a DATA symbol would still need
+#     __declspec(dllimport) on the consumer's side, and none crosses the boundary today). It only
+#     acts when the library is SHARED -- loom-py's case -- and is inert in the default static build.
+#   * /utf-8. Sources and headers carry UTF-8 in comments and string literals (the tokenizers match
+#     "▁" and friends); without it MSVC reads them in the system codepage, which on a French Windows
+#     is cp1252. PUBLIC because the headers reach every consumer.
+#   * _USE_MATH_DEFINES, without which <cmath> does not define M_PI (src/ops/fft.cpp).
+if(MSVC)
+    set_target_properties(loom_engine PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    target_compile_options(loom_engine PUBLIC /utf-8)
+    target_compile_definitions(loom_engine PRIVATE _USE_MATH_DEFINES)
+endif()
+
 # `src/core/profile.cpp` includes ggml's PRIVATE `ggml-impl.h`, for the one declaration ggml does not
 # export: `ggml_graph_view`, which returns a `ggml_cgraph` by value and so needs the complete type.
 # PRIVATE and target-scoped on purpose -- exactly one translation unit may see ggml's internals, and a

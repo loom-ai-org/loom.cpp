@@ -404,6 +404,13 @@ kernel measures ~1.6x on the shapes above; at the model's own dilations (1, 2, 3
 shapes give 1.2-1.4x, and that difference is most of the gap between the bench and the end-to-end
 number.
 
+
+**Its Windows half is a separate file, `ggml-0059-windows-msvc.patch`,** and belongs in this PR when
+it goes up. 6 includes `<unistd.h>` unconditionally for the cache probe's `sysconf`, which stops every
+MSVC build of `ops.cpp`. 59 guards that include and gives the probe a Windows arm, reading
+`GetLogicalProcessorInformation`'s largest L2 and L3. Without that arm Windows gets the 512 KB floor.
+On the Celeron N4100 it was first built on (4 MB shared L2, no L3), the budget becomes 4 MB.
+
 ---
 
 ## PR 7 — CPU backend: fuse the `LEAKY_RELU` before a `CONV_2D` and the residual `ADD` after it
