@@ -1,13 +1,9 @@
 #include "loom/core/transcribe.h"
 
 #include "loom/core/asr_long_form.h"
+#include "loom/core/asr_text.h"
 #include "loom/core/audio_window.h"
-#include "loom/core/bpe_vocab.h"
-#include "loom/core/ctc_vocab.h"
-#include "loom/core/funasr_vocab.h"
 #include "loom/core/model_contract.h"
-#include "loom/core/vocab.h"
-#include "loom/core/wordpiece_vocab.h"
 #include "loom/loom_errors.h"
 
 #include <algorithm>
@@ -105,26 +101,7 @@ std::vector<int32_t> run_driver(LoomLuaBridge& bridge, const std::vector<double>
 
 Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
                          const std::vector<float>& waveform, const TranscribeOptions& options) {
-    // Five vocab schemas reach this path, so all are tried: NeMo's checkpoints carry SentencePiece
-    // ("llama"/"t5" -> loom::Vocab), Whisper's carries GPT-2 byte-level BPE ("gpt2" -> BpeVocab),
-    // family 4's carry the CTC character table ("ctc" -> CtcVocab), family 5's FunASR's table, and
-    // NeMo's older WordPiece checkpoints (Citrinet-256-ls, `tokenizer.type: wpe`) a BERT vocabulary
-    // ("bert" -> WordPieceVocab), written already in the phantom-space shape its decode reads.
-    // Only the BPE one can resolve a token by TEXT, which is what timestamps need.
-    //
-    // **`Vocab::load` LAST, and the order is load-bearing**: the other two return nullptr for a schema
-    // that is not their own, while `Vocab::load` THROWS on one -- so asking the SentencePiece loader
-    // about a gpt2 or ctc file kills the run before the right loader is ever reached.
-    auto bpe_vocab = BpeVocab::load(model);
-    auto ctc_vocab = bpe_vocab ? nullptr : CtcVocab::load(model);
-    // Family 5's, whose table is flat like family 4's but whose pieces compose differently -- `@@`
-    // marks a continuation, CJK eats the space before it, and letter runs collapse. See FunasrVocab.
-    auto funasr_vocab = (bpe_vocab || ctc_vocab) ? nullptr : FunasrVocab::load(model);
-    auto wp_vocab = (bpe_vocab || ctc_vocab || funasr_vocab) ? nullptr : WordPieceVocab::load(model);
-    auto spm_vocab = (bpe_vocab || ctc_vocab || funasr_vocab || wp_vocab) ? nullptr : Vocab::load(model);
-    if (!spm_vocab && !bpe_vocab && !ctc_vocab && !funasr_vocab && !wp_vocab) {
-        throw LoadError("transcribe: model has no tokenizer vocab (tokenizer.ggml.model KV missing)");
-    }
+    AsrText asr_text(model);
     if (!model.has_kv("model.driver_script")) {
         throw LoadError("transcribe: model carries no driver_script; re-export it with `loom-export "
                         "<checkpoint> --task automatic-speech-recognition`");
@@ -137,39 +114,11 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     // model_contract.h, and docs/HIGH-LEVEL-API.md §3). Files exported before the table existed get the
     // Whisper spellings back as a documented fallback inside `read`.
     const ModelContract contract = ModelContract::read(model);
-    const AsrDecodeTable table = AsrDecodeTable::read(model, bpe_vocab.get(), contract);
+    const AsrDecodeTable table = AsrDecodeTable::read(model, asr_text.bpe(), contract);
 
-    // Control tokens a transcript must not contain, dropped before detokenizing because each is a real
-    // vocabulary piece that otherwise prints as its literal spelling: the end-of-sequence token, which
-    // the driver returns deliberately, and `<|notimestamps|>`, which is the model stating something
-    // about the decode rather than a word that was spoken. Timestamp markers are NOT dropped.
-    //
-    // EOS is added here rather than read from the table because every vocabulary family names it the
-    // same way, in `tokenizer.ggml.eos_token_id` -- it needs no per-task declaration to be found.
+    asr_text.add_control_ids(table.control_ids);
     const int32_t eos_id = default_eos_token(model);
-    std::vector<int32_t> control_ids = table.control_ids;
-    control_ids.push_back(eos_id);
-    // A WordPiece vocabulary's specials are real CTC classes and NeMo's `ids_to_text` drops them
-    // (`remove_special_tokens=True`), so a stray `[UNK]` never reaches the transcript there either.
-    if (wp_vocab) {
-        for (int32_t id : {wp_vocab->pad_id(), wp_vocab->unk_id(), wp_vocab->cls_id(), wp_vocab->sep_id(),
-                           wp_vocab->mask_id()}) {
-            if (id >= 0) control_ids.push_back(id);
-        }
-    }
-    const auto detokenize = [&](const std::vector<int32_t>& ids) {
-        std::vector<int32_t> text_ids;
-        text_ids.reserve(ids.size());
-        for (int32_t id : ids) {
-            if (std::find(control_ids.begin(), control_ids.end(), id) == control_ids.end()) {
-                text_ids.push_back(id);
-            }
-        }
-        if (ctc_vocab) return ctc_vocab->decode(text_ids);
-        if (funasr_vocab) return funasr_vocab->decode(text_ids);
-        if (wp_vocab) return wp_vocab->decode(text_ids);
-        return spm_vocab ? spm_vocab->decode(text_ids) : bpe_vocab->decode(text_ids);
-    };
+    const auto detokenize = [&](const std::vector<int32_t>& ids) { return asr_text.detokenize(ids); };
 
     Transcription out;
 
@@ -201,7 +150,7 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     const auto offers = [&](const std::vector<std::string>& declared, const char* probe) {
         if (!declared.empty()) return true;
         if (clip == 0) return false;
-        return table.legacy_spelling && bpe_vocab && bpe_vocab->piece_to_id(probe) >= 0;
+        return table.legacy_spelling && asr_text.bpe() && asr_text.bpe()->piece_to_id(probe) >= 0;
     };
     const bool selectable_language = offers(table.language_names, "<|en|>");
     const bool selectable_task = offers(table.task_names, "<|transcribe|>");
@@ -227,7 +176,7 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
                              bool selectable) -> int32_t {
         if (name.empty()) return -1;
         int32_t id = is_task ? table.task(name) : table.language(name);
-        if (id < 0 && table.legacy_spelling && bpe_vocab) id = bpe_vocab->piece_to_id("<|" + name + "|>");
+        if (id < 0 && table.legacy_spelling && asr_text.bpe()) id = asr_text.bpe()->piece_to_id("<|" + name + "|>");
         if (id < 0) {
             // A file that DECLARES which languages it speaks overrules the "no tokens, so harmless"
             // reading: an English-only checkpoint asked for French has no way to comply, and ignoring
@@ -381,15 +330,7 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
             chunk == 0 ? plan_windows(n_real, table.long_form) : std::vector<Window>{{0, n_real, n_real}};
         std::vector<int32_t> ids;
         if (windows.size() > 1) {
-            const auto text_only = [&](const std::vector<int32_t>& raw) {
-                std::vector<int32_t> kept;
-                for (int32_t id : raw) {
-                    if (std::find(control_ids.begin(), control_ids.end(), id) == control_ids.end()) {
-                        kept.push_back(id);
-                    }
-                }
-                return kept;
-            };
+            const auto text_only = [&](const std::vector<int32_t>& raw) { return asr_text.text_ids(raw); };
             std::vector<std::vector<int32_t>> per_window;
             per_window.reserve(windows.size());
             for (const Window& w : windows) {

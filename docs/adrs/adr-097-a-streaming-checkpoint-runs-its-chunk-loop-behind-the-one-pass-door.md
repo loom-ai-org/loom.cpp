@@ -39,7 +39,8 @@ And for the latency: one file at one setting, one file with all three, or three 
 
 Option 2, at chunk 32 / left 128, in one file (the user, 2026-11-08). The driver is written as `init`,
 `feed`, `finish`, and the one-pass door is init, a feed per chunk of the whole clip, finish, so a live door
-can call the same three. The live door is a hub item.
+can call the same three. The live door followed the same day:
+[ADR-098](adr-098-a-live-stream-keeps-its-state-in-the-engine.md).
 
 ## Consequences
 

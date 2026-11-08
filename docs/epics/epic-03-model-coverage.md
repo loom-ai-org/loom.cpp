@@ -1809,16 +1809,21 @@ workstation's GPU is on a training job.
 same vocabulary, one `model.pt` behind three released latencies. The export takes 32 / 128 (640 ms chunks,
 2.56 s of attention to the left) and runs upstream's `zipformer inference --streaming 1` loop in the driver,
 behind the one-pass `speech2text` door ([ADR-097](../adrs/adr-097-a-streaming-checkpoint-runs-its-chunk-loop-behind-the-one-pass-door.md)).
-A live door is a hub item. `zipformer_streaming_export.py`; `_is_zipformer` no longer claims a chunk-causal
-checkpoint.
+It is also the first file with a live door: audio pushed as it arrives, ids back as they are decoded
+([ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md), [Epic-06](epic-06-high-level-api-and-hosts.md#streaming-the-live-door)).
+`zipformer_streaming_export.py`; `_is_zipformer` no longer claims a chunk-causal checkpoint.
 
-**Four phases.** `fbank` is the non-streaming leaf's kaldi front end over the whole clip, followed by the
-`log(1e-10)` frames upstream pads with, so that every chunk is a row range of one retained output.
+**Four phases.** `fbank` is the non-streaming leaf's kaldi front end followed by the `log(1e-10)` frames
+upstream pads with. The driver runs it per chunk over a window of samples starting one hop before the chunk's
+first frame: kaldi's `snip_edges=False` reflects only past the clip's ends, so the window's rows from its
+second on are the clip's own frames: the encoder output is unchanged to the last digit (en 8.583e-06
+from the reference either way), and the 73 clips' ids are again 73/73.
 `encoder_chunk` is `StreamingEncoderWrapper.forward` at fixed shapes: 77 feature rows and 74 states in,
-`[1, 16, 512]` and 74 states out. The driver feeds output `k + 1` back as input `state_k` on the next call, so
-the state never leaves the engine. `decoder` and `joint` are the non-streaming leaf's, block-4 joint included.
-The driver is written as `init` / `feed` / `finish`, and `return_encoder` returns the encoder rows instead of
-the ids.
+`[1, 16, 512]` and 74 states out. The driver keeps the outputs in the stream's state
+(`loom.keep_state('encoder', 'encoder_chunk')`) and reads output `k + 1` back as input `state_k` on the next
+call, so the state never leaves the engine. `decoder` and `joint` are the non-streaming leaf's, block-4 joint
+included. The driver is `stream_open` / `stream_feed` / `stream_finish`, `infer` is the three in one call, and
+`return_encoder` returns the encoder rows instead of the ids.
 
 **The reference's streaming modules run as they are**, apart from three changes. The relative shift is NeMo's
 `rel_shift`, which holds for a score width of `2T - 1 + L`, in place of a traced `gather`. `processed_lens` is
@@ -1852,8 +1857,10 @@ The non-streaming small scores 7.22% on the same clips; upstream rates this chec
 test-clean against 3.78%. The engine gate `test_e2e_zipformer_streaming_mil_export` checks the encoder rows,
 tokens and text on three clips. Fed zero states on every call, it fails at all three levels: encoder 4.98 off,
 24 tokens for 180. **Cost is linear in the clip**: 60 s took 7.3 s, 120 s 14.0 s, 400 s 46.5 s (8.2x to 8.6x real
-time, RTF 0.12), against 25 s for 120 s with the non-streaming leaf (4.8x, RTF 0.21). Peak memory still grows, 280 / 373 / 785 MB. That is the whole-clip
-fbank and the waveform held as Lua doubles, not the encoder. The GPUs have not run this model.
+time, RTF 0.12), against 25 s for 120 s with the non-streaming leaf (4.8x, RTF 0.21). With the whole-clip fbank,
+peak memory grew 280 / 373 / 785 MB; the per-chunk fbank took 60 s from 244 MB to 217 MB one-pass and 180 MB
+streamed in 100 ms pieces, at the same speed (7.67-7.82x real time, RTF 0.128-0.130). What still grows
+one-pass is the waveform held as Lua doubles. The GPUs have not run this model.
 
 ### Family 1's CTC leaf at 10M: Citrinet-256 (LibriSpeech)
 
