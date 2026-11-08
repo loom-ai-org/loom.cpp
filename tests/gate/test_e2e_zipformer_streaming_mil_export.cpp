@@ -6,6 +6,9 @@
 // Hence the TENSOR oracle first -- every chunk's encoder rows, through the driver's own loop
 // (`return_encoder`) -- then tokens, then text.
 //
+// The live door (ADR-098) is graded against the same ids: pushed in pieces of several sizes, and as two
+// interleaved streams with a one-pass call between their pushes.
+//
 // Fixture: `loom-exporter/fixture_gen/reference_forward_zipformer_streaming.py`. Set
 // LOOM_ZIPFORMER_STREAMING_GGUF and LOOM_ZIPFORMER_STREAMING_REF_DIR; the test skips cleanly without them.
 
@@ -127,6 +130,53 @@ int main() {
         const loom::audio::Transcription text = loom::audio::transcribe(bridge, *model, waveform, {});
         std::fprintf(stderr, "%s: text \"%s\"\n", names[i].c_str(), text.text.c_str());
         LOOM_CHECK(text.text == read_text(ref + "/ref_text_" + index + ".txt"));
+
+        // ---- 4. the live door (ADR-098): the same ids, whatever the pieces --------------------------
+        // A chunk runs once its window of samples has arrived, so where a piece boundary falls must not
+        // matter: 10 ms, a prime count that lands mid-hop, and one second. The ids must also ARRIVE as
+        // the audio does, not all at `finish` -- a stream that buffered everything would pass the
+        // equality above and be no stream at all.
+        const auto same_ids = [&](const std::vector<int32_t>& ids) {
+            if (ids.size() != want.size()) return false;
+            for (size_t t = 0; t < ids.size(); ++t) {
+                if (ids[t] != static_cast<int32_t>(want[t])) return false;
+            }
+            return true;
+        };
+        for (const size_t piece : {size_t{160}, size_t{1999}, size_t{16000}}) {
+            loom::audio::TranscriptionStream stream(bridge, *model);
+            size_t before_finish = 0;
+            for (size_t at = 0; at < waveform.size(); at += piece) {
+                stream.push(waveform.data() + at, std::min(piece, waveform.size() - at));
+            }
+            before_finish = stream.tokens().size();
+            const loom::audio::TranscriptUpdate last = stream.finish();
+            std::fprintf(stderr, "%s: live, %zu-sample pieces, %zu of %zu id(s) before finish, \"%s\"\n",
+                         names[i].c_str(), piece, before_finish, stream.tokens().size(), last.text.c_str());
+            LOOM_CHECK(same_ids(stream.tokens()));
+            LOOM_CHECK(last.text == text.text);
+            // Everything but the final chunk or two decodes before the input ends: the last 13 feature
+            // frames of lookahead and the padding are all `finish` holds back.
+            if (waveform.size() > 3 * 16000) LOOM_CHECK(before_finish * 2 > stream.tokens().size());
+        }
+
+        // Two streams on one model, pushed in alternation, with a one-pass call between their pushes:
+        // the state is per stream, so neither sees the other or the one-pass call.
+        {
+            loom::audio::TranscriptionStream a(bridge, *model);
+            loom::audio::TranscriptionStream b(bridge, *model);
+            const size_t half = waveform.size() / 2;
+            a.push(waveform.data(), half);
+            b.push(waveform.data(), half / 3);
+            const loom::audio::Transcription between = loom::audio::transcribe(bridge, *model, waveform, {});
+            LOOM_CHECK(between.text == text.text);
+            a.push(waveform.data() + half, waveform.size() - half);
+            b.push(waveform.data() + half / 3, waveform.size() - half / 3);
+            a.finish();
+            b.finish();
+            LOOM_CHECK(same_ids(a.tokens()));
+            LOOM_CHECK(same_ids(b.tokens()));
+        }
     }
 
     LOOM_TEST_REPORT_AND_RETURN();

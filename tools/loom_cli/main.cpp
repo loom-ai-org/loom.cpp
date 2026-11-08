@@ -18,6 +18,7 @@
 
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -36,7 +37,7 @@ void print_usage(const char* argv0) {
                   "usage: %s --model <path.gguf> --prompt \"<text or token ids>\" [--n-predict N]\n"
                   "       %s --model <asr.gguf> --wav <path.wav> [--language en] "
                   "[--task transcribe|translate] [--target-language xx] [--timestamps] "
-                  "[--no-condition-on-previous]\n"
+                  "[--no-condition-on-previous] [--stream MS]\n"
                   "       %s --model <tts-or-codec.gguf> --prompt \"<phonemes|text|codes>\" "
                   "--out out.wav\n"
                   "       %s --model <voice-cloning-tts.gguf> --wav <ref.wav> "
@@ -496,10 +497,37 @@ std::string format_time(double seconds) {
     return buf;
 }
 
+// `--stream MS`: the clip through `TranscriptionStream`, one push per MS of audio. Each update that adds
+// text prints with the audio time it was decoded at -- the end of the piece that completed it -- which
+// is the transcript a live caller would have seen by then.
+void run_asr_stream(loom::Session& session, const loom::GgufModel& model, const std::vector<float>& waveform,
+                    uint32_t rate, uint32_t stream_ms) {
+    using clock = std::chrono::steady_clock;
+    const size_t piece = std::max<size_t>(1, static_cast<size_t>(rate) * stream_ms / 1000);
+    loom::audio::TranscriptionStream stream(session.bridge(), model);
+    const auto print = [&](const loom::audio::TranscriptUpdate& u) {
+        if (u.delta.empty()) return;
+        std::printf("[%s] %s%s\n", format_time(static_cast<double>(u.samples) / rate).c_str(),
+                    u.revised ? "(revised) " : "", u.delta.c_str());
+        std::fflush(stdout);
+    };
+    const auto t0 = clock::now();
+    for (size_t at = 0; at < waveform.size(); at += piece) {
+        print(stream.push(waveform.data() + at, std::min(piece, waveform.size() - at)));
+    }
+    print(stream.finish());
+    const double wall = std::chrono::duration<double>(clock::now() - t0).count();
+    const double audio = static_cast<double>(waveform.size()) / rate;
+    std::printf("transcript: %s\n", stream.text().c_str());
+    std::fprintf(stderr, "(streamed %.2f s in %u ms pieces: %.2fx real time, RTF %.3f; stream state %.1f MB)\n",
+                 audio, stream_ms, wall > 0 ? audio / wall : 0.0, audio > 0 ? wall / audio : 0.0,
+                 (stream.state().tensor_bytes() + stream.state().value_bytes()) / 1e6);
+}
+
 void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string& wav_path,
              const std::string& language_name, const std::string& task_name,
              const std::string& target_language_name, bool timestamps,
-             bool condition_on_previous) {
+             bool condition_on_previous, uint32_t stream_ms) {
     // EVERYTHING BELOW THE ARGUMENT PARSING IS THE ENGINE'S NOW (loom/core/transcribe.h). This function
     // used to hold the whole long-form loop -- windowing, segment splitting, the timestamp-aware seek,
     // prev_tokens conditioning -- and loom-py could not reach any of it, so its users got fixed cuts
@@ -516,6 +544,20 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     // (loom/core/session.h). The copy that used to be here attached a KvCache and no ConvStateCache,
     // which would have thrown inside the driver for any speech model carrying ShortConv blocks.
     loom::Session session(model, backends);
+
+    if (stream_ms > 0) {
+        // The live door, fed from a file: the clip pushed in pieces of `stream_ms` as fast as they
+        // decode, each piece's new text printed when it lands. The options below select a decode the
+        // live door does not take yet, so naming one is refused rather than ignored.
+        if (!language_name.empty() || !task_name.empty() || !target_language_name.empty() || timestamps ||
+            !condition_on_previous) {
+            throw loom::Error("--stream takes no --language, --task, --target-language, --timestamps or "
+                              "--no-condition-on-previous: the live door decodes with the file's defaults");
+        }
+        run_asr_stream(session, model, waveform, asr_rate ? asr_rate : 16000, stream_ms);
+        print_device_report(session.bridge());
+        return;
+    }
 
     loom::audio::TranscribeOptions options;
     options.timestamps = timestamps;
@@ -559,6 +601,7 @@ int main(int argc, char** argv) {
     std::string target_language_name;
     bool timestamps = false;
     bool condition_on_previous = true;
+    uint32_t stream_ms = 0;
     std::string system_text;
     bool has_prompt = false;
     bool has_ref_text = false;
@@ -615,6 +658,13 @@ int main(int argc, char** argv) {
             target_language_name = argv[++i];
         } else if (arg == "--timestamps") {
             timestamps = true;
+        } else if (arg == "--stream" && i + 1 < argc) {
+            // Push the --wav clip through the live door in pieces of this many milliseconds.
+            stream_ms = static_cast<uint32_t>(std::stoul(argv[++i]));
+            if (stream_ms == 0) {
+                std::fprintf(stderr, "error: --stream takes a piece length in milliseconds above 0\n");
+                return 1;
+            }
         } else if (arg == "--no-condition-on-previous") {
             // On by default, as in Whisper's own CLI, and switchable for the same reason it is there:
             // carried context is what makes a sentence survive a window boundary, and it is also what
@@ -1300,7 +1350,7 @@ int main(int argc, char** argv) {
 
         if (has_wav) {
             run_asr(*model, backends, wav_path, language_name, task_name, target_language_name, timestamps,
-                    condition_on_previous);
+                    condition_on_previous, stream_ms);
         }
     } catch (const loom::Error& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

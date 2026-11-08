@@ -7,6 +7,7 @@
 #include <functional>
 #include "loom/core/kv_cache.h"
 #include "loom/core/output_store.h"
+#include "loom/core/stream_state.h"
 #include "loom/loom_errors.h"
 
 extern "C" {
@@ -206,12 +207,40 @@ void copy_row_range(ggml_tensor* src, ggml_tensor* dst, int64_t first_row, int64
 // Deliberately a table with named fields rather than a bare string or an `{module, index}` pair: it is
 // self-describing where a driver script is read (out of a GGUF, most often), and it cannot collide with
 // a two-element data array.
+//
+// `{state = "name"}` is the same reference into the current call's stream state (stream_state.h): the
+// tensors a driver kept with `loom.keep_state`, read with the same `index`/`row`/`rows`.
 bool is_output_ref(lua_State* L, int value_idx) {
     if (lua_type(L, value_idx) != LUA_TTABLE) return false;
     lua_getfield(L, value_idx, "from");
-    const bool is_ref = lua_type(L, -1) == LUA_TSTRING;
+    bool is_ref = lua_type(L, -1) == LUA_TSTRING;
     lua_pop(L, 1);
+    if (!is_ref) {
+        lua_getfield(L, value_idx, "state");
+        is_ref = lua_type(L, -1) == LUA_TSTRING;
+        lua_pop(L, 1);
+    }
     return is_ref;
+}
+
+// What a `StoreLookup` resolves a stream-state name under. Module names are topology names, which are
+// identifiers, so nothing registered can start with this.
+const std::string kStateRefPrefix = "state:";
+
+// The lookup key of the reference at `value_idx`: the module a `{from = ...}` names, or the prefixed
+// state entry a `{state = ...}` names.
+std::string output_ref_key(lua_State* L, int value_idx) {
+    lua_getfield(L, value_idx, "from");
+    if (lua_type(L, -1) == LUA_TSTRING) {
+        std::string key = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        return key;
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, value_idx, "state");
+    std::string key = kStateRefPrefix + lua_tostring(L, -1);
+    lua_pop(L, 1);
+    return key;
 }
 
 // Fills `dst` from another module's retained output, backend-side: `ggml_backend_tensor_copy` moves the
@@ -227,9 +256,7 @@ bool is_output_ref(lua_State* L, int value_idx) {
 // is refused or accepted on exactly the terms the copy was.
 void set_tensor_from_output_ref(lua_State* L, int value_idx, ggml_tensor* dst, const StoreLookup& lookup,
                                  const char* fname, GraphBuilder* aliaser = nullptr) {
-    lua_getfield(L, value_idx, "from");
-    const std::string src_module = lua_tostring(L, -1);
-    lua_pop(L, 1);
+    const std::string src_module = output_ref_key(L, value_idx);
 
     // 1-based, like the declared-output list it indexes (and like `loom.get_output`'s own `index`).
     lua_getfield(L, value_idx, "index");
@@ -980,9 +1007,7 @@ LoomLuaBridge::SequenceSource LoomLuaBridge::read_sequence_source(LoomLuaBridge*
         return src;
     }
     src.by_ref = true;
-    lua_getfield(L, arg, "from");
-    src.module = lua_tostring(L, -1);
-    lua_pop(L, 1);
+    src.module = output_ref_key(L, arg);
     lua_getfield(L, arg, "index");
     src.index1 = lua_isnil(L, -1) ? 1 : static_cast<int64_t>(std::llround(lua_tonumber(L, -1)));
     lua_pop(L, 1);
@@ -2316,7 +2341,89 @@ int LoomLuaBridge::l_seed_kv(lua_State* L) {
     }
 }
 
+StreamState& LoomLuaBridge::active_state(LoomLuaBridge* self, const char* fname) {
+    if (self->active_state_ == nullptr) {
+        throw Error(std::string(fname) + ": no driver call is running, so there is no stream state");
+    }
+    return *self->active_state_;
+}
+
+// `loom.state(name)`: what `loom.set_state` stored under `name` in this stream -- a number when a
+// number was stored, a table when a table was -- or nil when nothing was.
+int LoomLuaBridge::l_state(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string name = luaL_checkstring(L, 1);
+        const StreamState::Value* v = active_state(self, "loom.state").value(name);
+        if (v == nullptr) {
+            lua_pushnil(L);
+        } else if (v->scalar) {
+            lua_pushnumber(L, v->data.empty() ? 0.0 : v->data[0]);
+        } else {
+            push_number_array(L, v->data);
+        }
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.state: %s", e.what());
+    }
+}
+
+// `loom.set_state(name, value)`: a number or a flat array of numbers, kept by the host between calls;
+// nil removes the entry.
+int LoomLuaBridge::l_set_state(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string name = luaL_checkstring(L, 1);
+        StreamState& state = active_state(self, "loom.set_state");
+        if (lua_isnoneornil(L, 2)) {
+            state.erase_value(name);
+        } else if (lua_type(L, 2) == LUA_TNUMBER) {
+            state.set_value(name, StreamState::Value{{lua_tonumber(L, 2)}, true});
+        } else {
+            state.set_value(name, StreamState::Value{read_number_array(L, 2), false});
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.set_state: %s", e.what());
+    }
+}
+
+// `loom.keep_state(name, module)`: copies every retained output of `module` into the stream's tensor
+// entry `name`, backend to backend, for a later call of this stream to read as `{state = name, ...}`.
+//
+// A copy and not a hand-over of the module's store, because a module's cached graph ends in a `cpy`
+// into that store's tensors: swapping the store out from under it is the dangling-destination case
+// `OutputStore::layout_epoch` exists for. A transducer's whole encoder state is about 1.3 MB, copied
+// once per 640 ms chunk.
+int LoomLuaBridge::l_keep_state(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string name = luaL_checkstring(L, 1);
+        const std::string module = luaL_checkstring(L, 2);
+        StreamState& state = active_state(self, "loom.keep_state");
+        OutputStore& src = retained_store(self, module);
+        OutputStore& dst = state.tensors_for_write(name, self->modules_.at(module).backends.primary);
+        std::vector<ggml_tensor*> outs(src.size());
+        for (size_t i = 0; i < src.size(); ++i) outs[i] = src.get(i);
+        const std::vector<ggml_tensor*>& slots = dst.reshape(outs);
+        for (size_t i = 0; i < outs.size(); ++i) ggml_backend_tensor_copy(outs[i], slots[i]);
+        dst.bump_generation();
+        return 0;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.keep_state: %s", e.what());
+    }
+}
+
 OutputStore& LoomLuaBridge::retained_store(LoomLuaBridge* self, const std::string& module) {
+    if (module.compare(0, kStateRefPrefix.size(), kStateRefPrefix) == 0) {
+        const std::string name = module.substr(kStateRefPrefix.size());
+        OutputStore* store = active_state(self, "{state = ...}").tensors(name);
+        if (store == nullptr || !store->filled()) {
+            throw Error("stream state '" + name + "' holds no tensors -- nothing has kept them with "
+                         "loom.keep_state('" + name + "', module) in this stream");
+        }
+        return *store;
+    }
     const auto it = self->modules_.find(module);
     if (it == self->modules_.end()) {
         throw Error("unregistered module '" + module + "'");
@@ -2361,6 +2468,8 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"expand_by_duration_and_retain", &LoomLuaBridge::l_expand_by_duration_and_retain},
         {"get_weight", &LoomLuaBridge::l_get_weight},
         {"seed_kv", &LoomLuaBridge::l_seed_kv},
+        {"state", &LoomLuaBridge::l_state},               {"set_state", &LoomLuaBridge::l_set_state},
+        {"keep_state", &LoomLuaBridge::l_keep_state},
     };
     for (const auto& b : bindings) {
         lua_pushlightuserdata(L_, this);
@@ -2454,6 +2563,22 @@ bool LoomLuaBridge::has_function(const std::string& fn_name) const {
 }
 
 LoomLuaBridge::Value LoomLuaBridge::call(const std::string& fn_name, const std::unordered_map<std::string, Value>& args) {
+    StreamState scratch;
+    return call(fn_name, args, scratch);
+}
+
+LoomLuaBridge::Value LoomLuaBridge::call(const std::string& fn_name,
+                                         const std::unordered_map<std::string, Value>& args,
+                                         StreamState& state) {
+    // Restored on every way out, a throw included: a driver call never runs inside another, but a
+    // binding reached after this returns must find no state rather than a dangling one.
+    struct ActiveState {
+        LoomLuaBridge* self;
+        StreamState* previous;
+        ~ActiveState() { self->active_state_ = previous; }
+    } guard{this, active_state_};
+    active_state_ = &state;
+
     lua_getglobal(L_, fn_name.c_str());
     if (!lua_isfunction(L_, -1)) {
         lua_pop(L_, 1);
