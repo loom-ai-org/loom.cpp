@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: host-api
-last_updated: 2026-10-01
+last_updated: 2026-11-08
 ---
 
 # Epic-06: The High-Level API and Its Hosts
@@ -96,6 +96,96 @@ not face:
   replay) are sent only to a driver that reads `inputs.waveform` / `inputs.ref_audio` +
   `inputs.ref_tokens`; `--language` is a 1-based index into `loom.text.languages`, as in loom-py.
   `--n-predict` caps FRAMES and is sent only when given.
+
+### Streaming (planned): which models can, and how
+
+Every door today takes a whole input and returns a whole output. A streaming API covers three things.
+**Audio in:** the host pushes audio as it arrives and reads partial results. **Audio out:** a TTS hands back
+audio while it is still generating. **Tokens out:** an LM hands back each token as it is drawn. The survey
+below (2026-11-08, user: "all models amenable to a streaming API get it, even if they don't have stream in
+the name") covers all 72 published model cards. It was read off the reference code, the checkpoints' READMEs and
+the exports; no row has been run streamed yet.
+
+The kinds of streaming, by how close a streamed result is to the one-pass one:
+
+* **Exact:** a causal model whose state is carried between calls (or recomputed over a window at least
+  as long as its receptive field) gives the one-pass numbers. Zipformer streaming shows the state can stay
+  in the engine as retained outputs
+  ([ADR-097](../adrs/adr-097-a-streaming-checkpoint-runs-its-chunk-loop-behind-the-one-pass-door.md)).
+* **The reference's own streaming mode:** upstream defines one, and it computes different numbers from its
+  offline mode (other masks, re-decoding). The oracle is that mode, not the one-pass export.
+* **Generic:** no upstream mode. Approaches include re-decoding a growing or sliding window and committing
+  a stable prefix (whisper_streaming's local agreement) for ASR, sentence-by-sentence synthesis for TTS,
+  and overlapping windows for a non-causal codec. The output differs from one pass at the seams.
+
+**Audio in (ASR, VAD, wake word, segmentation):**
+
+| Model | Kind | What it needs |
+|---|---|---|
+| zipformer-small-streaming | exact | nothing beyond the live session: the driver is init / feed / finish already |
+| nemotron-3.5-asr-streaming-0.6b | reference's streaming mode (cache-aware: chunked attention, K/V and conv caches) | re-export: the encoder step with its caches; today the export is the offline mode, the whole clip at once |
+| kyutai-stt-1b-en-fr | exact (frame-synchronous) | re-export: Mimi encoder with its conv state and ring KV carried; the LM loop is per frame already |
+| moonshine-streaming-tiny / -small | exact encoder, decoder re-run per update | re-export: incremental encoder (windows (16, 4) and (16, 0), 3 frames lookahead on 4 layers) |
+| silero-vad | exact (LSTMCell state) | re-export: the per-frame cell with its state as an input; today one sweep over the clip |
+| wakehubert-tiny | exact (strictly causal, 2.5 s receptive field) | driver only: re-run over the last 2.5 s per chunk, or a state-carrying re-export |
+| nemotron-labs-unified-asr-0.6b | reference's streaming mode (buffered: chunked masks, 5.6 s left context recomputed per chunk) | re-export: the streaming-mode encoder beside the offline one |
+| qwen3-asr-0.6b | reference's streaming mode (every 2 s, all audio so far re-fed; previous transcript minus its last 5 tokens as prefix; first 2 chunks unprefixed) | driver/host only: a prefix input; cost grows with the stream |
+| oruk-loop-153m | generic: Qwen3-ASR's scheme (its teacher) | as qwen3-asr; no reference streaming mode to grade against |
+| parakeet-tdt-0.6b, parakeet-rnnt-0.6b, canary-1b-v2, conformer-ctc-small, citrinet-1024, citrinet-256-ls | generic: NeMo's buffered chunked inference (overlapping windows, merged tokens) | host: the window + merge loop; Canary's long-form merge ([ADR-063](../adrs/adr-063-a-long-clip-is-decoded-the-way-its-reference-decodes-it.md)) is the nearest code |
+| whisper-small, moonshine-tiny, granite-speech-4.0-1b, lfm2.5-audio-1.5b-asr, sensevoice-small, paraformer-zh, gigaam-v3-rnnt, hubert-large-ls960-ft, data2vec-audio-base-960h | generic: re-decode a growing or sliding window | host only |
+| marblenet-vad-v2 | generic: sliding window (finite receptive field, with lookahead) | driver only |
+| pyannote-segmentation-3.0 | generic: rolling 10 s windows (diart-style) | host only |
+
+Not streamable in a useful sense: titanet-large and ecapa-voxlingua107 (one embedding per utterance), and
+the text classifiers distilbert-ner and punctuate-all (whole text in, labels out).
+
+**New streaming leaves on disk, not in the zoo:**
+
+| Candidate | Status |
+|---|---|
+| `funasr/paraformer-zh-streaming` | the paraformer leaf refuses it |
+| `nemotron-speech-streaming-en-0.6b` | the English sibling |
+| Zipformer's other two latencies | an export constant each |
+| `kyutai-stt-2.6b-en` | on disk |
+| `voxtral-mini-4b-realtime-2602` | on disk |
+
+**Audio out (TTS and codecs):**
+
+| Model | Kind | What it needs |
+|---|---|---|
+| pocket-tts, pocket-tts-18m / -7m / -2m | exact: AR latents, causal Mimi decoder (`generate_audio_stream`) | re-export: Mimi decoder step with its conv state; today one call over every latent |
+| qwen3-tts-12hz-0.6b + qwen3-tts-tokenizer-12hz | exact: AR frames, causal codec | driver: emit each chunk of the existing chunked decode ([ADR-034](../adrs/adr-034-a-chunked-decode-is-the-drivers-loop-not-a-longer-call.md)) as it is made |
+| audio8-tts-realistic-0.6b + audio8-tts-codec | exact by construction: AR frames; codec all causal (convs, transposed convs, window-128 transformer) | driver: decode with ≥ receptive-field left context, or a state-carrying codec re-export. Upstream's own code has no streaming entry point; the README's SGLang-Omni adapter does, unbenchmarked |
+| voxcpm2 | exact: `generate_streaming`, the AudioVAE's `streaming_decode` carries causal-conv state per patch | re-export: the VAE decoder step with its state |
+| moss-tts-local-transformer-v1.5 + moss-audio-tokenizer-v2 | exact: causal-transformer codec with streaming encode/decode (ring KV per layer) | re-export: codec step with its ring caches; a context-window chunk loop was 48% wrong here |
+| voxtral-4b-tts-2603 | exact: chunked codec equals one call | driver: emit each `codec_chunk` as it is made |
+| soprano-1.1-80m | exact: `infer_stream` re-runs the decoder over hidden states with a receptive-field margin ("lossless") | driver only: the decoder phase takes any length already |
+| lfm2.5-audio-1.5b-tts | exact up to one ISTFT hop: detokenizer is LFM2 with a causal window of 30, then a 'same' ISTFT | driver: chunked detokenize with a hop of lookahead |
+| fun-cosyvoice3-0.5b | reference's streaming mode ("bi-streaming": chunk-aware flow mask, HiFT cache) | re-export: the streaming flow and HiFT; the export rewrote only the cache-less call |
+| chatterbox | generic: S3Gen's flow has a `finalize` lookahead hook, but the `S3GenStreamer` its docstring names is not shipped | driver: chunked flow + vocoder with overlap |
+| dia-1.6b, musicgen-small | generic: AR codes, non-causal codec (DAC, EnCodec 32 kHz `use_causal_conv: false`) | driver: overlapping codec windows |
+| speecht5-tts | generic: AR mel frames, HiFi-GAN over a window | driver: vocode overlapping mel windows |
+| kokoro-82m, vits-piper-en-gb-miro, matcha-tts-ljspeech, styletts2-ljspeech, f5-tts-v1-base, supertonic-2, sanotts, vocetta2-276k, vocetta2-500k, vocetta2-1m, vaniq-edge, auroratts-100k | generic: non-AR, the whole utterance at once; sentence by sentence (Kokoro's own `KPipeline` yields per chunk) | host only: split the text, yield each sentence's audio |
+| dac-44khz, encodec-32khz, snac-24khz (codecs alone) | generic: non-causal decoders (SNAC also injects noise) | host: overlapping windows |
+
+**Tokens out:** every model with a token loop: qwen3-0.6b-base, lfm2-350m-monolithic, lfm2-350m-modular, smollm2-360m-instruct,
+gemma-3-270m-it and flan-t5-small, plus the text side of every AED and speech-LM ASR. The drivers already
+draw one token per step; what is missing is a way to hand each one back mid-run.
+
+**Both directions:** LFM2.5-Audio's interleaved speech-to-speech mode is a full-duplex streamer upstream
+(its demo decodes each audio frame as generated). The zoo exports its ASR and TTS halves separately, and
+the interleaved mode is not exported.
+
+What the engine and loom-py need, in common across the tables:
+
+1. **A session that keeps the driver's state between calls.** The model-side half of this already exists:
+   retained outputs fed back as inputs.
+2. **A way for a driver to hand back a piece mid-run**: a partial transcript, an audio chunk or a token.
+   Lua coroutines, or a per-step `feed` that returns, are the two obvious shapes.
+3. **A chunked front end:** today's fbank and mel phases run over the whole clip.
+
+Re-exports are needed only for the "re-export" rows. Every other row is driver or host work on the files
+already published.
 
 ### Resolution order for anything a model can infer itself
 
