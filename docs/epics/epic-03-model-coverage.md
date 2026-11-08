@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-11-03
+last_updated: 2026-11-08
 ---
 
 # Epic-03: Model Coverage
@@ -40,6 +40,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 |---|---|---|
 | **Language** | Qwen3-0.6B-Base, LFM2-350M (monolithic *and* modular), SmolLM2-360M-Instruct, Gemma-3-270M-it | `causal_lm_export.py` |
 | **ASR — NeMo encoders** | Conformer-CTC-small, Parakeet-TDT-0.6B, Parakeet-RNNT-0.6B, GigaAM v3, Nemotron 3.5 ASR Streaming 0.6B (language-prompted, 40 locales), Nemotron-Labs-Unified-ASR 0.6B (offline mode of the unified offline/streaming FastConformer RNN-T, 25 European languages, language prompt folded into an embedding row; NeMo 3.0) | `nemo_asr_export.py`, `transducer_export.py`, `nemotron_asr_export.py`, `nemotron_unified_export.py` |
+| **ASR — Zipformer** | Zipformer small, Zipformer small streaming (upstream's chunk loop in the driver, [ADR-097](../adrs/adr-097-a-streaming-checkpoint-runs-its-chunk-loop-behind-the-one-pass-door.md)) | `zipformer_export.py`, `zipformer_streaming_export.py` |
 | **ASR — CNN + transformer + CTC** | any HF `*ForCTC` (HuBERT, data2vec-audio, wav2vec 2.0) | `ctc_asr_export.py` |
 | **ASR — SANM / FunASR** | SenseVoice-Small | `sanm_asr_export.py` |
 | **ASR — SANM + CIF** | Paraformer-zh | `paraformer_export.py` |
@@ -1802,6 +1803,58 @@ workstation's GPU is on a training job.
 | M1 Pro CPU, 8 threads | 73/73 | 27.1x | 65/73 | 7.30% | 33.0x |
 | Metal, M1 Pro | 73/73 | 13.3x | 65/73 | 7.30% | 16.8x |
 
+### Zipformer small streaming: the chunk loop in the driver
+
+`pkufool/zipformer-small-streaming` (Apache-2.0, built 2026-11-08): the chunk-causal sibling of Zipformer small,
+same vocabulary, one `model.pt` behind three released latencies. The export takes 32 / 128 (640 ms chunks,
+2.56 s of attention to the left) and runs upstream's `zipformer inference --streaming 1` loop in the driver,
+behind the one-pass `speech2text` door ([ADR-097](../adrs/adr-097-a-streaming-checkpoint-runs-its-chunk-loop-behind-the-one-pass-door.md)).
+A live door is a hub item. `zipformer_streaming_export.py`; `_is_zipformer` no longer claims a chunk-causal
+checkpoint.
+
+**Four phases.** `fbank` is the non-streaming leaf's kaldi front end over the whole clip, followed by the
+`log(1e-10)` frames upstream pads with, so that every chunk is a row range of one retained output.
+`encoder_chunk` is `StreamingEncoderWrapper.forward` at fixed shapes: 77 feature rows and 74 states in,
+`[1, 16, 512]` and 74 states out. The driver feeds output `k + 1` back as input `state_k` on the next call, so
+the state never leaves the engine. `decoder` and `joint` are the non-streaming leaf's, block-4 joint included.
+The driver is written as `init` / `feed` / `finish`, and `return_encoder` returns the encoder rows instead of
+the ids.
+
+**The reference's streaming modules run as they are**, apart from three changes. The relative shift is NeMo's
+`rel_shift`, which holds for a score width of `2T - 1 + L`, in place of a traced `gather`. `processed_lens` is
+F32. The key mask is one comparison against a constant table per stack. Three traps from the first runs:
+
+* **The reference's mask could not be lowered.** Its flip-and-concatenate fed a comparison into CONCAT, which
+  takes no boolean operand. Its per-stack `mask[..., ::ds]` was lowered as an unstrided VIEW, silently, a third
+  case for [Retro-103](../retros/retro-103-an-argument-the-lowering-did-not-read.md). The rule now refuses a
+  strided slice.
+* **`x[:, 0]` kept the batch axis.** The encoder output came out `[512, 1, 16]`, the bridge saw one row per
+  chunk, and the driver decoded one frame in 16 ("GI MIE DO CAR FYE I"). It now returns the non-streaming
+  leaf's `[1, T, C]`.
+* **`DecodeStream` starts the context at `[blank, blank]`**, not `greedy_search`'s `[-1, blank]`. The driver
+  follows the stream.
+
+**Verified** against upstream's released `jit_model-chunk-32-left-128.pt`, run through its own `DecodeStream`
+and `streaming_greedy_search` (`fixture_gen/reference_forward_zipformer_streaming.py`). The eager model built
+from `model.pt` equals that file to 6.7e-6, and the export wrapper equals the eager model to 8.9e-6 on every chunk.
+
+| | F32 | Q8_0 |
+|---|---|---|
+| size | 143 MB | 61 MB |
+| tokens, 73 LibriSpeech-dummy clips | 73/73 | 46/73 |
+| WER, same clips (reference 12.17%) | 12.17% | 11.91% |
+| tokens, en / zh / jfk samples | 180/180, 29/29, 24/24 | |
+| encoder rows, every chunk, through the driver | at most 1.1e-4 (jfk; en, zh about 1e-5) | |
+| speed, 4 threads on the dev box | 7.75x real time (RTF 0.129) | 7.80x (RTF 0.128) |
+| upstream's jit file in torch 2.8, same clips and threads | 3.91x (RTF 0.256); loom F32 timed straight after, 7.66x: 1.96x | |
+
+The non-streaming small scores 7.22% on the same clips; upstream rates this checkpoint 8.15% on LibriSpeech
+test-clean against 3.78%. The engine gate `test_e2e_zipformer_streaming_mil_export` checks the encoder rows,
+tokens and text on three clips. Fed zero states on every call, it fails at all three levels: encoder 4.98 off,
+24 tokens for 180. **Cost is linear in the clip**: 60 s took 7.3 s, 120 s 14.0 s, 400 s 46.5 s (8.2x to 8.6x real
+time, RTF 0.12), against 25 s for 120 s with the non-streaming leaf (4.8x, RTF 0.21). Peak memory still grows, 280 / 373 / 785 MB. That is the whole-clip
+fbank and the waveform held as Lua doubles, not the encoder. The GPUs have not run this model.
+
 ### Family 1's CTC leaf at 10M: Citrinet-256 (LibriSpeech)
 
 `nvidia/stt_en_citrinet_256_ls` (CC-BY-4.0, 2026-10-10), requested for the Pi Zero after Moonshine tiny
@@ -1940,7 +1993,7 @@ from.
 
 | | |
 |---|---|
-| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md), [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md), [ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md), [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md), [ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md), [ADR-070](../adrs/adr-070-a-gpl-upstream-is-a-reference-not-a-dependency.md), [ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md), [ADR-094](../adrs/adr-094-a-speech-lm-recognizer-is-cut-at-quiet-points-and-its-cache-holds-one-piece.md) |
+| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md), [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md), [ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md), [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md), [ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md), [ADR-070](../adrs/adr-070-a-gpl-upstream-is-a-reference-not-a-dependency.md), [ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md), [ADR-094](../adrs/adr-094-a-speech-lm-recognizer-is-cut-at-quiet-points-and-its-cache-holds-one-piece.md), [ADR-097](../adrs/adr-097-a-streaming-checkpoint-runs-its-chunk-loop-behind-the-one-pass-door.md) |
 | Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md), [Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), [Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md), [Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md), [Retro-056](../retros/retro-056-a-fold-checked-after-the-reference-ran-checks-nothing.md), [Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md), [Retro-058](../retros/retro-058-a-size-stated-twice-was-never-compared.md), [Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md), [Retro-063](../retros/retro-063-an-expand-as-was-lowered-as-an-identity.md), [Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md), [Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md), [Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md), [Retro-069](../retros/retro-069-a-mean-that-kept-its-axis-interleaved-a-concat.md), [Retro-078](../retros/retro-078-the-fusion-went-quiet-again.md), [Retro-079](../retros/retro-079-the-references-default-path-was-the-broken-one.md), [Retro-080](../retros/retro-080-a-gather-read-a-view-as-rows.md), [Retro-081](../retros/retro-081-piper-has-two-framings.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |

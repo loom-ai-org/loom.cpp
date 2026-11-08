@@ -2,7 +2,7 @@
 type: retro
 date: 2026-11-05
 domain: exporter
-tags: [mil, lowering, conv2d, log1p, zipformer, silent-failure]
+tags: [mil, lowering, conv2d, log1p, slice, zipformer, silent-failure]
 ---
 
 # Retro-103: An Argument the Lowering Did Not Read
@@ -47,3 +47,14 @@ The convolution fix changes no published file: a scan of the 70 models then on t
 and none asymmetric. The `log1p` fix has no such scan, because a dropped epsilon leaves no mark in a GGUF. Reading
 the reference code available locally found `log1p` only on paths these exports do not run, such as beam search;
 that reading does not cover every tree.
+
+## A third, 2026-11-08: a slice's stride
+
+Zipformer streaming's first export ran and failed on a RESHAPE of its attention mask, 160 elements where 80
+were wanted. The reference slices the mask per stack as `mask[..., ::ds]`, and `slice_by_index`'s rule never
+read `stride`: it emitted a VIEW of the unstrided extent, declaring that shape. A RESHAPE caught it here.
+Behind a broadcasting op it would have read the wrong elements and carried on. The engine's VIEW takes no
+element stride on its innermost axis, so the rule now refuses any static stride other than 1, naming the op
+(`test_a_strided_slice_is_refused_not_lowered_as_a_view`, which fails with the refusal reverted). The export
+reads each stack's mask from a table already at its rate. Every exporter CI test passed with the refusal in
+place; the published files have not been re-exported against it.
