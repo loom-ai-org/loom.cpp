@@ -28,6 +28,7 @@
 // it, and fail inside the driver on the first SHORT_CONV node (BACKLOG.md P4.0.10).
 #include "loom/core/conv_state_cache.h"
 #include "loom/core/output_store.h"
+#include "loom/core/stream_state.h"
 #include "loom/core/profile.h"
 #include "loom/core/lua_bridge.h"
 // What a file declares about ITSELF -- the task it performs and the modality pair it maps between --
@@ -72,6 +73,7 @@
 #include "loom/core/text_classify.h"
 #include "loom/core/audio_classify.h"
 #include "loom/core/transcribe.h"
+#include "loom/core/transcribe_stream.h"
 
 // --- One standalone C++ component from the pre-MIL era. It was four; P4.0.8's follow-up retired
 //     `cfm_euler_sampler.h`, `ode_stepper.h` and `style_diffusion_sampler.h`, each of which had a Lua
