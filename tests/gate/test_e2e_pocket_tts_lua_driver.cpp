@@ -44,6 +44,14 @@
 
 namespace {
 
+// Whether the file carries the frame step (exports since ADR-101); older ones decode a chunk per call only.
+bool session_has_mimi_step(const loom::GgufModel& model) {
+    for (const std::string& name : model.topology_names()) {
+        if (name == "mimi_step") return true;
+    }
+    return false;
+}
+
 // The one string this test needs out of `meta.json`: the text as the reference was given it.
 std::string meta_text(const std::string& json) {
     const std::string needle = "\"text\": \"";
@@ -148,6 +156,28 @@ int main() {
         // ISAs' accumulation order; the rmse bound is the sharper of the two.
         LOOM_CHECK(d.max_abs < 2e-3);
         LOOM_CHECK(d.rmse < 2e-5);
+    }
+
+    // --- 1b. Teacher-forced, decoded a frame at a time (ADR-101). ---
+    // The live cut: `mimi_step` with the decoder's state carried between calls, upstream's own
+    // `generate_audio_stream` decode. One frame per call and three, so a piece of several frames and the
+    // state's hand-off between them are both graded against the reference, to the same bounds as arm 1.
+    if (session_has_mimi_step(*model)) {
+        for (double piece_frames : {1.0, 3.0}) {
+            loom::Session session(*model, device.backends());
+            const auto got = std::get<std::vector<double>>(session.bridge().call("infer", {
+                {"tokens", tokens}, {"noise", as_doubles(noise)}, {"teacher_latents", as_doubles(latents)},
+                {"piece_frames", piece_frames}}));
+            LOOM_CHECK(got.size() == ref_wave.size());
+            const Diff d = compare(got, ref_wave);
+            std::fprintf(stderr, "teacher-forced, %g frame(s) per step: max_abs_diff=%g rmse=%g\n", piece_frames,
+                         d.max_abs, d.rmse);
+            LOOM_CHECK(d.peak > 0.05);
+            LOOM_CHECK(d.max_abs < 2e-3);
+            LOOM_CHECK(d.rmse < 2e-5);
+        }
+    } else {
+        std::fprintf(stderr, "frame-step arm skipped: this export has no mimi_step\n");
     }
 
     // --- 2. Free-running: the loop itself, from the same draws. ---
