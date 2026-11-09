@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-08
+last_updated: 2026-11-09
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -940,8 +940,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   `loom_cli --stream`, loom-py `speech2text.stream()`. Tokens out is built for the causal LMs
   ([ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md): the KV and conv caches
   parked or per-stream, `GenerationStream`, loom-py `text2text.stream()`); they need a re-export to carry
-  the stream functions. Next: the other ASR rows, audio out for TTS and codecs, and the decode loops with
-  per-call context (Whisper, T5, the speech LMs), each a driver with the three functions (a re-export)
+  the stream functions. Audio out is built a sentence at a time
+  ([ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md): `SpeechStream`, exact
+  for Pocket-TTS x4 and Soprano after a re-export, loom-py cuts every other TTS by sentence). Next: Pocket-TTS
+  per frame (the Mimi decoder as a step carrying its state), the other audio-out rows, the codec pairs, the
+  other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   No GPU has run either door yet; the per-stream cache mode is what `Auto` picks there.
   The user asked that every model amenable to streaming gets it, name or no name (2026-11-08).

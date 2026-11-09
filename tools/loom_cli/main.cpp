@@ -41,6 +41,7 @@ void print_usage(const char* argv0) {
                   "[--no-condition-on-previous] [--stream MS]\n"
                   "       %s --model <lm.gguf> --prompt \"<text>\" --stream N "
                   "[--stream-caches auto|park|per-stream]\n"
+                  "       %s --model <tts.gguf> --prompt \"<text>\" --out out.wav --stream 1\n"
                   "       %s --model <tts-or-codec.gguf> --prompt \"<phonemes|text|codes>\" "
                   "--out out.wav\n"
                   "       %s --model <voice-cloning-tts.gguf> --wav <ref.wav> "
@@ -80,7 +81,7 @@ void print_usage(const char* argv0) {
                   "  $LOOM_PROFILE_NODES=1         ... and a second table keyed on the NODE name, which\n"
                   "                                is the only thing that says which graph a bucket is in\n"
                   "                                (profile with ONE thread; see include/loom/core/profile.h)\n",
-                  argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+                  argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 // What ran where, after a device run. The number that matters is the split count: each split is a point
@@ -139,6 +140,34 @@ uint32_t rate_override(const DriverInputs& extra) {
     return 0;
 }
 
+// `--stream` on a model whose answer is audio: `SpeechStream`, each piece reported as it is made -- a
+// sentence chunk for the families that stream today (ADR-100). The waveform is written whole at the
+// end, so what this shows is when each piece WOULD have been playable.
+std::vector<float> run_speech_stream(loom::Session& session, loom::audio::SpeechStream::Inputs inputs,
+                                     uint32_t rate, uint32_t channels) {
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    loom::audio::SpeechStream stream(session.bridge(), std::move(inputs));
+    std::vector<float> audio;
+    double first = -1.0;
+    while (!stream.finished()) {
+        const std::vector<float> piece = stream.next();
+        if (piece.empty()) continue;
+        const double at = std::chrono::duration<double>(clock::now() - t0).count();
+        if (first < 0) first = at;
+        audio.insert(audio.end(), piece.begin(), piece.end());
+        std::printf("  piece %zu", stream.pieces_done());
+        if (stream.pieces_total() > 0) std::printf("/%zu", stream.pieces_total());
+        std::printf(": %.2f s of audio, ready at %.3f s\n", static_cast<double>(piece.size()) / channels / rate, at);
+        std::fflush(stdout);
+    }
+    const double wall = std::chrono::duration<double>(clock::now() - t0).count();
+    const double seconds = static_cast<double>(audio.size()) / channels / rate;
+    std::printf("  streamed: first audio after %.3f s; %.2f s of audio in %.2f s = %.2fx real time (RTF %.3f)\n",
+                first, seconds, wall, wall > 0 ? seconds / wall : 0.0, seconds > 0 ? wall / seconds : 0.0);
+    return audio;
+}
+
 // Runs a model whose OUTPUT KIND is audio and writes the waveform.
 //
 // **This is the half of the CLI that did not exist**, and its absence was not a small gap: with two
@@ -154,7 +183,7 @@ uint32_t rate_override(const DriverInputs& extra) {
 int synthesize(loom::GgufModel& model, const loom::Backends& backends,
                 const std::vector<int32_t>& ids, const std::string& input_name,
                 const DriverInputs& extra,
-                const std::string& out_path, uint32_t rate_override, uint32_t seed) {
+                const std::string& out_path, uint32_t rate_override, uint32_t seed, bool stream = false) {
     uint32_t rate = model.has_kv("loom.sample_rate") ? model.hparam_u32("sample_rate") : 0;
     if (rate == 0) rate = rate_override;
     if (rate == 0) {
@@ -176,21 +205,32 @@ int synthesize(loom::GgufModel& model, const loom::Backends& backends,
     inputs["seed"] = static_cast<double>(seed);
     set_inputs(inputs, extra);
 
-    const auto result = session.bridge().call("infer", inputs);
-    const auto* samples = std::get_if<std::vector<double>>(&result);
-    if (samples == nullptr) {
-        std::fprintf(stderr, "this model's driver returned a single number, not a waveform\n");
-        return 1;
-    }
-    std::vector<float> audio(samples->begin(), samples->end());
-    double peak = 0.0, sum_sq = 0.0;
-    for (float v : audio) { peak = std::max(peak, std::abs(static_cast<double>(v))); sum_sq += v * v; }
-    // Peak and rms, because they have caught something: real speech lands near +-0.3, and audio that
-    // leaves [-1, 1] means the conditioning is wrong rather than the vocoder (Retro-006).
     // Interleaved channels, read off the file: a stereo codec returns `L R L R ...`, and dividing its
     // length by the rate alone would report twice the duration and write a mono file at half speed.
     const uint32_t channels = model.has_kv("loom.channels")
                                   ? std::max<uint32_t>(model.hparam_u32("channels"), 1) : 1;
+    std::vector<float> audio;
+    if (stream) {
+        if (!loom::audio::SpeechStream::supported(session.bridge())) {
+            std::fprintf(stderr, "error: --stream: this model's driver has no live path (stream_open / "
+                                 "stream_feed / stream_finish). It was exported before streaming, or its "
+                                 "family does not stream yet; without --stream it synthesises as before.\n");
+            return 1;
+        }
+        audio = run_speech_stream(session, std::move(inputs), rate, channels);
+    } else {
+        const auto result = session.bridge().call("infer", inputs);
+        const auto* samples = std::get_if<std::vector<double>>(&result);
+        if (samples == nullptr) {
+            std::fprintf(stderr, "this model's driver returned a single number, not a waveform\n");
+            return 1;
+        }
+        audio.assign(samples->begin(), samples->end());
+    }
+    double peak = 0.0, sum_sq = 0.0;
+    for (float v : audio) { peak = std::max(peak, std::abs(static_cast<double>(v))); sum_sq += v * v; }
+    // Peak and rms, because they have caught something: real speech lands near +-0.3, and audio that
+    // leaves [-1, 1] means the conditioning is wrong rather than the vocoder (Retro-006).
     std::printf("  %zu samples x %u channel(s) at %u Hz = %.2f s, peak %.4f, rms %.4f\n",
                 audio.size() / channels, channels, rate,
                 static_cast<double>(audio.size()) / channels / rate, peak,
@@ -1035,7 +1075,7 @@ int main(int argc, char** argv) {
                 }
                 std::printf("\n");
                 return synthesize(*model, backends, widen_rows(file.codes, file.n_codebooks, width, absent),
-                                  "codes", extra_inputs, out_wav, rate_override(extra_inputs), synth_seed);
+                                  "codes", extra_inputs, out_wav, rate_override(extra_inputs), synth_seed, stream_ms > 0);
             }
             const std::vector<double> codes = read_number_spec(prompt_text);
             if (width > 0 && codes.size() % width != 0) {
@@ -1047,7 +1087,7 @@ int main(int argc, char** argv) {
                         width > 0 ? codes.size() / width : codes.size());
             const std::vector<int32_t> ids(codes.begin(), codes.end());
             return synthesize(*model, backends, ids, "codes", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "supertonic") {
@@ -1076,7 +1116,7 @@ int main(int argc, char** argv) {
                 }
                 if (!out_wav.empty()) {
                     return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                                      rate_override(extra_inputs), synth_seed);
+                                      rate_override(extra_inputs), synth_seed, stream_ms > 0);
                 }
             }
             return 0;
@@ -1101,7 +1141,7 @@ int main(int argc, char** argv) {
             }
             if (out_wav.empty()) return 0;
             return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "pocket_tts") {
@@ -1122,7 +1162,7 @@ int main(int argc, char** argv) {
             std::printf("  %zu id(s)\n", ids.size());
             if (out_wav.empty()) return 0;
             return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "soprano") {
@@ -1140,7 +1180,7 @@ int main(int argc, char** argv) {
             std::printf("  %zu id(s)\n", ids.size());
             if (out_wav.empty()) return 0;
             return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "cosyvoice3") {
@@ -1159,7 +1199,7 @@ int main(int argc, char** argv) {
             std::printf("  %zu id(s)\n", ids.size());
             if (out_wav.empty()) return 0;
             return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "voxcpm2") {
@@ -1178,7 +1218,7 @@ int main(int argc, char** argv) {
             }
             if (out_wav.empty()) return 0;
             return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (contract.task == loom::task_names::TTS && model->has_kv("tokenizer.ggml.model") &&
@@ -1196,7 +1236,7 @@ int main(int argc, char** argv) {
             std::printf("  %zu id(s)\n", ids.size());
             if (out_wav.empty()) return 0;
             return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "f5") {
@@ -1245,7 +1285,7 @@ int main(int argc, char** argv) {
             extra.push_back({"waveform", std::vector<double>(reference.begin(), reference.end()), true});
             extra.push_back({"n_ref_text", std::vector<double>{static_cast<double>(ref_ids.size())}, false});
             return synthesize(*model, backends, all_ids, "text_ids", extra, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "phonemes") {
@@ -1289,7 +1329,7 @@ int main(int argc, char** argv) {
                 }
                 if (!out_wav.empty()) {
                     return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                                      rate_override(extra_inputs), synth_seed);
+                                      rate_override(extra_inputs), synth_seed, stream_ms > 0);
                 }
             }
             return 0;
@@ -1363,7 +1403,7 @@ int main(int argc, char** argv) {
                     return 0;
                 }
                 return synthesize(*model, backends, prompt_tokens, "tokens", extra_inputs, out_wav,
-                                  rate_override(extra_inputs), synth_seed);
+                                  rate_override(extra_inputs), synth_seed, stream_ms > 0);
             }
 
             if (is_multi_topology) {
