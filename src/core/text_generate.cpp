@@ -28,6 +28,48 @@ int32_t new_token(const LoomLuaBridge::Value& result) {
     return static_cast<int32_t>(ids.back());
 }
 
+// `eos` is what the driver's own loop is told to stop on; `strip` is every id that, ending the output,
+// is a control token rather than text.
+struct Stops {
+    int32_t eos;
+    std::vector<int32_t> strip;
+};
+
+Stops resolve_stops(const GgufModel& model, const GenerateOptions& options) {
+    // The file's own stop tokens unless the caller named one, so the loop stops where the checkpoint
+    // says it should rather than where a host's default happened to land. Negative means no early stop,
+    // which the generated drivers document as the meaning of a negative `eos_token`.
+    //
+    // The whole SET, not the one the tokenizer config happened to name (P4.23). `eos` stays the first
+    // of them because it is what the driver's own loop is told to stop on and what a caller may
+    // override; the rest are what the driver breaks on from `extra_eos_tokens`, and what the strip
+    // below has to know about -- a chat turn ends on `<end_of_turn>`, so stripping only `<eos>` leaves
+    // a control token's spelling on the end of the answer.
+    const std::vector<int32_t> stop_ids = eos_token_ids(model);
+    const int32_t eos = options.eos_token == GenerateOptions::kEosFromFile
+        ? (stop_ids.empty() ? -1 : stop_ids.front())
+        : options.eos_token;
+    // A caller-named stop token replaces the file's set rather than joining it: "stop here" is an
+    // instruction, and a loop that also stopped somewhere else would not be following it.
+    const std::vector<int32_t> strip_ids =
+        options.eos_token == GenerateOptions::kEosFromFile ? stop_ids : std::vector<int32_t>{eos};
+    return {eos, strip_ids};
+}
+
+std::unordered_map<std::string, LoomLuaBridge::Value> driver_args(const GenerateOptions& options, int32_t eos) {
+    std::unordered_map<std::string, LoomLuaBridge::Value> args = options.extra_inputs;
+    args["max_new_tokens"] = static_cast<double>(options.max_new_tokens);
+    args["eos_token"] = static_cast<double>(eos);
+    // Only what the caller SET (P4.24). An entry that is absent leaves the driver's own
+    // `inputs.<knob> or <default>` fallback intact, which is the checkpoint's declared value --
+    // passing a host default here instead would silently overrule the file for every caller who
+    // named nothing.
+    if (options.temperature) args["temperature"] = static_cast<double>(*options.temperature);
+    if (options.top_k) args["top_k"] = static_cast<double>(*options.top_k);
+    if (options.top_p) args["top_p"] = static_cast<double>(*options.top_p);
+    return args;
+}
+
 } // namespace
 
 std::vector<int32_t> eos_token_ids(const GgufModel& model) {
@@ -50,23 +92,9 @@ std::vector<int32_t> generate(LoomLuaBridge& bridge, const GgufModel& model,
                     "model asked to continue nothing has nothing to continue.");
     }
 
-    // The file's own stop tokens unless the caller named one, so the loop stops where the checkpoint
-    // says it should rather than where a host's default happened to land. Negative means no early stop,
-    // which the generated drivers document as the meaning of a negative `eos_token`.
-    //
-    // The whole SET, not the one the tokenizer config happened to name (P4.23). `eos` stays the first
-    // of them because it is what the driver's own loop is told to stop on and what a caller may
-    // override; the rest are what the driver breaks on from `extra_eos_tokens`, and what the strip
-    // below has to know about -- a chat turn ends on `<end_of_turn>`, so stripping only `<eos>` leaves
-    // a control token's spelling on the end of the answer.
-    const std::vector<int32_t> stop_ids = eos_token_ids(model);
-    const int32_t eos = options.eos_token == GenerateOptions::kEosFromFile
-        ? (stop_ids.empty() ? -1 : stop_ids.front())
-        : options.eos_token;
-    // A caller-named stop token replaces the file's set rather than joining it: "stop here" is an
-    // instruction, and a loop that also stopped somewhere else would not be following it.
-    const std::vector<int32_t> strip_ids =
-        options.eos_token == GenerateOptions::kEosFromFile ? stop_ids : std::vector<int32_t>{eos};
+    const Stops stops = resolve_stops(model, options);
+    const int32_t eos = stops.eos;
+    const std::vector<int32_t>& strip_ids = stops.strip;
 
     if (options.seed) bridge.seed_rng(*options.seed);
 
@@ -85,22 +113,14 @@ std::vector<int32_t> generate(LoomLuaBridge& bridge, const GgufModel& model,
     // `infer_with_past` -- 7.71 vs 21.78 tok/s. onnxruntime does 19.2-21.4 on the same box, so this
     // one call was the entire gap to it (Epic-05 §2).
     //
-    // Not every driver has one: LFM2's ShortConv blocks carry history no KV cache holds, so its export
-    // has only `infer` and must keep the re-fed loop. Hence prefer-if-present rather than require.
+    // Not every driver has one. lfm2-350m-monolithic does (its ShortConv history is a ConvStateCache),
+    // but the MODULAR export -- one topology per layer -- carries no caches, has only `infer`, and
+    // keeps the re-fed loop. Hence prefer-if-present rather than require.
     const std::string entry = bridge.has_function("infer_with_past") ? "infer_with_past" : "infer";
 
     const auto call = [&]() {
-        std::unordered_map<std::string, LoomLuaBridge::Value> args = options.extra_inputs;
+        std::unordered_map<std::string, LoomLuaBridge::Value> args = driver_args(options, eos);
         args["tokens"] = running;
-        args["max_new_tokens"] = static_cast<double>(options.max_new_tokens);
-        args["eos_token"] = static_cast<double>(eos);
-        // Only what the caller SET (P4.24). An entry that is absent leaves the driver's own
-        // `inputs.<knob> or <default>` fallback intact, which is the checkpoint's declared value --
-        // passing a host default here instead would silently overrule the file for every caller who
-        // named nothing.
-        if (options.temperature) args["temperature"] = static_cast<double>(*options.temperature);
-        if (options.top_k) args["top_k"] = static_cast<double>(*options.top_k);
-        if (options.top_p) args["top_p"] = static_cast<double>(*options.top_p);
         return bridge.call(entry, args);
     };
 
@@ -139,7 +159,7 @@ std::vector<int32_t> generate(LoomLuaBridge& bridge, const GgufModel& model,
         }
     } else {
         // One token per call: the prompt grows and is re-fed, which is what a driver without cross-step
-        // state requires (LFM2's ShortConv blocks carry history no cache holds).
+        // state requires (lfm2-350m-modular's per-layer export carries no caches).
         generated.push_back(new_token(first));
         running.push_back(static_cast<double>(generated.back()));
         while (generated.size() < options.max_new_tokens && generated.back() != eos) {
@@ -153,6 +173,108 @@ std::vector<int32_t> generate(LoomLuaBridge& bridge, const GgufModel& model,
         generated.pop_back();
     }
     return generated;
+}
+
+GenerationStream::GenerationStream(LoomLuaBridge& bridge, const GgufModel& model,
+                                   std::vector<int32_t> prompt_tokens, GenerateOptions options)
+    : bridge_(bridge), prompt_(std::move(prompt_tokens)), options_(std::move(options)) {
+    if (!model.has_kv("model.driver_script")) {
+        throw LoadError("GenerationStream: model carries no driver_script; it can be inspected but not run.");
+    }
+    if (!supported(bridge)) {
+        throw LoadError("GenerationStream: this file's driver runs its decode loop inside one call "
+                        "(`infer_with_past`) and exports no `stream_open` / `stream_feed` / "
+                        "`stream_finish`, so it cannot hand tokens back as they are drawn. A re-export "
+                        "with this runtime's exporter adds them; `generate` still runs it one-pass.");
+    }
+    if (prompt_.empty()) {
+        throw Error("GenerationStream: the prompt is empty. A model asked to continue nothing has "
+                    "nothing to continue.");
+    }
+    const Stops stops = resolve_stops(model, options_);
+    eos_ = stops.eos;
+    strip_ = stops.strip;
+    driver_loop_ = bridge.has_function("stream_open");
+    reset();
+}
+
+bool GenerationStream::supported(const LoomLuaBridge& bridge) {
+    // The one-token shape keeps nothing across calls but the tokens, which this class holds.
+    return bridge.has_function("stream_open") || !bridge.has_function("infer_with_past");
+}
+
+void GenerationStream::reset() {
+    state_.clear();
+    if (options_.seed) state_.seed_rng(*options_.seed);
+    tokens_.clear();
+    running_.assign(prompt_.begin(), prompt_.end());
+    opened_ = false;
+    finished_ = false;
+    stripped_ = false;
+}
+
+std::vector<int32_t> GenerationStream::next(uint32_t max_tokens) {
+    std::vector<int32_t> out;
+    if (finished_ || max_tokens == 0) return out;
+
+    if (driver_loop_) {
+        if (!opened_) {
+            std::unordered_map<std::string, LoomLuaBridge::Value> args = driver_args(options_, eos_);
+            args["tokens"] = std::vector<double>(prompt_.begin(), prompt_.end());
+            opened_ = true;
+            for (double id : as_ids(bridge_.call("stream_open", args, state_))) out.push_back(static_cast<int32_t>(id));
+        }
+        // The driver's own loop decides when it is done -- an eos it was told about, one of the
+        // file's extra stop ids it carries, its ceiling -- and says so in its state, so the host never
+        // has to re-derive the rule `infer_with_past` applies.
+        while (!driver_done() && out.size() < max_tokens) {
+            const uint32_t want = max_tokens - static_cast<uint32_t>(out.size());
+            const std::vector<double> ids =
+                as_ids(bridge_.call("stream_feed", {{"max_tokens", static_cast<double>(want)}}, state_));
+            for (double id : ids) out.push_back(static_cast<int32_t>(id));
+            if (ids.empty() && !driver_done()) {
+                throw Error("GenerationStream: the driver's stream_feed drew nothing and did not say it "
+                            "was done, so another call would not draw anything either.");
+            }
+        }
+        if (driver_done()) {
+            finished_ = true;
+            bridge_.call("stream_finish", {}, state_);
+        }
+    } else {
+        // `generate`'s one-token loop: the first call always draws, then it runs until the ceiling or
+        // `eos` -- `eos` alone, as there.
+        while (!finished_ && out.size() < max_tokens) {
+            std::unordered_map<std::string, LoomLuaBridge::Value> args = driver_args(options_, eos_);
+            args["tokens"] = running_;
+            opened_ = true;
+            const int32_t id = new_token(bridge_.call("infer", args, state_));
+            running_.push_back(static_cast<double>(id));
+            out.push_back(id);
+            if (tokens_.size() + out.size() >= std::max<size_t>(options_.max_new_tokens, 1) || id == eos_) {
+                finished_ = true;
+            }
+        }
+    }
+    // As `generate`: only the LAST id is a stop token's spelling to drop, and only the stream's end has
+    // a last id.
+    if (finished_ && options_.strip_eos && !out.empty() &&
+        std::find(strip_.begin(), strip_.end(), out.back()) != strip_.end()) {
+        out.pop_back();
+        stripped_ = true;
+    }
+    tokens_.insert(tokens_.end(), out.begin(), out.end());
+    return out;
+}
+
+bool GenerationStream::driver_done() const {
+    const StreamState::Value* done = state_.value("done");
+    return done != nullptr && !done->data.empty() && done->data.front() != 0.0;
+}
+
+std::vector<double> GenerationStream::as_ids(const LoomLuaBridge::Value& v) {
+    if (std::holds_alternative<double>(v)) return {std::get<double>(v)};
+    return std::get<std::vector<double>>(v);
 }
 
 } // namespace text

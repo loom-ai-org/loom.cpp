@@ -36,6 +36,7 @@ add_library(loom_engine
     src/core/conv_state_cache.cpp
     src/core/kv_cache.cpp
     src/core/output_store.cpp
+    src/core/cache_lease.cpp
     src/core/stream_state.cpp
     src/core/profile.cpp
     src/core/model_contract.cpp

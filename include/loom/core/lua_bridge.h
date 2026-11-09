@@ -3,6 +3,7 @@
 #include "loom/core/backend.h"
 #include "loom/core/gguf_model.h"
 #include "loom/core/graph_topology.h"
+#include "loom/core/stream_state.h"
 
 #include <ggml-cpp.h>
 
@@ -150,6 +151,12 @@ public:
     Value call(const std::string& fn_name, const std::unordered_map<std::string, Value>& args,
                StreamState& state);
 
+    // How streams keep their rows of the model's KV and conv-state caches apart (ADR-099): parked
+    // while another stream runs, or a cache per stream. `Auto` decides per cache by its backend.
+    // Changing it while streams are open leaves their rows where they are, so set it before opening.
+    void set_stream_caches(StreamCaches mode) { stream_caches_ = mode; }
+    StreamCaches stream_caches() const { return stream_caches_; }
+
     // Reseeds the shared RNG from C++, the same door `loom.seed_rng` gives a driver script -- so a HOST
     // can make a sampled generation reproducible without the driver having to expose a seed argument
     // (P4.24). Same stream, so the draw-ORDER caveat `rng_` documents applies to both callers.
@@ -207,6 +214,9 @@ private:
     // everything it needs is already on the Module, and building one eagerly would allocate a compute
     // buffer for every registered topology of a many-module model whether or not the driver ever runs it.
     GraphBuilder& module_builder(Module& mod);
+    // The cache a module's next run uses: the active stream's own, or the model's after leasing it to
+    // that stream (ADR-099). The model's itself outside any call.
+    template <typename Cache> Cache* stream_cache(Cache* shared);
 
     lua_State* L_;
     Backends backends_;
@@ -217,6 +227,7 @@ private:
     // The stream state the current `call` runs against; null outside a call. Set and restored by `call`
     // itself, so a binding that finds it null is being run outside any driver call.
     StreamState* active_state_ = nullptr;
+    StreamCaches stream_caches_ = StreamCaches::Auto;
 
     // Backs loom.seed_rng/loom.gaussian_array/loom.uniform_array -- the SAME engine/distribution shapes
     // (std::mt19937 + std::normal_distribution<float>(0,1) + std::uniform_real_distribution<float>(0,1))

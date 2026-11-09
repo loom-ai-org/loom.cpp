@@ -7,13 +7,14 @@
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 
+#include <algorithm>
 #include <string>
 
 namespace loom {
 
 KvCache::KvCache(uint32_t n_layer, uint32_t n_embd_k, uint32_t n_embd_v, uint32_t kv_size, ggml_backend_t backend,
                  bool ring)
-    : n_embd_k_(n_embd_k), n_embd_v_(n_embd_v), kv_size_(kv_size), ring_(ring) {
+    : backend_(backend), n_embd_k_(n_embd_k), n_embd_v_(n_embd_v), kv_size_(kv_size), ring_(ring) {
     const size_t mem_size = static_cast<size_t>(n_layer) * 2 * ggml_tensor_overhead() + 4096;
     store_ctx_.reset(ggml_init(ggml_init_params{mem_size, nullptr, /*no_alloc=*/true}));
     if (!store_ctx_) {
@@ -86,11 +87,50 @@ void KvCache::set_rows(uint32_t layer, bool value, const float* data, uint32_t f
                     std::to_string(kv_size_) + " positions");
     }
     ggml_tensor* dst = (value ? v_layers_ : k_layers_).at(layer);
+    note_written(static_cast<uint64_t>(first_row) + n_rows);
     ggml_backend_tensor_set(dst, data, static_cast<size_t>(first_row) * dst->nb[1],
                             static_cast<size_t>(n_rows) * dst->nb[1]);
 }
 
+void KvCache::note_written(uint64_t end_position) {
+    const uint64_t rows = std::min<uint64_t>(end_position, kv_size_);
+    if (rows > rows_used_) rows_used_ = static_cast<uint32_t>(rows);
+}
+
+std::unique_ptr<KvCache> KvCache::make_like() const {
+    return std::make_unique<KvCache>(n_layer(), n_embd_k_, n_embd_v_, kv_size_, backend_, ring_);
+}
+
+// Rows [0, rows_used) of a layer are a contiguous prefix of its tensor (ne[0] is the token's width,
+// nb[1] the row stride), so each layer half is one backend read.
+void KvCache::park(std::vector<float>& out) const {
+    const size_t per_row = static_cast<size_t>(n_embd_k_) + n_embd_v_;
+    out.resize(static_cast<size_t>(rows_used_) * per_row * n_layer());
+    float* dst = out.data();
+    for (uint32_t il = 0; il < n_layer(); ++il) {
+        for (ggml_tensor* t : {k_layers_[il], v_layers_[il]}) {
+            const size_t bytes = static_cast<size_t>(rows_used_) * t->nb[1];
+            ggml_backend_tensor_get(t, dst, 0, bytes);
+            dst += bytes / sizeof(float);
+        }
+    }
+}
+
+void KvCache::restore(const std::vector<float>& in) {
+    const size_t per_row = static_cast<size_t>(n_embd_k_) + n_embd_v_;
+    rows_used_ = static_cast<uint32_t>(in.size() / (per_row * n_layer()));
+    const float* src = in.data();
+    for (uint32_t il = 0; il < n_layer(); ++il) {
+        for (ggml_tensor* t : {k_layers_[il], v_layers_[il]}) {
+            const size_t bytes = static_cast<size_t>(rows_used_) * t->nb[1];
+            ggml_backend_tensor_set(t, src, 0, bytes);
+            src += bytes / sizeof(float);
+        }
+    }
+}
+
 void KvCache::reset() {
+    rows_used_ = 0;
     if (store_buf_) {
         ggml_backend_buffer_clear(store_buf_.get(), 0);
     }

@@ -113,6 +113,9 @@ functions in one call, and the one-pass gate then covers the live code.
 | engine | `loom::audio::TranscriptionStream`: `push(samples)` -> ids, `text`, `delta`; `finish()`; `reset()` |
 | `loom_cli` | `--wav x.wav --stream MS`: the clip pushed in MS pieces, each new piece of text printed at its audio time |
 | loom-py | `model.speech2text.stream()` -> `TranscriptStream.push(samples)` / `.finish()` -> `TranscriptUpdate` |
+| engine (tokens out) | `loom::text::GenerationStream`: `next(n)` -> up to n more ids, `generate`'s ids exactly; `reset()` |
+| `loom_cli` | `--prompt ... --stream N [--stream-caches auto\|park\|per-stream]`: N tokens per pull, text printed as drawn |
+| loom-py | `model.text2text.stream(prompt)` / `chat_stream(messages)` -> `TextStream`, iterated for text pieces |
 
 A file without the three functions keeps its one-pass doors and is refused by the live one; streaming is a
 second door, never a change to the first. Zipformer streaming chunks its front end in the driver: the fbank
@@ -120,6 +123,14 @@ phase runs per chunk over a window of samples starting one hop before the chunk'
 kaldi's `snip_edges=False` gives the clip's own frames, so no topology changed. Streamed in 100 ms pieces
 it runs at the one-pass speed (60 s: 7.67-7.82x real time, RTF 0.128-0.130, dev box) with 1.4 MB of stream
 state, and peak RSS fell from 244 MB to 180 MB because no whole-clip feature matrix is kept.
+
+**Tokens out, and the model's caches** ([ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md)).
+An LM's history is the model's KV cache (and LFM2's conv-state cache), which every stream shares. A stream
+either leases it -- its written rows parked on the host while another stream runs, nothing copied while it
+runs alone -- or owns a cache of its own, as `StreamCaches` says: `Auto` gives a discrete GPU a cache per
+stream and parks on the CPU, an iGPU or an accelerator. A seeded stream draws from its own generator. The
+LM driver's `stream_open` / `stream_feed` / `stream_finish` cut `infer_with_past`'s loop at each token and
+set `done` when it would have stopped; a one-token driver streams with no re-export.
 
 ### Streaming: which other models can, and how
 
@@ -192,21 +203,26 @@ the text classifiers distilbert-ner and punctuate-all (whole text in, labels out
 | kokoro-82m, vits-piper-en-gb-miro, matcha-tts-ljspeech, styletts2-ljspeech, f5-tts-v1-base, supertonic-2, sanotts, vocetta2-276k, vocetta2-500k, vocetta2-1m, vaniq-edge, auroratts-100k | generic: non-AR, the whole utterance at once; sentence by sentence (Kokoro's own `KPipeline` yields per chunk) | host only: split the text, yield each sentence's audio |
 | dac-44khz, encodec-32khz, snac-24khz (codecs alone) | generic: non-causal decoders (SNAC also injects noise) | host: overlapping windows |
 
-**Tokens out:** every model with a token loop: qwen3-0.6b-base, lfm2-350m-monolithic, lfm2-350m-modular, smollm2-360m-instruct,
-gemma-3-270m-it and flan-t5-small, plus the text side of every AED and speech-LM ASR. The drivers already
-draw one token per step; what is missing is a way to hand each one back mid-run.
+**Tokens out:** **built** for the causal LMs (ADR-099): qwen3-0.6b-base, smollm2-360m-instruct,
+gemma-3-270m-it and lfm2-350m-monolithic stream after a re-export; lfm2-350m-modular streams as it is,
+through the door's own loop. Left: flan-t5-small and the text side of every AED and speech-LM ASR, whose
+loops carry per-call context (an encoder's output, a built prompt) that the stream state has to hold
+first.
 
 **Both directions:** LFM2.5-Audio's interleaved speech-to-speech mode is a full-duplex streamer upstream
 (its demo decodes each audio frame as generated). The zoo exports its ASR and TTS halves separately, and
 the interleaved mode is not exported.
 
-What the rest of the tables need, now that the state and the hand-back exist (ADR-098):
+What the rest of the tables need, now that the state, the hand-back and the caches exist (ADR-098,
+ADR-099):
 
 1. **A driver with the three stream functions** for every "driver" and "re-export" row, which means a
    re-export even where no weight changes: the driver is in the GGUF.
-2. **A door per direction.** `TranscriptionStream` is audio in; tokens out (LMs) and audio out (TTS,
-   codecs) need their own, on the same `StreamState` and the same three-function shape.
-3. **A chunked front end per family**, as Zipformer's windowed fbank: mel phases still run over the
+2. **A door per direction.** `TranscriptionStream` is audio in and `GenerationStream` tokens out; audio
+   out (TTS, codecs) needs its own, on the same `StreamState` and the same three-function shape.
+3. **Per-call context in the stream state** for the decode loops that have it (Whisper's and T5's
+   encoder output, a speech LM's built prompt), so their `PrefillDecodeLoop` can be cut per token too.
+4. **A chunked front end per family**, as Zipformer's windowed fbank: mel phases still run over the
    whole clip.
 
 The "host only" rows (sentence-by-sentence TTS, re-decoded windows for ASR) need no re-export.
@@ -227,7 +243,7 @@ fixture set is kept for exactly this reason; `v5` is the contract-declaring set.
 | | |
 |---|---|
 | Authority | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) |
-| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
+| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
 | Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md) |
 | Active tasks | [Backlog → Host API](../backlog/active-index.md#host-api) |
 
