@@ -946,8 +946,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   a frame at a time (ADR-101: first audio after 0.20 s), and the Qwen3-TTS codec pair
   ([ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md):
   a `CodecStream` with its state carried; the talker is RTF ~11 on the dev-box CPU, so live only on a GPU),
-  and Audio8-TTS's pair on the same machinery. Next: MOSS-TTS and Dia (workstation), the other audio-out rows,
-  the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  and Audio8-TTS's pair on the same machinery, and MOSS-TTS and Dia
+  ([ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md): a module may declare a ring KV
+  cache of its own; DAC decoded in windows). Next: the other audio-out rows (VoxCPM2, Voxtral, LFM2.5-Audio,
+  CosyVoice3, Chatterbox, MusicGen, SpeechT5, EnCodec/SNAC), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   No GPU has run either door yet; the per-stream cache mode is what `Auto` picks there.

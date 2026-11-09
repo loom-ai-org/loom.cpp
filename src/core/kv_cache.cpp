@@ -13,8 +13,12 @@
 namespace loom {
 
 KvCache::KvCache(uint32_t n_layer, uint32_t n_embd_k, uint32_t n_embd_v, uint32_t kv_size, ggml_backend_t backend,
-                 bool ring)
-    : backend_(backend), n_embd_k_(n_embd_k), n_embd_v_(n_embd_v), kv_size_(kv_size), ring_(ring) {
+                 bool ring, uint32_t window)
+    : backend_(backend), n_embd_k_(n_embd_k), n_embd_v_(n_embd_v), kv_size_(kv_size), ring_(ring), window_(window) {
+    if (window_ > 0 && (!ring_ || window_ > kv_size_)) {
+        throw Error("KvCache: a window of " + std::to_string(window_) + " needs a ring of at least that many "
+                    "cells, not a " + (ring_ ? "ring of " + std::to_string(kv_size_) : std::string("linear cache")));
+    }
     const size_t mem_size = static_cast<size_t>(n_layer) * 2 * ggml_tensor_overhead() + 4096;
     store_ctx_.reset(ggml_init(ggml_init_params{mem_size, nullptr, /*no_alloc=*/true}));
     if (!store_ctx_) {
@@ -98,7 +102,7 @@ void KvCache::note_written(uint64_t end_position) {
 }
 
 std::unique_ptr<KvCache> KvCache::make_like() const {
-    return std::make_unique<KvCache>(n_layer(), n_embd_k_, n_embd_v_, kv_size_, backend_, ring_);
+    return std::make_unique<KvCache>(n_layer(), n_embd_k_, n_embd_v_, kv_size_, backend_, ring_, window_);
 }
 
 // Rows [0, rows_used) of a layer are a contiguous prefix of its tensor (ne[0] is the token's width,
