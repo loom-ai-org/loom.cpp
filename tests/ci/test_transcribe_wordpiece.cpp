@@ -29,5 +29,5 @@ int main() {
     const loom::audio::Transcription r = loom::audio::transcribe(session.bridge(), *model, waveform, options);
     // The driver returned [CLS] ▁hello ▁wor ld [UNK] [SEP].
     LOOM_CHECK(r.text == "hello world");
-    return 0;
+    LOOM_TEST_REPORT_AND_RETURN();
 }

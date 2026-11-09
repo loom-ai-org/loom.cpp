@@ -94,6 +94,13 @@ CodecStream::CodecStream(LoomLuaBridge& bridge, Inputs inputs) : bridge_(bridge)
 
 void CodecStream::reset() {
     state_.clear();
+    // Always a generator of its own (ADR-104): a stochastic codec (SNAC) draws noise as frames arrive, and
+    // drawing from the bridge's would let another stream's -- or a one-pass decode's -- draws land between
+    // two of this one's pushes. The driver's `stream_open` seeds it (from `inputs.seed`, else the file's
+    // default), so the 0 here is never what a draw sees.
+    const auto seed = inputs_.find("seed");
+    state_.seed_rng(seed != inputs_.end() && std::holds_alternative<double>(seed->second)
+                        ? static_cast<uint32_t>(std::get<double>(seed->second)) : 0u);
     samples_ = 0;
     finished_ = false;
     bridge_.call("stream_open", inputs_, state_);
