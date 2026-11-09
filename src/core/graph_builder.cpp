@@ -1,4 +1,5 @@
 #include "loom/core/graph_builder.h"
+#include "loom/core/conv_state_cache.h"
 #include "loom/core/kv_cache.h"
 #include "loom/core/output_store.h"
 #include "loom/core/profile.h"
@@ -197,6 +198,8 @@ GraphBuilder::GraphBuilder(const GraphTopology& topo, GgufModel& model, Backends
                             KvCache* kv_cache, size_t compute_meta_bytes, ConvStateCache* conv_state)
     : topo_(topo), model_(model), backends_(backends), backend_(backends.primary),
       kv_cache_(kv_cache), conv_state_(conv_state), compute_meta_bytes_(compute_meta_bytes) {
+    kv_serial_ = kv_cache_ ? kv_cache_->serial() : 0;
+    conv_serial_ = conv_state_ ? conv_state_->serial() : 0;
     if (backend_ == nullptr) {
         throw Error("GraphBuilder: no primary backend -- construct a loom::Device, or pass a "
                     "ggml_backend_t directly");
@@ -305,6 +308,8 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
         if (kv_cells_ != nullptr) {
             KvCache::fill_cell_index(kv_cells_, static_cast<uint32_t>(std::llround(axes.at("n_past"))),
                                      ring_size());
+            kv_cache_->note_written(static_cast<uint64_t>(std::llround(axes.at("n_past"))) +
+                                    static_cast<uint64_t>(kv_cells_->ne[0]));
         }
         cached_.n_kv_real = real_n_kv(axes);
         ++reuses_;
@@ -402,6 +407,8 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
             }
             KvCache::fill_cell_index(kv_cells_, static_cast<uint32_t>(std::llround(axes.at("n_past"))),
                                      ring_size());
+            kv_cache_->note_written(static_cast<uint64_t>(std::llround(axes.at("n_past"))) +
+                                    static_cast<uint64_t>(kv_cells_->ne[0]));
         }
     }
 
@@ -811,6 +818,20 @@ void GraphBuilder::reserve(uint32_t n_ctx_max) {
     if (n_ctx_max > 1) {
         build({{"n_tokens", 1.0}, {"n_past", static_cast<double>(n_ctx_max - 1)}});
     }
+}
+
+} // namespace loom
+
+namespace loom {
+
+void GraphBuilder::set_caches(KvCache* kv_cache, ConvStateCache* conv_state) {
+    const uint64_t kv_serial = kv_cache ? kv_cache->serial() : 0;
+    const uint64_t conv_serial = conv_state ? conv_state->serial() : 0;
+    if (kv_serial != kv_serial_ || conv_serial != conv_serial_) drop_retained_graph();
+    kv_cache_ = kv_cache;
+    conv_state_ = conv_state;
+    kv_serial_ = kv_serial;
+    conv_serial_ = conv_serial;
 }
 
 } // namespace loom

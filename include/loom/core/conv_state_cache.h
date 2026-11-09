@@ -1,6 +1,7 @@
 #pragma once
 
 #include "loom/core/backend.h"
+#include "loom/core/cache_lease.h"
 
 #include <ggml-cpp.h>
 
@@ -25,7 +26,7 @@ namespace loom {
 // ggml-alloc never sees it; addressed by the `layer` attr on the node; writes returned as cpy nodes the
 // caller routes through PrimitiveContext::side_effects; reads returned as plain views. A host that can
 // allocate one can allocate the other.
-class ConvStateCache {
+class ConvStateCache : public LeasedCache {
 public:
     // n_state is the per-channel history depth (`kernel - 1`); n_embd_conv is the channel count, i.e.
     // the width of one time step of the convolution's input.
@@ -58,10 +59,24 @@ public:
     // across unrelated sequences gets the same guarantee KvCache::reset() gives.
     void reset();
 
+    // An empty cache of the same geometry on the same backend: a stream's own (ADR-099).
+    std::unique_ptr<ConvStateCache> make_like() const;
+    ggml_backend_t backend() const { return backend_; }
+
     ConvStateCache(const ConvStateCache&) = delete;
     ConvStateCache& operator=(const ConvStateCache&) = delete;
 
+protected:
+    // Every layer's whole window: it is a few kernel taps per channel (80 KiB for LFM2), so tracking
+    // which layers a stream reached would cost more than it saves.
+    void park(std::vector<float>& out) const override;
+    void restore(const std::vector<float>& in) override;
+    // A step at n_past == 0 reads the zero slot, never the stored one, so a stream that has not
+    // written yet cannot see the previous owner's window.
+    void forget() override {}
+
 private:
+    ggml_backend_t backend_;
     ggml_context_ptr store_ctx_;
     ggml_backend_buffer_ptr store_buf_;
     std::vector<ggml_tensor*> layers_;
