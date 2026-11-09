@@ -64,8 +64,15 @@ answer for Mimi.
   passes), so the pair is RTF 13 -- live on a GPU, not on this CPU.
 * Two files stay loaded at once while streaming, which the one-pass `loom_cli` path avoided by releasing the
   LM first (MOSS-TTS is 16 GB at F32).
-* Not covered yet: Audio8's codec (the same template, a 128-frame window), MOSS-TTS's and Dia's (Dia's DAC is
-  not causal, so its stream is approximate), and a GPU run.
+* Audio8-TTS, the second pair, on the same machinery: its codec is causal throughout too (the windowed
+  transformer's `look_ahead_conv` is an identity), and its reference decodes in ONE call, so the stream is that
+  call at any length. `Audio8CodecStep` carries 36 states (8 layers of 8 key/value heads over 128 frames, and
+  the DAC decoder's tails and overlaps; 1.19 M floats). Talker and codec one pass bit-identical to the
+  published files; the talker's stream bit-identical to its one pass; the codec stream 7.9e-07 from one pass at
+  pushes of 1, 4 and 8; the pair 5.2e-07, its first audio after 1.30 s on the dev box (the talker 0.32 s a
+  frame, the 44.1 kHz codec RTF 3.7 alone: RTF 11.4 together).
+* Not covered yet: MOSS-TTS's and Dia's pairs (Dia's DAC is not causal, so its stream would be approximate),
+  and a GPU run.
 
 ## Related
 
