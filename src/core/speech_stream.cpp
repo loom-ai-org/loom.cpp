@@ -83,5 +83,38 @@ std::vector<float> SpeechStream::as_samples(const LoomLuaBridge::Value& v) {
     return std::vector<float>(d.begin(), d.end());
 }
 
+CodecStream::CodecStream(LoomLuaBridge& bridge, Inputs inputs) : bridge_(bridge), inputs_(std::move(inputs)) {
+    if (!supported(bridge)) {
+        throw LoadError("this codec's driver has no live path (stream_open / stream_feed / stream_finish): "
+                        "it was exported before streaming, or its decoder does not stream yet. Its one-pass "
+                        "decode is unaffected.");
+    }
+    reset();
+}
+
+void CodecStream::reset() {
+    state_.clear();
+    samples_ = 0;
+    finished_ = false;
+    bridge_.call("stream_open", inputs_, state_);
+}
+
+std::vector<float> CodecStream::push(const std::vector<int32_t>& codes) {
+    if (finished_) throw Error("CodecStream::push: the stream has finished; reset() reopens it");
+    return absorb(bridge_.call("stream_feed", {{"codes", std::vector<double>(codes.begin(), codes.end())}}, state_));
+}
+
+std::vector<float> CodecStream::finish() {
+    if (finished_) throw Error("CodecStream::finish: the stream has already finished");
+    finished_ = true;
+    return absorb(bridge_.call("stream_finish", {}, state_));
+}
+
+std::vector<float> CodecStream::absorb(const LoomLuaBridge::Value& v) {
+    std::vector<float> out = SpeechStream::as_samples(v);
+    samples_ += out.size();
+    return out;
+}
+
 } // namespace audio
 } // namespace loom

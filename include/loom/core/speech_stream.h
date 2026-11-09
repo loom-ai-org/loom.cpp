@@ -58,15 +58,55 @@ public:
     size_t samples() const { return samples_; }
     const StreamState& state() const { return state_; }
 
+    // A driver's return value as samples: its array, or nothing.
+    static std::vector<float> as_samples(const LoomLuaBridge::Value& v);
+
 private:
     double state_number(const char* name) const;
-    static std::vector<float> as_samples(const LoomLuaBridge::Value& v);
 
     LoomLuaBridge& bridge_;
     Inputs inputs_;
     StreamState state_;
     size_t samples_ = 0;
     bool opened_ = false;
+    bool finished_ = false;
+};
+
+// Codes in, audio out: the codec half of a pair (ADR-102). A text-to-codes model's `SpeechStream` hands back
+// its codes a piece at a time; this decodes them as they arrive.
+//
+// THE DRIVER CONTRACT. `stream_open(inputs)`; `stream_feed({codes = ...})` takes any whole number of
+// frames, frame-major, and returns their samples; `stream_finish({})` returns whatever is left (nothing,
+// for a causal decoder). The driver keeps its own position; the host only pushes.
+class CodecStream {
+public:
+    using Inputs = SpeechStream::Inputs;
+
+    // Opens a stream (`stream_open`). Throws loom::LoadError when the driver has no streaming entry points.
+    // `bridge` is not owned and must outlive this object.
+    explicit CodecStream(LoomLuaBridge& bridge, Inputs inputs = {});
+
+    static bool supported(const LoomLuaBridge& bridge) { return SpeechStream::supported(bridge); }
+
+    // The samples `codes` decode to, given every frame pushed before them. `codes.size()` must be a whole
+    // number of the codec's frames; the driver says so by name when it is not.
+    std::vector<float> push(const std::vector<int32_t>& codes);
+    // Ends the input: whatever is left. A stream takes no push after this; `reset` reopens it.
+    std::vector<float> finish();
+    // Drops everything and opens the stream again.
+    void reset();
+
+    bool finished() const { return finished_; }
+    size_t samples() const { return samples_; }
+    const StreamState& state() const { return state_; }
+
+private:
+    std::vector<float> absorb(const LoomLuaBridge::Value& v);
+
+    LoomLuaBridge& bridge_;
+    Inputs inputs_;
+    StreamState state_;
+    size_t samples_ = 0;
     bool finished_ = false;
 };
 
