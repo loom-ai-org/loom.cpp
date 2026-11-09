@@ -155,6 +155,12 @@ set_tests_properties(test_e2e_spm_byte_fallback_tokenizer PROPERTIES SKIP_RETURN
 
 # --- P4.23: the whole item end to end on a real IT checkpoint -- templated, tokenized, and stopping
 #     where the checkpoint says a turn stops. Generic over any GGUF carrying a chat template.
+add_executable(test_e2e_token_stream gate/test_e2e_token_stream.cpp)
+target_link_libraries(test_e2e_token_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_token_stream COMMAND test_e2e_token_stream)
+set_tests_properties(test_e2e_token_stream PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_token_stream PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_e2e_chat_generation gate/test_e2e_chat_generation.cpp)
 target_link_libraries(test_e2e_chat_generation PRIVATE loom::engine)
 add_test(NAME test_e2e_chat_generation COMMAND test_e2e_chat_generation)
@@ -514,6 +520,11 @@ add_executable(test_kv_cache ci/test_kv_cache.cpp)
 target_link_libraries(test_kv_cache PRIVATE loom::engine)
 add_test(NAME test_kv_cache COMMAND test_kv_cache)
 set_tests_properties(test_kv_cache PROPERTIES LABELS ci)
+
+add_executable(test_cache_lease ci/test_cache_lease.cpp)
+target_link_libraries(test_cache_lease PRIVATE loom::engine)
+add_test(NAME test_cache_lease COMMAND test_cache_lease)
+set_tests_properties(test_cache_lease PROPERTIES LABELS ci)
 
 # Tiny single-layer attention toy model shared by test_generation_smoke.
 add_test(
