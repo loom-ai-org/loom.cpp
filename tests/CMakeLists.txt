@@ -161,6 +161,15 @@ add_test(NAME test_e2e_token_stream COMMAND test_e2e_token_stream)
 set_tests_properties(test_e2e_token_stream PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_token_stream PROPERTIES SKIP_RETURN_CODE 77)
 
+# The audio-out live door (ADR-100): `SpeechStream`'s pieces joined are `infer`'s waveform, bit for bit,
+# and two interleaved streams each give their own. LOOM_STREAM_TTS_GGUF names a TTS exported with the
+# stream functions (pocket-tts, soprano).
+add_executable(test_e2e_speech_stream gate/test_e2e_speech_stream.cpp)
+target_link_libraries(test_e2e_speech_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_speech_stream COMMAND test_e2e_speech_stream)
+set_tests_properties(test_e2e_speech_stream PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_speech_stream PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_e2e_chat_generation gate/test_e2e_chat_generation.cpp)
 target_link_libraries(test_e2e_chat_generation PRIVATE loom::engine)
 add_test(NAME test_e2e_chat_generation COMMAND test_e2e_chat_generation)
@@ -219,6 +228,13 @@ target_compile_definitions(test_cpu_repack_routing PRIVATE LOOM_TEST_FIXTURE_DIR
 add_test(NAME test_cpu_repack_routing COMMAND test_cpu_repack_routing)
 set_tests_properties(test_cpu_repack_routing PROPERTIES LABELS ci)
 set_tests_properties(test_cpu_repack_routing PROPERTIES FIXTURES_REQUIRED repack_test_gguf_fixture)
+
+# The audio-out door's own rules (ADR-100), against toy drivers: empty pieces skipped, the finish's tail,
+# seeded streams that keep their draws, a stalled driver, a driver without the stream functions.
+add_executable(test_speech_stream ci/test_speech_stream.cpp)
+target_link_libraries(test_speech_stream PRIVATE loom::engine)
+add_test(NAME test_speech_stream COMMAND test_speech_stream)
+set_tests_properties(test_speech_stream PROPERTIES LABELS ci)
 
 add_executable(test_lua_bridge_has_function ci/test_lua_bridge_has_function.cpp)
 target_link_libraries(test_lua_bridge_has_function PRIVATE loom::engine)
