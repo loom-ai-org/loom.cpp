@@ -43,6 +43,7 @@ add_library(loom_engine
     src/core/session.cpp
     src/core/asr_text.cpp
     src/core/transcribe.cpp
+    src/core/speech_stream.cpp
     src/core/transcribe_stream.cpp
     src/core/asr_long_form.cpp
     src/core/text_generate.cpp
