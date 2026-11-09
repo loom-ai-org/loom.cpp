@@ -110,6 +110,23 @@ void test_a_stalled_driver_is_an_error(ggml_backend_t backend) {
     LOOM_CHECK_THROWS(s.next(), loom::Error);
 }
 
+void test_a_named_key_is_refused_not_dropped(ggml_backend_t backend) {
+    // `{h = {...}}` would read as the empty array of its positional part; the next call would find its
+    // state gone. An array and a number still go in, a named key does not.
+    loom::LoomLuaBridge bridge(loom::Backends{backend, nullptr});
+    bridge.load_script("function stream_open(i) loom.set_state('a', {1, 2}) loom.set_state('n', 3)\n"
+                       "  loom.set_state('carry', {h = {1, 2}}) return {} end\n"
+                       "function stream_feed(i) return {} end\n"
+                       "function stream_finish(i) return {} end\n");
+    bool refused = false;
+    try {
+        loom::audio::CodecStream s(bridge, {});
+    } catch (const loom::Error& e) {
+        refused = std::string(e.what()).find("named key") != std::string::npos;
+    }
+    LOOM_CHECK(refused);
+}
+
 void test_a_driver_without_the_functions_is_refused(ggml_backend_t backend) {
     loom::LoomLuaBridge bridge(loom::Backends{backend, nullptr});
     bridge.load_script("function infer(i) return {0.5} end\n");
@@ -131,6 +148,7 @@ int main() {
     test_seeded_streams_keep_their_draws(bridge);
     test_a_stalled_driver_is_an_error(backend.get());
     test_a_driver_without_the_functions_is_refused(backend.get());
+    test_a_named_key_is_refused_not_dropped(backend.get());
 
     LOOM_TEST_REPORT_AND_RETURN();
 }

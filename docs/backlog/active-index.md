@@ -948,8 +948,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   a `CodecStream` with its state carried; the talker is RTF ~11 on the dev-box CPU, so live only on a GPU),
   and Audio8-TTS's pair on the same machinery, and MOSS-TTS and Dia
   ([ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md): a module may declare a ring KV
-  cache of its own; DAC decoded in windows). Next: the other audio-out rows (VoxCPM2, Voxtral, LFM2.5-Audio,
-  CosyVoice3, Chatterbox, MusicGen, SpeechT5, EnCodec/SNAC), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  cache of its own; DAC decoded in windows), and MusicGen with EnCodec, and SNAC alone
+  ([ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md): EnCodec's LSTM
+  carried across pushes by `run_recurrent`'s `carry`, its convolutions windowed; SNAC's noise drawn per frame).
+  Next: the other audio-out rows (VoxCPM2, Voxtral, LFM2.5-Audio, CosyVoice3, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   No GPU has run either door yet; the per-stream cache mode is what `Auto` picks there.

@@ -1032,7 +1032,8 @@ LoomLuaBridge::SequenceSource LoomLuaBridge::read_sequence_source(LoomLuaBridge*
 void LoomLuaBridge::cell_sweep(LoomLuaBridge* self, const std::string& module_name,
                                 const SequenceSource& src, uint32_t seq_len, uint32_t input_dim,
                                 uint32_t hidden_dim, bool reverse, const char* fname,
-                                const std::function<void(uint32_t, const std::vector<float>&)>& emit) {
+                                const std::function<void(uint32_t, const std::vector<float>&)>& emit,
+                                std::vector<float>& h, std::vector<float>& c) {
     const auto it = self->modules_.find(module_name);
     if (it == self->modules_.end()) {
         throw Error(std::string(fname) + ": unregistered module '" + module_name + "'");
@@ -1060,8 +1061,13 @@ void LoomLuaBridge::cell_sweep(LoomLuaBridge* self, const std::string& module_na
         }
     }
 
-    std::vector<float> h(hidden_dim, 0.0f);
-    std::vector<float> c(hidden_dim, 0.0f);
+    // `h` and `c` are the caller's: zeros for a sweep from the start, or where an earlier call over the
+    // sequence before this one left them (`carry`, below).
+    if (h.size() != hidden_dim || c.size() != hidden_dim) {
+        throw Error(std::string(fname) + ": the carried state is " + std::to_string(h.size()) + " (h) and " +
+                     std::to_string(c.size()) + " (c) wide, but this call declares hidden_dim=" +
+                     std::to_string(hidden_dim));
+    }
     std::vector<float> layer_input(src.by_ref ? 0 : input_dim);
 
     for (uint32_t step = 0; step < seq_len; ++step) {
@@ -1144,8 +1150,14 @@ ggml_tensor* LoomLuaBridge::reshape_store_2d(Module& mod, int64_t ne0, int64_t n
     return store->reshape({shape}).at(0);
 }
 
-// `loom.run_recurrent(module, sequence, seq_len, input_dim, hidden_dim, reverse)` and
+// `loom.run_recurrent(module, sequence, seq_len, input_dim, hidden_dim, reverse [, carry])` and
 // `loom.run_recurrent_and_retain(...)`, the same body with `retain` set.
+//
+// **`carry` continues a sweep across calls** (ADR-104): a table whose `h` (and, for an LSTM cell, `c`)
+// the sweep starts from instead of zeros, and into which it writes the state after its last step. Two
+// calls over the halves of a sequence with one carry are one call over the whole of it -- which is what
+// a stream needs from a recurrence it cannot window (EnCodec's decoder LSTM: 32 frames of left context
+// still leave it O(1) from one call). Absent, the sweep starts from zeros, as it always has.
 //
 // **Either end of this may be a retained output instead of a Lua array** -- `sequence` accepts
 // `{from = "module"}` exactly as a `run_subgraph` input does, and the retaining form leaves its own
@@ -1165,6 +1177,24 @@ int LoomLuaBridge::run_recurrent_impl(lua_State* L, bool retain) {
         const bool reverse = lua_toboolean(L, 6) != 0;
 
         const SequenceSource src = read_sequence_source(self, L, 2, seq_len, input_dim, fname);
+        const bool carried = lua_istable(L, 7);
+        std::vector<float> h(hidden_dim, 0.0f), c(hidden_dim, 0.0f);
+        if (carried) {
+            using Slot = std::pair<const char*, std::vector<float>*>;
+            for (const auto& [key, state] : std::initializer_list<Slot>{{"h", &h}, {"c", &c}}) {
+                lua_getfield(L, 7, key);
+                if (!lua_isnil(L, -1)) {
+                    const std::vector<double> given = read_number_array(L, lua_gettop(L));
+                    if (given.size() != hidden_dim) {
+                        lua_pop(L, 1);
+                        throw Error(std::string("carry.") + key + " has " + std::to_string(given.size()) +
+                                     " values, but this call declares hidden_dim=" + std::to_string(hidden_dim));
+                    }
+                    state->assign(given.begin(), given.end());
+                }
+                lua_pop(L, 1);
+            }
+        }
 
         const auto it = self->modules_.find(module_name);
         if (it == self->modules_.end()) {
@@ -1198,7 +1228,13 @@ int LoomLuaBridge::run_recurrent_impl(lua_State* L, bool retain) {
                     out[static_cast<size_t>(t) * hidden_dim + k] = static_cast<double>(h[k]);
                 }
             }
-        });
+        }, h, c);
+        if (carried) {
+            push_number_array(L, std::vector<double>(h.begin(), h.end()));
+            lua_setfield(L, 7, "h");
+            push_number_array(L, std::vector<double>(c.begin(), c.end()));
+            lua_setfield(L, 7, "c");
+        }
 
         const std::vector<double> shape = {static_cast<double>(hidden_dim), static_cast<double>(seq_len),
                                             1.0, 1.0};
@@ -1278,10 +1314,12 @@ int LoomLuaBridge::l_run_bi_recurrent_and_retain(lua_State* L) {
                 }
             };
         };
+        std::vector<float> h_fwd(hidden_dim, 0.0f), c_fwd(hidden_dim, 0.0f);
+        std::vector<float> h_bwd(hidden_dim, 0.0f), c_bwd(hidden_dim, 0.0f);
         cell_sweep(self, fwd_module, src, seq_len, input_dim, hidden_dim, /*reverse=*/false, fname,
-                    sink(0));
+                    sink(0), h_fwd, c_fwd);
         cell_sweep(self, bwd_module, src, seq_len, input_dim, hidden_dim, /*reverse=*/true, fname,
-                    sink(1));
+                    sink(1), h_bwd, c_bwd);
 
         OutputStore* store = nullptr;
         ggml_context_ptr template_ctx;
@@ -2389,7 +2427,9 @@ int LoomLuaBridge::l_state(lua_State* L) {
 }
 
 // `loom.set_state(name, value)`: a number or a flat array of numbers, kept by the host between calls;
-// nil removes the entry.
+// nil removes the entry. A table with a named key is refused, not stored: it would read as the array of
+// its positional part -- `{h = {...}, c = {...}}` as `{}` -- and the next call would find its state gone
+// without a word (ADR-104 met exactly that with an LSTM carry).
 int LoomLuaBridge::l_set_state(lua_State* L) {
     try {
         auto* self = bridge_from_upvalue(L);
@@ -2400,6 +2440,19 @@ int LoomLuaBridge::l_set_state(lua_State* L) {
         } else if (lua_type(L, 2) == LUA_TNUMBER) {
             state.set_value(name, StreamState::Value{{lua_tonumber(L, 2)}, true});
         } else {
+            luaL_checktype(L, 2, LUA_TTABLE);
+            const auto n = lua_objlen(L, 2);
+            lua_pushnil(L);
+            while (lua_next(L, 2) != 0) {
+                const bool positional = lua_type(L, -2) == LUA_TNUMBER &&
+                                        lua_tonumber(L, -2) >= 1 && lua_tonumber(L, -2) <= static_cast<double>(n);
+                lua_pop(L, 1);
+                if (!positional) {
+                    lua_pop(L, 1);
+                    throw Error("'" + name + "' is a table with a named key; a state value is a number or a "
+                                "flat array of numbers -- keep each field under a name of its own");
+                }
+            }
             state.set_value(name, StreamState::Value{read_number_array(L, 2), false});
         }
         return 0;

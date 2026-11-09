@@ -138,5 +138,19 @@ int main() {
         LOOM_CHECK(differences == 0);
     }
 
+    // --- A reflection wider than its input is a catchable error, not ggml's assert ---------------------
+    // ggml_pad_reflect_1d asserts `p < ne0` and aborts the process; EnCodec's kernel-7 convolutions
+    // reached it on a clip under 4 frames (ADR-104).
+    {
+        ggml_init_params params{static_cast<size_t>(1) * 1024 * 1024, nullptr, /*no_alloc=*/true};
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_tensor* x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 3, 2);
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{ctx.get(), env, nullptr};
+        const loom::PrimitiveFn& pad = loom::PrimitiveRegistry::instance().get("PAD_1D_REFLECT");
+        LOOM_CHECK_THROWS(pad(pc, {x}, {{"lp0", 3}, {"rp0", 3}}), loom::SchemaError);
+        LOOM_CHECK(pad(pc, {x}, {{"lp0", 2}, {"rp0", 2}})[0]->ne[0] == 7);
+    }
+
     LOOM_TEST_REPORT_AND_RETURN();
 }

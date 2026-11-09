@@ -10,7 +10,7 @@
 //      module's retained outputs, the prompt's text schedule included, which is why a stream keeps its own.
 //
 // LOOM_STREAM_LM_CODES_GGUF: a text-to-codes model exported with the stream functions (qwen3-tts-12hz-0.6b,
-//                            audio8-tts-realistic-0.6b).
+//                            audio8-tts-realistic-0.6b, moss-tts, dia-1.6b, musicgen-small).
 // LOOM_STREAM_CODEC_GGUF:    its codec, exported with them.
 // LOOM_STREAM_REF_NPY:       a reference clip at the LM's rate, F32, for a model that clones and has no voice
 //                            of its own (Qwen3-TTS Base); optional otherwise.
@@ -84,18 +84,20 @@ int main() {
         }
         return out;
     };
-    // The LM's own text front end, by its tag: a byte-level BPE (Qwen3-TTS, Audio8, MOSS-TTS) or bytes (Dia).
+    // The LM's own text front end, by its tag: a byte-level BPE (Qwen3-TTS, Audio8, MOSS-TTS), bytes (Dia) or
+    // T5's SentencePiece unigram (MusicGen).
     const std::string tag = lm->kv_str("tokenizer.ggml.model");
-    auto bpe = tag == "byt5" ? nullptr : loom::BpeVocab::load(*lm);
+    auto bpe = tag == "byt5" || tag == "t5" ? nullptr : loom::BpeVocab::load(*lm);
     auto bytes = tag == "byt5" ? loom::ByteVocab::load(*lm) : nullptr;
-    LOOM_CHECK(bpe != nullptr || bytes != nullptr);
+    auto spm = tag == "t5" ? loom::Vocab::load(*lm) : nullptr;
+    LOOM_CHECK(bpe != nullptr || bytes != nullptr || spm != nullptr);
     loom::Session lm_session(*lm, backend.get());
     loom::Session codec_session(*codec, backend.get());
     loom::LoomLuaBridge& bridge = lm_session.bridge();
     LOOM_CHECK(loom::audio::SpeechStream::supported(bridge) && loom::audio::CodecStream::supported(codec_session.bridge()));
 
     const auto inputs_for = [&](const std::string& text, double seed) {
-        const std::vector<int32_t> ids = bpe ? bpe->encode(text) : bytes->encode(text);
+        const std::vector<int32_t> ids = bpe ? bpe->encode(text) : bytes ? bytes->encode(text) : spm->encode(text);
         Inputs in{{"tokens", std::vector<double>(ids.begin(), ids.end())}, {"max_new_tokens", frames_asked()},
                   {"seed", seed}};
         if (!ref.empty()) in["waveform"] = std::vector<double>(ref.begin(), ref.end());
