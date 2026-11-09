@@ -156,7 +156,10 @@ A pair streams as its two files do one pass: the LM's `SpeechStream` hands back 
 drawn, and the codec's `CodecStream` decodes pushes as they arrive, with the decoder's state carried by a
 `codec_step` graph beside the unchanged one-pass decode. Qwen3-TTS and Audio8-TTS are built, and MOSS-TTS and Dia ([ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md)): MOSS's codec is six transformers whose
 windows are kept in ring KV caches declared per module, and Dia's DAC, not causal, is decoded in windows wide
-enough to cover its receptive field. For Qwen3-TTS the talker's stream is its one pass
+enough to cover its receptive field. MusicGen and its EnCodec, and SNAC alone, are built too
+([ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md)): EnCodec's
+convolutions are windowed and its LSTM's state is carried across pushes (`loom.run_recurrent`'s `carry`), and
+SNAC's noise is drawn per frame, so a window decodes a frame with the noise it had before. For Qwen3-TTS the talker's stream is its one pass
 bit for bit, the pair's audio is within 1.2e-06 of decoding the same codes in one pass, and the first audio
 comes a frame after the talker draws it (1.58 s on the dev box, where the whole 30-frame generation took 28 s).
 
@@ -226,10 +229,10 @@ the text classifiers distilbert-ner and punctuate-all (whole text in, labels out
 | lfm2.5-audio-1.5b-tts | exact up to one ISTFT hop: detokenizer is LFM2 with a causal window of 30, then a 'same' ISTFT | driver: chunked detokenize with a hop of lookahead |
 | fun-cosyvoice3-0.5b | reference's streaming mode ("bi-streaming": chunk-aware flow mask, HiFT cache) | re-export: the streaming flow and HiFT; the export rewrote only the cache-less call |
 | chatterbox | generic: S3Gen's flow has a `finalize` lookahead hook, but the `S3GenStreamer` its docstring names is not shipped | driver: chunked flow + vocoder with overlap |
-| dia-1.6b, musicgen-small | generic: AR codes, non-causal codec (DAC, EnCodec 32 kHz `use_causal_conv: false`) | **dia built** (ADR-103): the talker hands back a frame once every delayed channel has reached it; DAC decodes windows with 16 frames of context each side, which its receptive field makes one call's result to f32 rounding. musicgen-small: not yet |
+| dia-1.6b, musicgen-small | generic: AR codes, non-causal codec (DAC, EnCodec 32 kHz `use_causal_conv: false`) | **built** (dia ADR-103, musicgen-small ADR-104): the talker hands back a frame once every delayed channel has reached it; DAC decodes windows with 16 frames of context each side, which its receptive field makes one call's result to f32 rounding; EnCodec windows its convolutions (3 frames before the LSTM, 1 after) and carries the LSTM's h and c |
 | speecht5-tts | generic: AR mel frames, HiFi-GAN over a window | driver: vocode overlapping mel windows |
 | kokoro-82m, vits-piper-en-gb-miro, matcha-tts-ljspeech, styletts2-ljspeech, f5-tts-v1-base, supertonic-2, sanotts, vocetta2-276k, vocetta2-500k, vocetta2-1m, vaniq-edge, auroratts-100k | generic: non-AR, the whole utterance at once; sentence by sentence (Kokoro's own `KPipeline` yields per chunk) | host only: **built** in loom-py (`text2speech.stream`, `exact=False`): the text split, each sentence's audio yielded |
-| dac-44khz, encodec-32khz, snac-24khz (codecs alone) | generic: non-causal decoders (SNAC also injects noise) | **dac-44khz built** (ADR-103, windows of its one-pass graph); encodec, snac: not yet |
+| dac-44khz, encodec-32khz, snac-24khz (codecs alone) | generic: non-causal decoders (SNAC also injects noise) | **built**: dac-44khz (ADR-103, windows of its one-pass graph), encodec-32khz and snac-24khz (ADR-104: windows round EnCodec's carried LSTM; SNAC's windows with its noise drawn per frame, 3 coarse frames each side) |
 
 **Tokens out:** **built** for the causal LMs (ADR-099): qwen3-0.6b-base, smollm2-360m-instruct,
 gemma-3-270m-it and lfm2-350m-monolithic stream after a re-export; lfm2-350m-modular streams as it is,
@@ -272,8 +275,8 @@ fixture set is kept for exactly this reason; `v5` is the contract-declaring set.
 | | |
 |---|---|
 | Authority | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) |
-| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md) (per-module ring caches; MOSS-TTS, Dia), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md) |
+| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md) (per-module ring caches; MOSS-TTS, Dia), [ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md) (a carried LSTM, per-frame noise; MusicGen, EnCodec, SNAC), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md), [Retro-104](../retros/retro-104-a-state-value-that-dropped-its-named-keys.md) (a stream's state value dropped its named keys) |
 | Active tasks | [Backlog → Host API](../backlog/active-index.md#host-api) |
 
 ## 4. The Record

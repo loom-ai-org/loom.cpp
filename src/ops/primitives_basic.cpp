@@ -727,6 +727,13 @@ Outputs op_pad_1d_reflect(PrimitiveContext& pc, const Inputs& in, const Json& at
     const int lp0 = static_cast<int>(resolve_attr_int(attrs, "lp0", pc.symbols));
     const int rp0 = static_cast<int>(resolve_attr_int(attrs, "rp0", pc.symbols));
     ggml_tensor* a = ensure_packed(pc.ctx, in[0]);
+    // A reflection needs more elements than it pads: ggml asserts it and ABORTS the process, which is what a
+    // codec handed too few frames did (EnCodec's kernel-7 convolutions on under 4 frames, ADR-104).
+    if (lp0 >= a->ne[0] || rp0 >= a->ne[0]) {
+        throw SchemaError("PAD_1D_REFLECT: reflecting " + std::to_string(lp0) + " left and " + std::to_string(rp0) +
+                          " right needs more than that many elements, got " + std::to_string(a->ne[0]) +
+                          " -- the input is too short for this graph");
+    }
     ggml_tensor* native = ggml_pad_reflect_1d(pc.ctx, a, lp0, rp0);
     // Ask, then choose (primitive_registry.h's `backend_can_run`). Of the backends ggml ships, only
     // Vulkan, OpenCL, OpenVINO and Hexagon lack this op -- CUDA, Metal, SYCL and CANN all have it -- so

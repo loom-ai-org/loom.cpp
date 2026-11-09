@@ -69,5 +69,5 @@ int main() {
         threw = true;
     }
     LOOM_CHECK(threw);
-    return 0;
+    LOOM_TEST_REPORT_AND_RETURN();
 }
