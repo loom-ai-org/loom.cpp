@@ -1670,15 +1670,26 @@ int LoomLuaBridge::l_causal_mask(lua_State* L) {
         const double window_arg = luaL_optnumber(L, 3, 0.0);
         const bool windowed = window_arg > 0.0;
         const auto window = static_cast<uint32_t>(window_arg > 0.0 ? window_arg : 0.0);
-        const uint32_t n_kv = n_past + n_tokens;
+        // A 4th argument is the RING the keys sit in (ADR-103): past its capacity the columns are its
+        // cells, and cell c holds the latest position written to it -- the largest p <= the call's last
+        // with p % ring == c. Before the ring fills, the cells are positions 0.. and nothing changes.
+        const auto ring = static_cast<uint32_t>(std::max(0.0, luaL_optnumber(L, 4, 0.0)));
+        const uint32_t end = n_past + n_tokens;
+        const uint32_t n_kv = ring > 0 ? std::min(end, ring) : end;
+        const auto position_of = [&](uint32_t cell) -> uint32_t {
+            if (ring == 0 || end <= ring) return cell;
+            const uint32_t last = end - 1;
+            return last - ((last - cell) % ring + ring) % ring;
+        };
         std::vector<double> mask(static_cast<size_t>(n_kv) * n_tokens);
         for (uint32_t i = 0; i < n_tokens; ++i) {
             const uint32_t query_pos = n_past + i;
-            for (uint32_t j = 0; j < n_kv; ++j) {
+            for (uint32_t cell = 0; cell < n_kv; ++cell) {
+                const uint32_t j = position_of(cell);
                 // `query_pos - j < window` on unsigned values is only meaningful once j <= query_pos has
                 // already been established, which the short-circuit guarantees.
                 const bool visible = (j <= query_pos) && (!windowed || (query_pos - j) < window);
-                mask[static_cast<size_t>(i) * n_kv + j] =
+                mask[static_cast<size_t>(i) * n_kv + cell] =
                     visible ? 0.0 : -std::numeric_limits<double>::infinity();
             }
         }

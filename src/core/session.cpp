@@ -18,7 +18,12 @@ ModuleCaches register_topologies(GgufModel& model, Backends backends, LoomLuaBri
         // phase" -- family 10's classifier-free guidance runs the decoder twice per step over two
         // independent histories, and two streams sharing one cache read each other's cells and still
         // produce plausible tokens (ADR-023).
-        if (topo.uses_kv_cache() && topo.private_kv_cache) {
+        if (topo.uses_kv_cache() && topo.kv_geometry) {
+            // Its own geometry (ADR-103), so its own cache, whatever the file's `loom.*` keys say.
+            const GraphTopology::KvGeometry& g = *topo.kv_geometry;
+            caches.private_kv.push_back(std::make_unique<KvCache>(g.n_layer, g.n_embd_k, g.n_embd_v, g.size,
+                                                                  backends.primary, g.ring, g.window));
+        } else if (topo.uses_kv_cache() && topo.private_kv_cache) {
             caches.private_kv.push_back(make_kv_cache(model, backends));
         } else if (topo.uses_kv_cache() && caches.kv == nullptr) {
             caches.kv = make_kv_cache(model, backends);

@@ -89,6 +89,23 @@ GraphTopology GraphTopology::parse(const std::string& json_text) {
             }
         }
 
+        if (j.contains("kv_cache")) {
+            const Json& g = j.at("kv_cache");
+            GraphTopology::KvGeometry geometry;
+            geometry.n_layer = g.at("n_layer").get<uint32_t>();
+            geometry.n_embd_k = g.at("n_embd_k").get<uint32_t>();
+            geometry.n_embd_v = g.at("n_embd_v").get<uint32_t>();
+            geometry.size = g.at("size").get<uint32_t>();
+            geometry.ring = g.value("ring", false);
+            geometry.window = g.value("window", 0u);
+            if (geometry.n_layer == 0 || geometry.size == 0 || geometry.n_embd_k == 0 || geometry.n_embd_v == 0) {
+                throw SchemaError("GraphTopology::parse: kv_cache declares a zero dimension");
+            }
+            topo.kv_geometry = geometry;
+            // A cache of its own geometry cannot be the session's shared one.
+            topo.private_kv_cache = true;
+        }
+
         for (const Json& node_json : j.at("nodes")) {
             topo.items.push_back(parse_item(node_json));
         }

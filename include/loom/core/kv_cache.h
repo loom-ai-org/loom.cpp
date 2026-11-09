@@ -36,7 +36,7 @@ public:
     // holds which position does not matter. It is the shape of Kyutai's `RingKVCache`, and what lets a
     // streaming model run past any fixed capacity.
     KvCache(uint32_t n_layer, uint32_t n_embd_k, uint32_t n_embd_v, uint32_t kv_size, ggml_backend_t backend,
-            bool ring = false);
+            bool ring = false, uint32_t window = 0);
 
     // Builds a ggml_set_rows node writing `k_cur`/`v_cur` (each shape [n_embd_k/v, n_tokens]) into this
     // layer's cache at the cells named by `cells` (an I64 [n_tokens] tensor -- see new_cell_index). The
@@ -75,6 +75,11 @@ public:
     uint32_t n_embd_v() const { return n_embd_v_; }
     uint32_t kv_size() const { return kv_size_; }
     bool ring() const { return ring_; }
+    // The attention window a ring serves, or 0 when it is the whole ring (ADR-066). A ring LARGER than
+    // its window takes calls of several tokens past its capacity -- up to `kv_size - window` a call --
+    // because the cells such a call overwrites hold positions already outside every query's window
+    // (ADR-103). The mask over its cells is `loom.causal_mask(n, n_past, window, kv_size)`.
+    uint32_t window() const { return window_; }
 
     // The cells some write has reached since the current stream took the cache: the extent a park has
     // to copy (ADR-099). A high-water mark, so a driver that rewinds its `n_past` makes a park copy
@@ -111,6 +116,7 @@ private:
     uint32_t n_embd_v_;
     uint32_t kv_size_;
     bool ring_ = false;
+    uint32_t window_ = 0;
     uint32_t rows_used_ = 0;
 };
 
