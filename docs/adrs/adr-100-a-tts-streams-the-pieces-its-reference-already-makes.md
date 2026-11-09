@@ -67,7 +67,7 @@ the exact ones say so.
   Soprano 2.92 s against 9.69 s; Pocket-TTS 2m 0.44 s against 1.37 s. `loom_cli` on Pocket: first audio
   after 3.25 s, 15.36 s of audio in 8.69 s = 1.77x real time (RTF 0.566), the same speed as one pass.
 * A piece is a whole chunk, so the first one waits for the first sentence's whole generation: the latency
-  is a sentence's, not a frame's. Per-frame Pocket-TTS (option 1) is the next step.
+  is a sentence's, not a frame's. Pocket-TTS now streams per frame ([ADR-101](adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md)).
 * The host cut differs from one pass where a model carries prosody across a sentence. Pocket-TTS's older
   file cut that way gave 15.36 s against 13.92 s one pass. `exact` is how a caller tells.
 * Pinned draws (`noise`) and teacher latents across several chunks are carried as state counters, as the
