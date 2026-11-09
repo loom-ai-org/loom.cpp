@@ -117,8 +117,10 @@ functions in one call, and the one-pass gate then covers the live code.
 | `loom_cli` | `--prompt ... --stream N [--stream-caches auto\|park\|per-stream]`: N tokens per pull, text printed as drawn |
 | loom-py | `model.text2text.stream(prompt)` / `chat_stream(messages)` -> `TextStream`, iterated for text pieces |
 | engine (audio out) | `loom::audio::SpeechStream`: `next()` -> the next piece's samples, `infer`'s waveform exactly; `reset()` |
-| `loom_cli` | `--prompt ... --out x.wav --stream 1`: each piece reported as it is ready, the file written at the end |
+| `loom_cli` | `--prompt ... --out x.wav --stream 1 [--codec c.gguf]`: each piece reported as it is ready, the file written at the end |
 | loom-py | `model.text2speech.stream(text, ...)` -> `SpeechStream` of `Audio` pieces, `exact` saying how it was cut |
+| engine (codec pairs) | `loom::audio::CodecStream`: `push(codes)` -> their samples, given every frame before them; `finish()` |
+| loom-py | `codec.codes2speech.stream(lm.text2codes.stream(text))` -> `Audio` per push, pushes growing 1 to 8 frames |
 
 A file without the three functions keeps its one-pass doors and is refused by the live one; streaming is a
 second door, never a change to the first. Zipformer streaming chunks its front end in the driver: the fbank
@@ -148,6 +150,13 @@ transposed-conv overlaps, 250 keys and values per layer) carried in and out and 
 upstream's `generate_audio_stream` decodes. A stream's pieces grow from one frame (80 ms) to eight; the
 first audio is ready after 0.20 s instead of 3.65 s, at the one-pass speed (1.68x real time, RTF 0.595),
 and the join is within 1.2e-06 of `infer`, which still decodes a chunk per call.
+
+**Codec pairs: two doors, the codec carrying its state** ([ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md)).
+A pair streams as its two files do one pass: the LM's `SpeechStream` hands back each frame of codes as it is
+drawn, and the codec's `CodecStream` decodes pushes as they arrive, with the decoder's state carried by a
+`codec_step` graph beside the unchanged one-pass decode. Qwen3-TTS first: the talker's stream is its one pass
+bit for bit, the pair's audio is within 1.2e-06 of decoding the same codes in one pass, and the first audio
+comes a frame after the talker draws it (1.58 s on the dev box, where the whole 30-frame generation took 28 s).
 
 ### Streaming: which other models can, and how
 
@@ -206,7 +215,7 @@ the text classifiers distilbert-ner and punctuate-all (whole text in, labels out
 | Model | Kind | What it needs |
 |---|---|---|
 | pocket-tts, pocket-tts-18m / -7m / -2m | exact: AR latents, causal Mimi decoder (`generate_audio_stream`) | **per frame: built** (ADR-101; a sentence chunk per piece with `piece_frames = 0`, ADR-100), after a re-export |
-| qwen3-tts-12hz-0.6b + qwen3-tts-tokenizer-12hz | exact: AR frames, causal codec | driver: emit each chunk of the existing chunked decode ([ADR-034](../adrs/adr-034-a-chunked-decode-is-the-drivers-loop-not-a-longer-call.md)) as it is made |
+| qwen3-tts-12hz-0.6b + qwen3-tts-tokenizer-12hz | exact: AR frames, causal codec | **built** (ADR-102): the talker hands back a frame per pull, the codec decodes pushes with its state carried; after a re-export of both |
 | audio8-tts-realistic-0.6b + audio8-tts-codec | exact by construction: AR frames; codec all causal (convs, transposed convs, window-128 transformer) | driver: decode with ≥ receptive-field left context, or a state-carrying codec re-export. Upstream's own code has no streaming entry point; the README's SGLang-Omni adapter does, unbenchmarked |
 | voxcpm2 | exact: `generate_streaming`, the AudioVAE's `streaming_decode` carries causal-conv state per patch | re-export: the VAE decoder step with its state |
 | moss-tts-local-transformer-v1.5 + moss-audio-tokenizer-v2 | exact: causal-transformer codec with streaming encode/decode (ring KV per layer) | re-export: codec step with its ring caches; a context-window chunk loop was 48% wrong here |
@@ -236,8 +245,8 @@ ADR-099):
 1. **A driver with the three stream functions** for every "driver" and "re-export" row, which means a
    re-export even where no weight changes: the driver is in the GGUF.
 2. **A door per direction:** built. `TranscriptionStream` is audio in, `GenerationStream` tokens out and
-   `SpeechStream` audio out. A codec pair (text2codes then codes2speech, two files) has no stream yet:
-   it needs the codes handed from one door to the other as they are made.
+   `SpeechStream` audio out; a codec pair is a text-to-codes `SpeechStream` composed with a `CodecStream`
+   by the host (ADR-102).
 3. **Per-call context in the stream state** for the decode loops that have it (Whisper's and T5's
    encoder output, a speech LM's built prompt), so their `PrefillDecodeLoop` can be cut per token too.
 4. **A chunked front end per family**, as Zipformer's windowed fbank: mel phases still run over the
@@ -261,7 +270,7 @@ fixture set is kept for exactly this reason; `v5` is the contract-declaring set.
 | | |
 |---|---|
 | Authority | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) |
-| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
+| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
 | Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md) |
 | Active tasks | [Backlog → Host API](../backlog/active-index.md#host-api) |
 
