@@ -1,13 +1,16 @@
-// The audio-out live door (ADR-100) on a real TTS: `SpeechStream` must hand back, piece by piece, exactly
+// The audio-out live door (ADR-100, ADR-101) on a real TTS: `SpeechStream` must hand back, piece by piece,
 // the waveform `infer` returns, and streams on one model must not see each other.
 //
-//   1. One stream, seeded: its pieces joined are `infer`'s samples, bit for bit -- the driver's `infer`
-//      IS the stream run in one call, and a seeded stream draws its seed's sequence. There are at least
-//      two pieces, and the first is ready before the whole is.
-//   2. `reset` gives the same pieces again.
+//   1. One stream, seeded: its pieces joined are `infer`'s samples -- the same count, and the same values to
+//      within f32 summation order. A driver that cuts where its one pass already cuts (Soprano's sentences)
+//      gives them bit for bit; one that decodes a frame at a time through a state-carrying step (Pocket-TTS)
+//      sums the same terms in another order, ~1e-6 apart. There are at least two pieces, and the first is
+//      ready before the whole is.
+//   2. `reset` gives the same pieces again, bit for bit.
 //   3. Two streams pulled in alternation, with a one-pass `infer` between their pulls, under both cache
-//      modes: each gives its own one-pass waveform. Their draws come from generators of their own, so a
-//      piece of one stream between two of the other's moves neither.
+//      modes: each gives exactly what it gave alone. Their draws come from generators of their own and
+//      their decoder state is their own, so a piece of one stream between two of the other's moves
+//      neither.
 //
 // LOOM_STREAM_TTS_GGUF: a TTS exported with the stream functions (pocket-tts, soprano). A file exported
 // before them is refused by the door, which is checked too when LOOM_STREAM_TTS_OLD_GGUF names one.
@@ -19,7 +22,9 @@
 
 #include "cpu_backend.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -27,6 +32,15 @@
 namespace {
 
 constexpr int kSkipReturnCode = 77;
+// A stream against one pass. Pocket-TTS's frame step measured 1.0e-6 against its one-call decoder on a
+// waveform peaking near 1; a frame decoded from the wrong state is off by the signal itself.
+constexpr double kOnePassTolerance = 1e-4;
+
+double max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
+    double d = 0.0;
+    for (size_t i = 0; i < std::min(a.size(), b.size()); ++i) d = std::max(d, std::abs(double(a[i]) - b[i]));
+    return d;
+}
 
 // Three sentences long enough that Pocket-TTS's vocabulary cannot regroup them into one chunk.
 const char* const kTextA =
@@ -101,6 +115,7 @@ int main() {
     LOOM_CHECK(!want_a.empty() && !want_b.empty());
 
     // 1. One stream.
+    std::vector<float> alone_a, alone_b;
     {
         loom::audio::SpeechStream stream(bridge, a);
         t0 = clock::now();
@@ -108,21 +123,29 @@ int main() {
         const double first_s = std::chrono::duration<double>(clock::now() - t0).count();
         stream.reset();
         const Pulled got = pull_all(stream);
-        std::fprintf(stderr, "stream a: %zu pieces of %zu (first %zu samples), %zu samples; one pass %zu; "
-                             "first piece after %.2f s, one pass took %.2f s\n",
-                     got.pieces, stream.pieces_total(), got.first_piece, got.samples.size(), want_a.size(),
+        const double d = max_abs_diff(got.samples, want_a);
+        std::fprintf(stderr, "stream a: %zu pieces (driver's total %zu, first %zu samples), %zu samples; one "
+                             "pass %zu, max|d| %.3g; first piece after %.2f s, one pass took %.2f s\n",
+                     got.pieces, stream.pieces_total(), got.first_piece, got.samples.size(), want_a.size(), d,
                      first_s, one_pass_s);
-        LOOM_CHECK(got.samples == want_a);
+        LOOM_CHECK(got.samples.size() == want_a.size());
+        LOOM_CHECK(d <= kOnePassTolerance);
         LOOM_CHECK(got.pieces >= 2);
-        LOOM_CHECK(stream.pieces_total() == stream.pieces_done());
+        LOOM_CHECK(stream.pieces_total() == 0 || stream.pieces_total() == stream.pieces_done());
         LOOM_CHECK(got.first_piece < want_a.size());
         LOOM_CHECK(stream.samples() == want_a.size());
         LOOM_CHECK(stream.next().empty());
+        alone_a = got.samples;
 
         // 2. Reset.
         stream.reset();
         LOOM_CHECK(!stream.finished() && stream.samples() == 0);
-        LOOM_CHECK(pull_all(stream).samples == want_a);
+        LOOM_CHECK(pull_all(stream).samples == alone_a);
+    }
+    {
+        loom::audio::SpeechStream stream(bridge, b);
+        alone_b = pull_all(stream).samples;
+        LOOM_CHECK(alone_b.size() == want_b.size() && max_abs_diff(alone_b, want_b) <= kOnePassTolerance);
     }
 
     // 3. Interleaved, under both cache modes.
@@ -142,10 +165,10 @@ int main() {
             got_b.insert(got_b.end(), pb.begin(), pb.end());
         }
         std::fprintf(stderr, "%s: a %s, b %s, one pass between %s\n", park ? "park" : "per-stream",
-                     got_a == want_a ? "ok" : "DIFFERS", got_b == want_b ? "ok" : "DIFFERS",
+                     got_a == alone_a ? "ok" : "DIFFERS", got_b == alone_b ? "ok" : "DIFFERS",
                      one_pass_ok ? "ok" : "DIFFERS");
-        LOOM_CHECK(got_a == want_a);
-        LOOM_CHECK(got_b == want_b);
+        LOOM_CHECK(got_a == alone_a);
+        LOOM_CHECK(got_b == alone_b);
         LOOM_CHECK(one_pass_ok);
     }
 
