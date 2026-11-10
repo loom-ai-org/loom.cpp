@@ -2209,6 +2209,71 @@ else allocates command buffers.
 So the buffers the next large graph re-allocates do not show. Qwen3-0.6B (251-token prefill, 64
 steps) is unchanged, 18.0 s.
 
+## PR 55 — `cpu`: x86 without AVX2 — MSVC's SSE macros, an SSE direct-conv tile, an SSE tinyBLAS arm
+
+*(`cmake/patches/ggml-0060-x86-sse-without-avx2.patch`; the conv tile half extends PR 6)*
+
+**Problem.** An x86 CPU without AVX2 (Atom/Celeron/Pentium Silver, Goldmont Plus and older) gets ggml's `sse42`
+or `x64` variant, and three gaps leave that mostly scalar:
+1. **MSVC defines none of GCC's SSE macros, even under `/arch:SSE4.2`**, not even `__SSE__` (checked with
+   MSVC 19.44). `ggml-cpu-impl.h` already defines `__SSE3__`/`__SSSE3__` for MSVC when AVX is on, but not for
+   the `sse42` variant. So every `GGML_SIMD` path there compiled as scalar C on Windows: dot products,
+   elementwise ops, activations, the int8 quantization of activations.
+2. **PR 6's direct conv1d tile has NEON and AVX2+FMA arms only**; every other x86 falls to its scalar tile.
+3. **tinyBLAS's F32 GEMM has AVX, AVX-512 and NEON instances but no `__m128` one**, although every helper it
+   needs is already defined for `__m128`. Without AVX, every F32 matmul and im2col convolution runs one
+   `ggml_vec_dot_f32` per output element.
+
+**Change.**
+1. `ggml-cpu-impl.h`: on MSVC (not clang-cl) with `GGML_SSE42`, define `__SSE__` through `__SSE4_2__`.
+2. `ops.cpp`: a `__SSE2__`/`_M_X64` tile, 4 output channels x 2 `__m128`, multiply then add (no FMA), the
+   same RES/CLAMP epilogues as the AVX2 tile. Plus an SSE arm in the fused `LEAKY_RELU` copy.
+3. `sgemm.cpp`: `tinyBLAS<4, __m128, __m128, float, float, float>` after the AVX arm, x86-64 only.
+
+**Numerics.** Not bit-identical to the scalar tile, though per element it is the same arithmetic. The tile
+covers 8 positions, not 4, and `ggml_conv_1d_direct_ok`'s shape rules are written in that width, so some
+convolutions change path. VITS audio 104-120 dB SNR, Matcha 78-104 dB; ASR transcripts identical (Citrinet,
+Zipformer, Linux and Windows); on Windows, Zipformer Q8_0_PC 70/73 transcripts identical, WER 7.57 -> 7.65.
+
+**Measured.** Celeron N4100, Windows, MSVC, 4 threads, F32 RTF (one `ggml-cpu-sse42.dll` swapped per step,
+2 interleaved rounds):
+
+| | scalar | + conv tile | + SSE macros | + tinyBLAS |
+|---|---|---|---|---|
+| Citrinet-256-ls | 0.170 | 0.136 | 0.132 | 0.121 |
+| Zipformer small | 0.494 | 0.503 | 0.179 | 0.171 |
+| VITS (piper miro) | 0.919 | 0.597 | 0.322 | 0.302 |
+| Matcha-TTS | 12.95 | 6.01 | 3.82 | 3.70 |
+
+Linux (GCC defines the macros, so items 2 and 3 only), Ryzen 3 3250U, SSE4.2-only build, 2 threads, median of 5,
+3 alternating rounds: Citrinet 0.484 -> 0.300 s on a 12.5 s clip, Zipformer 1.75 -> 1.26 s, VITS 1.02 ->
+0.594 s, Matcha 8.6 -> 5.5 s wall. `ctest -L ci` passes on x64 (SSE2), sse42 and AVX-only builds.
+
+**What a reviewer should push on.** The tile shape is sized by register count, not swept. And the conv
+heuristics (`ggml_conv_1d_direct_ok`) were tuned at the AVX2 width and are reused at 8.
+
+## PR 56 — `cpu`: RunFast on x86-64 (MXCSR FTZ | DAZ for the graph compute)
+
+*(`cmake/patches/ggml-0061-x86-runfast-ftz-daz.patch`; extends PR 28)*
+
+**Problem.** PR 28 sets flush-to-zero for a graph compute on ARMv6 only, on the reasoning that later cores
+handle denormals in hardware. x86 cores still take microcode assists on them, 10-100x a normal multiply-add,
+and worst on Atom-class cores. BatchNorm-folded dead channels make them: Citrinet-256-ls has 138k weights
+below 1e-19 (down to 3e-36), and their products with ordinary activations fall below 2^-126 although no
+stored tensor holds a single denormal. Three 1x1 convolutions of one block took 12 ms where same-shape
+siblings took 0.25 ms (Core Ultra 9 285K), and 150 ms against 5 ms on a Celeron N4100.
+
+**Change.** On x86-64, PR 28's `GGML_CPU_HAS_RUNFAST` with MXCSR's FTZ (bit 15) | DAZ (bit 6) as the mode
+bits, through `_mm_getcsr`/`_mm_setcsr`. Set on entry to `ggml_graph_compute_thread`, only those two bits put
+back on exit, so the caller's thread is unaffected after the compute. `GGML_CPU_RUNFAST=0` turns it off.
+
+**Numerics.** As PR 28: denormal inputs read as zero and denormal results flush to zero; there is no
+default-NaN mode on x86. Same transcripts on every ASR model measured.
+
+**Measured.** Citrinet-256-ls node time on a 12.5 s clip, Core Ultra 9 285K, 4 threads, best of 3, RunFast off
+-> on: x64 build 0.156 -> 0.077 s, sse42 0.157 -> 0.081, AVX-only 0.139 -> 0.077, native AVX2 0.074 ->
+0.066 s. Zipformer, VITS and Matcha unchanged (within noise). `ctest -L ci` passes on all four builds.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
