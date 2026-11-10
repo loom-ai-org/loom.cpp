@@ -2234,6 +2234,9 @@ or `x64` variant, and three gaps leave that mostly scalar:
 covers 8 positions, not 4, and `ggml_conv_1d_direct_ok`'s shape rules are written in that width, so some
 convolutions change path. VITS audio 104-120 dB SNR, Matcha 78-104 dB; ASR transcripts identical (Citrinet,
 Zipformer, Linux and Windows); on Windows, Zipformer Q8_0_PC 70/73 transcripts identical, WER 7.57 -> 7.65.
+loom's VoxCPM2 gate on an SSE4.2 build: the teacher-forced arms are unchanged (5e-7 RMSE), and the free-running
+arm moves from 9.2e-6 to 6.4e-4 RMSE, over its 1e-4 bound. That arm's own header warns it can fail on another
+accumulation order without anything being wrong.
 
 **Measured.** Celeron N4100, Windows, MSVC, 4 threads, F32 RTF (one `ggml-cpu-sse42.dll` swapped per step,
 2 interleaved rounds):
