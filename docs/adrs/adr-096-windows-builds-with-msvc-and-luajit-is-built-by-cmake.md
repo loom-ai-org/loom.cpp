@@ -69,7 +69,7 @@ The rest, each where it belongs:
   `find_package(Vulkan)` does) rather than fetching them.
 * **Output matches Linux.** On 73 LibriSpeech clips, Citrinet-256 transcribes identically to Linux at F32 and
   Q8_0_PC, and Zipformer small identically at F32 (69/73 at Q8_0_PC, same WER). Speed on the N4100, 4 threads,
-  mean of 3 interleaved launches (ASR: 81 s of audio; TTS: 3 sentences after a warm-up), Vulkan with the driver's
+  mean of 3 interleaved launches (ASR: 110 s of audio; TTS: 3 sentences after a warm-up), Vulkan with the driver's
   shader cache warm:
 
   | RTF, F32 / Q8_0_PC | CPU | Vulkan (UHD 600) | Vulkan speed-up |
