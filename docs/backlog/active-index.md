@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-06
+last_updated: 2026-11-10
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -847,11 +847,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Backends & accelerators
 
-* [ ] **Vulkan on Windows: stability on the Celeron N4100 box is unproven.** F32 output matches the CPU and runs
-  ~2x faster on Matcha and Citrinet, but sustained Vulkan load froze or switched off the box 7 times
-  (2026-11-06/07), independent of precision, heat, the display, memory, the GPU timeout and driver version
-  (31.0.101.2112 and .2115). It was on an adapter that does not match its 5 V 4 A rating. Rerun the Vulkan
-  speed rounds on a correct supply, then finish the Vulkan rows. *Context: [ADR-096](../adrs/adr-096-windows-builds-with-msvc-and-luajit-is-built-by-cmake.md)*
+* [ ] **VITS F32 on Vulkan (Intel UHD 600, Windows) is slow on two specific sentences.** Harvard sentences 2
+  and 3 take 2.2-2.8x as long as their neighbours (5.9 s and 4.6 s against ~2.1 s), in every launch. Q8_0_PC
+  on the same GPU and both precisions on the CPU are not affected. It makes the timed RTF 1.71 against 0.89
+  over sentences 4-10. Start with a per-node profile of sentence 2 against sentence 4 on that box.
+  *Context: [ADR-096](../adrs/adr-096-windows-builds-with-msvc-and-luajit-is-built-by-cmake.md)*
 * [ ] **ggml-vc4 (P4.44-P4.47), what the Pi Zero's QPUs still leave to the CPU.** A model's first inference
   copies its F32 matrices into the pool (conformer-ctc 0.2 s); `CONV_TRANSPOSE_1D` with a stride that is
   not a power of two, or a residual or mask after it, is the CPU's; packing weights into the QPUs'
