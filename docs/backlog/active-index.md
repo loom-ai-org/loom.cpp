@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-06
+last_updated: 2026-11-10
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -370,6 +370,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — correctness
 
+* [ ] **A seed is not portable across C++ standard libraries.** `lua_bridge.h` draws through
+  `std::normal_distribution` / `std::uniform_real_distribution`, whose algorithms are implementation-defined,
+  so the same seed gives different VITS durations and Matcha noise on Windows (MSVC STL) than on Linux
+  (libstdc++), and macOS's libc++ is a third. `std::mt19937`'s raw output IS specified: a fixed Box-Muller
+  and a fixed `[0,1)` mapping over it would make seeded output identical everywhere. Changes every seeded
+  TTS output once, so it wants a release note. *Context: [ADR-096](../adrs/adr-096-windows-builds-with-msvc-and-luajit-is-built-by-cmake.md)*
 * [ ] **`RANGE_1D` with a negative step returns -1 elements, silently.** `op_range_1d` forces `end > start` so `ggml_arange` (which asserts it and has no negative steps) cannot abort, so `arange(T - 1, -T, -1)` becomes `arange(start, start + 1, -1)`; the first error is a downstream RESHAPE. Lower a negative step as `start + step * arange(0, n)` with `n = ceil((end - start) / step)`, and throw on an empty range rather than inventing one element. Nemotron ASR's export avoids it so its file runs on released wheels. *Context: [Retro-079](../retros/retro-079-the-references-default-path-was-the-broken-one.md)*
 * [ ] **Who still depends on the layout-"healing" heuristics?** The guards make size-guessing
   *unreachable for already-correct graphs*; they do not remove it, and `op_repeat`'s two branches are
@@ -402,6 +408,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — performance
 
+* [ ] **x86 without AVX2 runs loom's own kernels scalar.** The conv1d direct tile and friends are AVX2-only;
+  on an SSE4.2 CPU (Celeron N4100) the build limited to that variant is 1.5x (Zipformer) to 2.5x (VITS) slower
+  than the AVX2 one on the same Linux box, and MSVC auto-vectorises less than GCC. Two levers: SSE4.2 arms for
+  the hottest tiles, and a clang-cl Windows build (ADR-096 Option 2). *Context: [ADR-096](../adrs/adr-096-windows-builds-with-msvc-and-luajit-is-built-by-cmake.md)*
 * [ ] **P4.35/P4.36 follow-ups.** P4.35-P4.39 are merged (#89-#93, 2026-10-23), and their record is
   [Epic-05](../epics/epic-05-edge-performance.md#p435-p439-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22), ADR-082 and ADR-083. Two things are still open. (1) A job owning
   all 64 `A@V` rows, with narrow column blocks, measured 1.08x more on the op on the Pi 4 and is not built. (2) Moonshine
@@ -837,6 +847,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Backends & accelerators
 
+* [ ] **ggml-vulkan keeps no `VkPipelineCache`, so a process without a driver cache recompiles every launch.**
+  On the UHD 600 under Windows SYSTEM (no Intel per-user cache), VITS F32's first sentence takes 20 s against
+  2.1 s warm, and each new input shape takes about 3 s more. Services, fresh containers and CI runners are in
+  the same position. Lever: a ggml patch that creates the pipelines from a `VkPipelineCache`, loaded from and
+  saved to a per-device file (keyed on `pipelineCacheUUID` + driver version), with an env var for the
+  directory. *Context: [ADR-096](../adrs/adr-096-windows-builds-with-msvc-and-luajit-is-built-by-cmake.md)*
 * [ ] **ggml-vc4 (P4.44-P4.47), what the Pi Zero's QPUs still leave to the CPU.** A model's first inference
   copies its F32 matrices into the pool (conformer-ctc 0.2 s); `CONV_TRANSPOSE_1D` with a stride that is
   not a power of two, or a residual or mask after it, is the CPU's; packing weights into the QPUs'
@@ -944,6 +960,10 @@ before loom-py's card gate can run against it — `git -C vendor/loom.cpp fetch 
 `checkout <sha>` → rebuild → commit the pointer. A release pins that submodule at `main`'s tip, and
 **that pin is what the wheels are built from**.
 
+* [ ] **Windows wheels in CI.** loom-py builds on Windows with MSVC and its `tests/ci` pass there (verified by
+  hand on a Celeron N4100, 2026-11-07), but nothing builds it automatically. Needs a `windows-latest` row in
+  `wheels.yml` and `ci.yml` (the base wheel and `rt-vulkan`, which needs the Vulkan SDK on the runner), then
+  publishing `win_amd64` with the next release, and README/PLATFORMS saying so. *Context: [ADR-096](../adrs/adr-096-windows-builds-with-msvc-and-luajit-is-built-by-cmake.md)*
 * [ ] **Republish flan-t5-small once `feat/t5-bias-in-graph` (loom-exporter) merges.** The encoder's
   bias moved into the graph (ADR-074), so the GGUF changes: a `positions` input replaces
   `position_bias`, a 257x6 `enc_rel_bias` weight is added, and the driver drops `ENC_REL_BIAS`. It

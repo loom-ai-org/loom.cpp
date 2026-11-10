@@ -9,6 +9,7 @@
 // what made converting 78 files safe -- with the old variable set, resolution is what it always was.
 
 #include "test_util.h"
+#include "posix_env.h"
 #include "fixtures.h"
 
 #include <cstdio>

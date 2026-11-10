@@ -1,0 +1,64 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 97a42e34..65a37905 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -5,7 +5,19 @@
+ #elif defined(__AVX2__)
+ #  include <immintrin.h>
+ #endif
+-#include <unistd.h>
++// Windows has no <unistd.h>: `sysconf` is how the conv1d budget below asks Linux for its caches, and
++// Windows answers the same question through GetLogicalProcessorInformation instead (loom ggml-0059).
++#if defined(_WIN32)
++#  ifndef WIN32_LEAN_AND_MEAN
++#    define WIN32_LEAN_AND_MEAN
++#  endif
++#  ifndef NOMINMAX
++#    define NOMINMAX
++#  endif
++#  include <windows.h>
++#else
++#  include <unistd.h>
++#endif
+ #if defined(__APPLE__)
+ #  include <sys/sysctl.h>
+ #endif
+@@ -7869,6 +7881,23 @@ static int64_t ggml_conv_1d_direct_budget(void) {
+         // and it is also the arm that does not stage patches at all. This is a budget because the
+         // question is a budget.
+         l2 = 32 * 1024;
++#elif defined(_WIN32)
++        // One RelationCache record per cache INSTANCE, so a part with an L2 per core cluster lists
++        // several; the largest of each level is the one a thread's working set lives in, which is
++        // what sysconf answers on Linux. Without this arm Windows took the 512 KB floor -- an eighth
++        // of the 4 MB shared L2 (and no L3) of the Celeron N4100 it was first built on (loom ggml-0059).
++        DWORD len = 0;
++        GetLogicalProcessorInformation(NULL, &len);
++        if (len > 0) {
++            std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> info(len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
++            if (GetLogicalProcessorInformation(info.data(), &len)) {
++                for (const auto & r : info) {
++                    if (r.Relationship != RelationCache || r.Cache.Type == CacheInstruction) continue;
++                    if (r.Cache.Level == 2 && (long) r.Cache.Size > l2) l2 = (long) r.Cache.Size;
++                    if (r.Cache.Level == 3 && (long) r.Cache.Size > l3) l3 = (long) r.Cache.Size;
++                }
++            }
++        }
+ #else
+ #if defined(_SC_LEVEL3_CACHE_SIZE)
+         l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
+diff --git a/src/ggml-impl.h b/src/ggml-impl.h
+index ae26e0c2..656b0abd 100644
+--- a/src/ggml-impl.h
++++ b/src/ggml-impl.h
+@@ -361,7 +361,9 @@ struct ggml_cgraph {
+ // returns a slice of cgraph with nodes [i0, i1)
+ // the slice does not have leafs or gradients
+ // if you need the gradients, get them from the original graph
+-struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph, int i0, int i1);
++// loom (ggml-0059): exported like its neighbours below. loom's profiler walks a graph one node at a
++// time through it; an ELF build exports every symbol anyway, a Windows DLL only what is marked.
++GGML_API struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph, int i0, int i1);
+ 
+ // ggml-alloc.c: true if the operation can reuse memory from its sources
+ GGML_API bool ggml_op_can_inplace(enum ggml_op op);

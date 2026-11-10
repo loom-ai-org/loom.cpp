@@ -262,7 +262,8 @@ What was open here has since closed, and is recorded rather than tracked:
 * **The `loom-py` submodule pointer — DONE.** Bumping it is a release-time act, as this item said, and
   it is now part of the cut: rc10 pins `vendor/loom.cpp` at `main`'s tip and the wheels are built from
   that pin.
-* **Windows** stays out of scope and stays behind this.
+* **Windows** builds with MSVC since 2026-11-07 ([ADR-096](../adrs/adr-096-windows-builds-with-msvc-and-luajit-is-built-by-cmake.md)); its wheels are not
+  published until a `windows-latest` CI row builds them.
 
 
 ## 5. The Record
