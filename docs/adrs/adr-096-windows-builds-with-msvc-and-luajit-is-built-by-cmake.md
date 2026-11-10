@@ -68,8 +68,19 @@ The rest, each where it belongs:
   on Linux. The Vulkan wheel finds the SDK's own headers (`VulkanToolchain.cmake`'s probe now looks where
   `find_package(Vulkan)` does) rather than fetching them.
 * **Output matches Linux.** On 73 LibriSpeech clips, Citrinet-256 transcribes identically to Linux at F32 and
-  Q8_0_PC, and Zipformer small identically at F32 (69/73 at Q8_0_PC, same WER). CPU RTF on the N4100, 4 threads,
-  F32 / Q8_0_PC: Citrinet 0.179 / 0.109, Zipformer 0.520 / 0.449, VITS (miro) 0.917 / 0.936, Matcha 13.3 / 13.0.
+  Q8_0_PC, and Zipformer small identically at F32 (69/73 at Q8_0_PC, same WER). Speed on the N4100, 4 threads,
+  mean of 3 interleaved launches (ASR: 81 s of audio; TTS: 3 sentences after a warm-up):
+
+  | RTF, F32 / Q8_0_PC | CPU | Vulkan (UHD 600) | Vulkan speed-up |
+  |---|---|---|---|
+  | Citrinet-256 | 0.179 / 0.109 | 0.089 / 0.082 | 2.02x / 1.34x |
+  | Zipformer small | 0.520 / 0.449 | 0.303 / 0.337 | 1.72x / 1.33x |
+  | VITS (miro) | 0.917 / 0.936 | 1.713 / 0.886 | 0.54x / 1.06x |
+  | Matcha | 13.26 / 13.03 | 6.41 / 6.96 | 2.07x / 1.87x |
+
+  VITS F32 on Vulkan is slow on two specific sentences of the three timed: 2.2-2.8x their neighbours, in every
+  launch, and on that arm only. Over sentences 4-10 its RTF is 0.89. That is a hub item. Q8_0_PC gains little on
+  the GPU, and is slower than F32 there on Zipformer and Matcha.
 * **MSVC's x86 ladder is nine rungs, not fourteen** (no zen4, sapphirerapids, ivybridge, piledriver,
   cooperlake). It starts at the same `x64` baseline.
 * **loom's own x86 kernels are AVX2-only.** On SSE4.2 the conv1d direct tile is scalar
@@ -82,10 +93,14 @@ The rest, each where it belongs:
   TTS oracle WERs differ by one or two words in 80 for that reason alone. This predates the port (macOS's
   libc++ is a third implementation) and is tracked in the hub.
 * **Vulkan builds and runs on the UHD 600, and its F32 output matches the CPU's** (VITS SNR >= 91.9 dB,
-  Matcha >= 44.2 dB, ASR transcripts identical), at about 2x the CPU's speed on Matcha and Citrinet. Its
-  stability on that box is **not established**: sustained Vulkan load froze or switched off the machine seven
-  times, independent of precision, heat, the display, memory, the GPU timeout and the driver version. The box
-  was running on an adapter that does not match its 5 V 4 A rating, the likely cause. That rerun is in the hub.
+  Matcha >= 44.2 dB, ASR transcripts identical). At Q8_0_PC its ASR WER stays within 0.1 point of the CPU's
+  (Citrinet 70/73, Zipformer 70/73 transcripts identical to Linux) and its TTS WER within one word in 80.
+  It costs RAM: the peak working set is 60-390 MB above the CPU's for the same file, on a 4 GB box.
+* **Vulkan on that box is stable on a correct supply.** On the first adapter, which did not match the box's
+  5 V 4 A rating, sustained Vulkan load froze or switched off the machine seven times. That was independent of
+  precision, heat, the display, memory, the GPU timeout and the driver version (31.0.101.2112, .2115). On a
+  5 V 4 A supply (2026-11-10, driver .2140), all 38 Vulkan launches completed over about an hour of GPU load.
+  The board peaked at 50 °C, and Windows applied no thermal limit.
 * A runner job (`windows-latest`) in loom-py's `wheels.yml` is what makes this a shipped platform.
   Until then the wheel is built by hand.
 
