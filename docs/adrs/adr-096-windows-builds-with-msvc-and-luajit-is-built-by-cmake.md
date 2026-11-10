@@ -69,18 +69,27 @@ The rest, each where it belongs:
   `find_package(Vulkan)` does) rather than fetching them.
 * **Output matches Linux.** On 73 LibriSpeech clips, Citrinet-256 transcribes identically to Linux at F32 and
   Q8_0_PC, and Zipformer small identically at F32 (69/73 at Q8_0_PC, same WER). Speed on the N4100, 4 threads,
-  mean of 3 interleaved launches (ASR: 81 s of audio; TTS: 3 sentences after a warm-up):
+  mean of 3 interleaved launches (ASR: 81 s of audio; TTS: 3 sentences after a warm-up), Vulkan with the driver's
+  shader cache warm:
 
   | RTF, F32 / Q8_0_PC | CPU | Vulkan (UHD 600) | Vulkan speed-up |
   |---|---|---|---|
-  | Citrinet-256 | 0.179 / 0.109 | 0.089 / 0.082 | 2.02x / 1.34x |
-  | Zipformer small | 0.520 / 0.449 | 0.303 / 0.337 | 1.72x / 1.33x |
-  | VITS (miro) | 0.917 / 0.936 | 1.713 / 0.886 | 0.54x / 1.06x |
-  | Matcha | 13.26 / 13.03 | 6.41 / 6.96 | 2.07x / 1.87x |
+  | Citrinet-256 | 0.179 / 0.109 | 0.089 / 0.081 | 2.00x / 1.35x |
+  | Zipformer small | 0.520 / 0.449 | 0.285 / 0.294 | 1.83x / 1.53x |
+  | VITS (miro) | 0.917 / 0.936 | 0.826 / 0.884 | 1.11x / 1.06x |
+  | Matcha | 13.26 / 13.03 | 6.20 / 6.88 | 2.14x / 1.89x |
 
-  VITS F32 on Vulkan is slow on two specific sentences of the three timed: 2.2-2.8x their neighbours, in every
-  launch, and on that arm only. Over sentences 4-10 its RTF is 0.89. That is a hub item. Q8_0_PC gains little on
-  the GPU, and is slower than F32 there on Zipformer and Matcha.
+  Q8_0_PC gains little on the GPU: 1.10x on Citrinet, and it is slower than F32 on the other three.
+* **The first Vulkan run of a model compiles its shaders, and a SYSTEM process does that every launch.**
+  ggml-vulkan creates each pipeline on first use and keeps no `VkPipelineCache`. Intel's Windows driver caches
+  compiled pipelines per user on disk (`%USERPROFILE%\AppData\LocalLow\Intel\ShaderCache`), but writes
+  nothing for SYSTEM, even when that directory exists. With an empty cache, VITS F32's first sentence took 20 s
+  instead of 2.1 s, and each sentence that brought new shapes took about 3 s more.
+
+  Proof: deleting the cache file brought the cost back on a user process, and the next process ran without
+  it. A first benchmark run under schtasks as SYSTEM paid it every launch. That run inflated VITS F32 to RTF
+  1.713, Zipformer Q8_0_PC to 0.337, Zipformer F32 to 0.303 and Matcha F32 to 6.41; the other arms moved less
+  than 1.5%. Persisting a `VkPipelineCache` ourselves is a hub item.
 * **MSVC's x86 ladder is nine rungs, not fourteen** (no zen4, sapphirerapids, ivybridge, piledriver,
   cooperlake). It starts at the same `x64` baseline.
 * **loom's own x86 kernels are AVX2-only.** On SSE4.2 the conv1d direct tile is scalar
