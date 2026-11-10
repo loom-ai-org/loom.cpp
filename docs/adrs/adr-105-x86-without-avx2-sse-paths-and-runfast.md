@@ -74,6 +74,11 @@ Option 3, as two patches:
   * Zipformer Q8_0_PC changed 3 of 73 transcripts, WER 7.57 → 7.65: the macros also vectorise ggml's int8
     quantization of activations.
   * RunFast flushes values below 2^-126; ADR-078's caveat stands (`logf` of a denormal gives -inf, not -103.97).
+  * Gate (`v5`): 21 of 22 real-model tests pass on a native build. CosyVoice3's cloned-voice free-running
+    arm fails with or without these patches.
+  * On an SSE4.2 build, 96 of 98 pass. CosyVoice3 fails the same way. VoxCPM2's free-running arm drifts to
+    6.4e-4 RMSE (bound 1e-4, 9.2e-6 unpatched) while its teacher-forced arms are unchanged. That is the
+    accumulation-order case its header warns about.
 * **Linux gains too:** an SSE4.2-only build on a Ryzen 3 3250U, 0060 alone, Citrinet 1.61x, Zipformer 1.39x,
   VITS 1.72x, Matcha 1.55x. `ctest -L ci` passes on SSE2-only, SSE4.2, AVX-only and native builds.
 * **Q8_0_PC matmuls don't reach tinyBLAS on this path**, so after the fix Zipformer Q8_0_PC is 2x slower than
