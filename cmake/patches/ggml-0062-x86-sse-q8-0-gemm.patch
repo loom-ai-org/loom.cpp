@@ -1,0 +1,181 @@
+diff --git a/src/ggml-cpu/arch/x86/quants.c b/src/ggml-cpu/arch/x86/quants.c
+index ea54cfe..e5cf2c4 100644
+--- a/src/ggml-cpu/arch/x86/quants.c
++++ b/src/ggml-cpu/arch/x86/quants.c
+@@ -1359,6 +1359,21 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     }
+ 
+     sumf = hsum_float_8(accum);
++#elif defined(__SSSE3__)
++    // loom ggml-0062: x86 without AVX. Only the 32-term integer dot is vectorised -- it is exact either
++    // way -- and each block's sum is then scaled and added in the scalar loop's order below, so this
++    // is bit-identical to the scalar path it replaces (and to tinyBLAS_Q0_SSE, which does the same).
++    for (; ib < nb; ++ib) {
++        __m128i p = _mm_add_epi32(mul_sum_i8_pairs(_mm_loadu_si128((const __m128i *)x[ib].qs),
++                                                   _mm_loadu_si128((const __m128i *)y[ib].qs)),
++                                  mul_sum_i8_pairs(_mm_loadu_si128((const __m128i *)x[ib].qs + 1),
++                                                   _mm_loadu_si128((const __m128i *)y[ib].qs + 1)));
++        p = _mm_add_epi32(p, _mm_unpackhi_epi64(p, p));
++        p = _mm_add_epi32(p, _mm_shuffle_epi32(p, _MM_SHUFFLE(2, 3, 0, 1)));
++        const int sumi = _mm_cvtsi128_si32(p);
++
++        sumf += sumi*(GGML_CPU_FP16_TO_FP32(x[ib].d)*GGML_CPU_FP16_TO_FP32(y[ib].d));
++    }
+ #endif
+     for (; ib < nb; ++ib) {
+         int sumi = 0;
+diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
+index 267f1cf..b4a03ed 100644
+--- a/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -2672,6 +2672,135 @@ class tinyBLAS_Q0_AVX {
+ };
+ #endif // __AVX__
+ 
++#if defined(__SSSE3__) && !defined(__AVX__) && (defined(__x86_64__) || defined(_M_X64))
++// loom ggml-0062: Q8_0 x Q8_0 on x86 without AVX (SSE4.2 Atoms and Celerons). tinyBLAS_Q0_AVX above
++// needs AVX, so these CPUs ran every quantized matmul as one ggml_vec_dot_q8_0_q8_0 per output, and
++// with ggml-0060's F32 tinyBLAS in place that made Q8_0 slower than F32 (Celeron N4100, MSVC: Zipformer
++// small RTF 0.334 against 0.170; 0.144 with this, Matcha 4.60 -> 3.78). Each lane of C is one weight row: the 32-term integer dot of a block is
++// exact in SSSE3's maddubs/madd, the four rows' sums are gathered with two hadds, and each lane then
++// does `sum += (float)sumi * (da * db)` in block order -- the scalar loop's arithmetic, element for
++// element, so results are bit-identical to the ggml_vec_dot_q8_0_q8_0 path this replaces.
++class tinyBLAS_Q0_SSE {
++  public:
++    tinyBLAS_Q0_SSE(int64_t k,
++                    const block_q8_0 *A, int64_t lda,
++                    const block_q8_0 *B, int64_t ldb,
++                    float *C, int64_t ldc,
++                    int ith, int nth)
++        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {
++    }
++
++    void matmul(int64_t m, int64_t n) {
++        const int64_t mp = m / 4 * 4;
++        const int64_t np = n / 4 * 4;
++        if (mp > 0) {
++            if (np > 0)
++                gemm4<4>(0, mp, 0, np);
++            switch (n - np) {
++            case 3: gemm4<3>(0, mp, np, n); break;
++            case 2: gemm4<2>(0, mp, np, n); break;
++            case 1: gemm4<1>(0, mp, np, n); break;
++            default: break;
++            }
++        }
++        if (mp < m)
++            gemm1(mp, m, 0, n);
++    }
++
++  private:
++    // Rows ii..ii+3 of A against RN columns of B; C[ldc*j + ii..ii+3] is one __m128 per column.
++    template <int RN>
++    NOINLINE void gemm4(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        int64_t ytiles = (m - m0) / 4;
++        int64_t xtiles = (n - n0) / RN;
++        int64_t tiles = xtiles * ytiles;
++        int64_t duty = (tiles + nth - 1) / nth;
++        int64_t start = duty * ith;
++        int64_t end = start + duty;
++        if (end > tiles)
++            end = tiles;
++        for (int64_t job = start; job < end; ++job) {
++            int64_t ii = m0 + job / xtiles * 4;
++            int64_t jj = n0 + job % xtiles * RN;
++            const block_q8_0 *a0 = A + lda * (ii + 0);
++            const block_q8_0 *a1 = A + lda * (ii + 1);
++            const block_q8_0 *a2 = A + lda * (ii + 2);
++            const block_q8_0 *a3 = A + lda * (ii + 3);
++            __m128 Cv[RN];
++            for (int64_t j = 0; j < RN; ++j)
++                Cv[j] = _mm_setzero_ps();
++            for (int64_t l = 0; l < k; ++l) {
++                const __m128 da = _mm_setr_ps(unhalf(a0[l].d), unhalf(a1[l].d), unhalf(a2[l].d), unhalf(a3[l].d));
++                for (int64_t j = 0; j < RN; ++j) {
++                    const block_q8_0 *b = B + ldb * (jj + j) + l;
++                    const __m128i b0 = load0(b);
++                    const __m128i b1 = load1(b);
++                    const __m128i sumi = _mm_hadd_epi32(_mm_hadd_epi32(dot(a0 + l, b0, b1), dot(a1 + l, b0, b1)),
++                                                        _mm_hadd_epi32(dot(a2 + l, b0, b1), dot(a3 + l, b0, b1)));
++                    Cv[j] = _mm_add_ps(Cv[j], _mm_mul_ps(_mm_cvtepi32_ps(sumi), _mm_mul_ps(da, _mm_set1_ps(unhalf(b->d)))));
++                }
++            }
++            for (int64_t j = 0; j < RN; ++j)
++                _mm_storeu_ps(C + ldc * (jj + j) + ii, Cv[j]);
++        }
++    }
++
++    // The m % 4 rows left over, one output at a time.
++    NOINLINE void gemm1(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        int64_t xtiles = n - n0;
++        int64_t tiles = xtiles * (m - m0);
++        int64_t duty = (tiles + nth - 1) / nth;
++        int64_t start = duty * ith;
++        int64_t end = start + duty;
++        if (end > tiles)
++            end = tiles;
++        for (int64_t job = start; job < end; ++job) {
++            int64_t ii = m0 + job / xtiles;
++            int64_t jj = n0 + job % xtiles;
++            const block_q8_0 *a = A + lda * ii;
++            const block_q8_0 *b = B + ldb * jj;
++            float sumf = 0;
++            for (int64_t l = 0; l < k; ++l) {
++                __m128i p = dot(a + l, load0(b + l), load1(b + l));
++                p = _mm_add_epi32(p, _mm_unpackhi_epi64(p, p));
++                p = _mm_add_epi32(p, _mm_shuffle_epi32(p, _MM_SHUFFLE(2, 3, 0, 1)));
++                const int sumi = _mm_cvtsi128_si32(p);
++                sumf += sumi * (unhalf(a[l].d) * unhalf(b[l].d));
++            }
++            C[ldc * jj + ii] = sumf;
++        }
++    }
++
++    // Four int32 partial sums of one block's 32 products: |a| times b signed by a, so maddubs's
++    // pairwise int16 sums stay within 2 * 128 * 127.
++    inline __m128i dot(const block_q8_0 *a, __m128i b0, __m128i b1) {
++        const __m128i a0 = load0(a);
++        const __m128i a1 = load1(a);
++        const __m128i ones = _mm_set1_epi16(1);
++        return _mm_add_epi32(_mm_madd_epi16(ones, _mm_maddubs_epi16(_mm_sign_epi8(a0, a0), _mm_sign_epi8(b0, a0))),
++                             _mm_madd_epi16(ones, _mm_maddubs_epi16(_mm_sign_epi8(a1, a1), _mm_sign_epi8(b1, a1))));
++    }
++
++    inline __m128i load0(const block_q8_0 *b) {
++        return _mm_loadu_si128((const __m128i *)b->qs);
++    }
++
++    inline __m128i load1(const block_q8_0 *b) {
++        return _mm_loadu_si128(((const __m128i *)b->qs) + 1);
++    }
++
++    const block_q8_0 *const A;
++    const block_q8_0 *const B;
++    float *const C;
++    const int64_t k;
++    const int64_t lda;
++    const int64_t ldb;
++    const int64_t ldc;
++    const int ith;
++    const int nth;
++};
++#endif // __SSSE3__ && !__AVX__ && x86-64
++
+ //PPC Implementation
+ #if defined(__MMA__)
+ 
+@@ -5374,6 +5503,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             params->ith, params->nth};
+         tb.matmul(m, n);
+         return true;
++#elif defined(__SSSE3__) && (defined(__x86_64__) || defined(_M_X64))
++        tinyBLAS_Q0_SSE tb{
++            k, (const block_q8_0 *)A, lda,
++            (const block_q8_0 *)B, ldb,
++            (float *)C, ldc,
++            params->ith, params->nth};
++        tb.matmul(m, n);
++        return true;
+ #elif defined(__ARM_FEATURE_DOTPROD)
+         tinyBLAS_Q0_ARM<block_q8_0> tb{
+             k, (const block_q8_0 *)A, lda,
