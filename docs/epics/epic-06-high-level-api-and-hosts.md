@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: host-api
-last_updated: 2026-11-09
+last_updated: 2026-11-11
 ---
 
 # Epic-06: The High-Level API and Its Hosts
@@ -121,6 +121,9 @@ functions in one call, and the one-pass gate then covers the live code.
 | loom-py | `model.text2speech.stream(text, ...)` -> `SpeechStream` of `Audio` pieces, `exact` saying how it was cut |
 | engine (codec pairs) | `loom::audio::CodecStream`: `push(codes)` -> their samples, given every frame before them; `finish()` |
 | loom-py | `codec.codes2speech.stream(lm.text2codes.stream(text))` -> `Audio` per push, pushes growing 1 to 8 frames |
+| engine (frame rows) | `loom::audio::FrameStream`: `push(samples)` -> the rows of the frames it completed, `first_row`; `finish()` |
+| `loom_cli` | `--wav x.wav --stream MS` on a frame classifier: each change of the most probable label, printed when it is heard |
+| loom-py | `model.speech2class.stream()` / `speech2embeddings.stream()` -> `FrameStream`; each push an `AudioClasses` / `FrameEmbeddings` at stream times |
 
 A file without the three functions keeps its one-pass doors and is refused by the live one; streaming is a
 second door, never a change to the first. Zipformer streaming chunks its front end in the driver: the fbank
@@ -163,6 +166,13 @@ SNAC's noise is drawn per frame, so a window decodes a frame with the noise it h
 bit for bit, the pair's audio is within 1.2e-06 of decoding the same codes in one pass, and the first audio
 comes a frame after the talker draws it (1.58 s on the dev box, where the whole 30-frame generation took 28 s).
 
+**Frame rows: a VAD a frame at a time** ([ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md)).
+A frame classifier or embedder answers through `FrameStream`, cut by its contract as `classify` cuts. Silero
+VAD runs `infer`'s three graphs per push: `frontend` over a window that starts one whole frame back, so the
+64-sample context of each frame is read from inside it, and the LSTM's h and c carried by `run_recurrent`.
+On jfk the rows are 1.9e-06 from one call at any piece size (3.3e-06 from upstream's own frame loop), at 46x
+real time in 32 ms pieces.
+
 ### Streaming: which other models can, and how
 
 Every other door takes a whole input and returns a whole output. A streaming API covers three things.
@@ -192,7 +202,7 @@ The kinds of streaming, by how close a streamed result is to the one-pass one:
 | nemotron-3.5-asr-streaming-0.6b | reference's streaming mode (cache-aware: chunked attention, K/V and conv caches) | re-export: the encoder step with its caches; today the export is the offline mode, the whole clip at once |
 | kyutai-stt-1b-en-fr | exact (frame-synchronous) | re-export: Mimi encoder with its conv state and ring KV carried; the LM loop is per frame already |
 | moonshine-streaming-tiny / -small | exact encoder, decoder re-run per update | re-export: incremental encoder (windows (16, 4) and (16, 0), 3 frames lookahead on 4 layers) |
-| silero-vad | exact (LSTMCell state) | re-export: the per-frame cell with its state as an input; today one sweep over the clip |
+| silero-vad | exact (LSTMCell state) | **built** (ADR-106): `infer`'s graphs per push behind one frame of lead, the cell's h and c carried; publishes on rc21+ |
 | wakehubert-tiny | exact (strictly causal, 2.5 s receptive field) | driver only: re-run over the last 2.5 s per chunk, or a state-carrying re-export |
 | nemotron-labs-unified-asr-0.6b | reference's streaming mode (buffered: chunked masks, 5.6 s left context recomputed per chunk) | re-export: the streaming-mode encoder beside the offline one |
 | qwen3-asr-0.6b | reference's streaming mode (every 2 s, all audio so far re-fed; previous transcript minus its last 5 tokens as prefix; first 2 chunks unprefixed) | driver/host only: a prefix input; cost grows with the stream |
@@ -251,7 +261,7 @@ ADR-099):
    re-export even where no weight changes: the driver is in the GGUF.
 2. **A door per direction:** built. `TranscriptionStream` is audio in, `GenerationStream` tokens out and
    `SpeechStream` audio out; a codec pair is a text-to-codes `SpeechStream` composed with a `CodecStream`
-   by the host (ADR-102).
+   by the host (ADR-102); a frame classifier or embedder answers through `FrameStream` (ADR-106).
 3. **Per-call context in the stream state** for the decode loops that have it (Whisper's and T5's
    encoder output, a speech LM's built prompt), so their `PrefillDecodeLoop` can be cut per token too.
 4. **A chunked front end per family**, as Zipformer's windowed fbank: mel phases still run over the
@@ -275,7 +285,7 @@ fixture set is kept for exactly this reason; `v5` is the contract-declaring set.
 | | |
 |---|---|
 | Authority | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) |
-| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md) (per-module ring caches; MOSS-TTS, Dia), [ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md) (a carried LSTM, per-frame noise; MusicGen, EnCodec, SNAC), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
+| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md) (per-module ring caches; MOSS-TTS, Dia), [ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md) (a carried LSTM, per-frame noise; MusicGen, EnCodec, SNAC), [ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md) (frame rows; Silero VAD), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
 | Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md), [Retro-104](../retros/retro-104-a-state-value-that-dropped-its-named-keys.md) (a stream's state value dropped its named keys) |
 | Active tasks | [Backlog → Host API](../backlog/active-index.md#host-api) |
 
