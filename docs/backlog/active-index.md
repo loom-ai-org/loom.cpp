@@ -244,7 +244,8 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 * [ ] **Kyutai STT and LFM2.5-Audio are published at F32** (rc14, 2026-10-02): at F32 Kyutai runs
   about 5x slower than real time on the 2-core box and LFM2.5's two files are 5.2 and 5.5 GB. Measure
   Q8_0 against each gate (`test_e2e_kyutai_stt_lua_driver`, `test_e2e_lfm25_audio_{asr,tts}_lua_driver`,
-  whose reference scripts are in `scripts/`) and republish if the transcripts and codes hold.
+  whose reference scripts are in `scripts/`) and republish if the transcripts and codes hold. Kyutai Q8_0 on jfk
+  (2026-11-11, ADR-108): the same text as F32, one pass 0.70x real time (RTF 1.44) against F32's 0.26x.
 * [ ] **LFM2.5-Audio's interleaved speech-to-speech door** (`generate_interleaved`, text and audio in a
   fixed 6:12 pattern, multi-turn chat) -- not requested; the TTS door's phases are all it needs, plus
   an audio-in prompt segment (the ASR door's encoder) and the interleave schedule in the driver.
@@ -955,8 +956,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   ([ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md): 1.9e-06 from one call),
   and Moonshine streaming tiny and small, which re-decode
   ([ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md): the hypothesis in the
-  state, encoder windows; the stream ends on one call's ids; small is 0.81x real time on the dev-box CPU).
-  Next on the ASR side: Kyutai STT, Nemotron 3.5 streaming; then the other audio-out rows (VoxCPM2, Voxtral, LFM2.5-Audio, CosyVoice3, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  state, encoder windows; the stream ends on one call's ids; small is 0.81x real time on the dev-box CPU),
+  and Kyutai STT, frame-synchronous
+  ([ADR-108](../adrs/adr-108-kyutai-stt-streams-its-encoder-with-moshis-state-carried.md): moshi's encoder state
+  carried on the device, the RVQ in one graph; Q8_0 0.68x real time on the dev-box CPU, as fast as its one pass).
+  Next on the ASR side: Nemotron 3.5 streaming; then the other audio-out rows (VoxCPM2, Voxtral, LFM2.5-Audio, CosyVoice3, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   No GPU has run either door yet; the per-stream cache mode is what `Auto` picks there.
