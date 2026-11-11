@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-10
+last_updated: 2026-11-11
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -408,11 +408,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — performance
 
-* [ ] **Q8_0_PC on x86 without AVX2 is slower than F32.** After ggml-0060/0061 the F32 path has an SSE tinyBLAS
-  and conv tile, but Q8_0_PC matmuls still go through ggml's per-row int8 dot: on a Celeron N4100, Zipformer
-  small Q8_0_PC RTF 0.334 against F32 0.170, Matcha 4.60 against 3.78. Candidates: an SSSE3 tinyBLAS Q8_0 arm,
-  or routing Q8_0_PC through the F32 path after a dequantize on CPUs without AVX2.
-  *Context: [ADR-105](../adrs/adr-105-x86-without-avx2-sse-paths-and-runfast.md)*
 * [ ] **P4.35/P4.36 follow-ups.** P4.35-P4.39 are merged (#89-#93, 2026-10-23), and their record is
   [Epic-05](../epics/epic-05-edge-performance.md#p435-p439-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22), ADR-082 and ADR-083. Two things are still open. (1) A job owning
   all 64 `A@V` rows, with narrow column blocks, measured 1.08x more on the op on the Pi 4 and is not built. (2) Moonshine

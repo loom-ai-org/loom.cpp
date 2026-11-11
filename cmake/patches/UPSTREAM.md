@@ -2277,6 +2277,47 @@ default-NaN mode on x86. Same transcripts on every ASR model measured.
 -> on: x64 build 0.156 -> 0.077 s, sse42 0.157 -> 0.081, AVX-only 0.139 -> 0.077, native AVX2 0.074 ->
 0.066 s. Zipformer, VITS and Matcha unchanged (within noise). `ctest -L ci` passes on all four builds.
 
+## PR 57 — `cpu`: Q8_0 x Q8_0 on x86 without AVX (an SSSE3 tinyBLAS arm and `vec_dot`)
+
+*(`cmake/patches/ggml-0062-x86-sse-q8-0-gemm.patch`; the int8 half of PR 55)*
+
+**Problem.** Below AVX, x86 has no Q8_0 x Q8_0 path. `tinyBLAS_Q0_AVX` needs AVX, and
+`ggml_vec_dot_q8_0_q8_0`'s x86 arms are AVX2 and AVX, so an SSE4.2 CPU runs the scalar loop once per output
+element. With PR 55's F32 tinyBLAS in place, that makes a Q8_0 model slower than its F32 original. On a
+Celeron N4100 (Windows, MSVC), Zipformer small Q8_0 ran at RTF 0.334 against 0.170 for F32, and Matcha
+at 4.60 against 3.78.
+
+**Change.**
+1. `sgemm.cpp`: `tinyBLAS_Q0_SSE`, for Q8_0 x Q8_0 on SSSE3 without AVX, x86-64 only.
+   * Each `__m128` lane of C is one row of A: 4 rows x 1-4 columns of B per tile, plus a one-output tile for
+     the `m % 4` rows left over.
+   * A block's 32-term integer dot is `_mm_sign_epi8` then `maddubs`/`madd`, which is exact.
+   * Two `hadd`s gather four rows' sums into one register.
+2. `arch/x86/quants.c`: an `__SSSE3__` arm in `ggml_vec_dot_q8_0_q8_0` (the `n < 2` matmuls tinyBLAS
+   declines). It runs the same integer dot, then a horizontal sum.
+
+**Numerics.** Bit-identical to the scalar loop it replaces. Only the integer part is vectorised, and each
+output then does `sum += (float)sumi * (da * db)` block by block, in the scalar loop's order. Checked on
+the N4100 against the previous wheel: 20/20 VITS and Matcha clips byte-identical, Zipformer and Citrinet
+transcripts identical on all 73 clips. Also checked on Linux: VITS and Matcha wavs byte-identical.
+
+**Measured.** Celeron N4100, Windows, MSVC, 4 threads, 3 interleaved rounds, RTF of the Q8_0 model before
+-> after:
+
+| model | before | after | F32, same run |
+|---|---|---|---|
+| Zipformer small | 0.334 | **0.144** | 0.165 |
+| Matcha-TTS | 4.60 | **3.78** | 3.63 |
+| VITS (piper miro) | 0.306 | 0.305 | 0.307 |
+| Citrinet-256-ls | 0.040 | 0.039 | 0.040 |
+
+* VITS and Citrinet don't move: their quantized convolutions dequantize to F32 before the GEMM.
+* Linux, Ryzen 3 3250U, SSE4.2-only build, 2 threads: Zipformer small Q8_0 1.83 -> 1.28 s on a 12.5 s clip.
+* `ctest -L ci` passes on that build (153/153).
+
+**What a reviewer should push on.** The tile is 4 x 4 because of the register count; it wasn't swept. Q4_0
+and the other `tinyBLAS_Q0_AVX` types are not covered.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the

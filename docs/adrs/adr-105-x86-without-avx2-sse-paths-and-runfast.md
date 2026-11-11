@@ -2,7 +2,7 @@
 type: adr
 status: accepted
 date: 2026-11-10
-tags: [performance, x86, sse, windows, msvc, denormals, ggml-patches]
+tags: [performance, x86, sse, windows, msvc, denormals, int8, ggml-patches]
 supersedes: []
 ---
 
@@ -28,6 +28,10 @@ is selected by compiler macros. Four things left ggml's `sse42` DLL mostly scala
    [ADR-078](adr-078-runfast-on-armv6-compute-threads.md) fixed exactly this on ARMv6 and left later cores
    out, assuming they handle denormals in hardware.
 
+Once 1-4 were fixed, a fifth gap showed: **Q8_0 x Q8_0 had no path below AVX either.** `tinyBLAS_Q0_AVX`
+needs AVX, and `ggml_vec_dot_q8_0_q8_0`'s x86 arms are AVX2 and AVX, so Q8_0_PC models ran a scalar loop per
+output. That left them slower than F32: Zipformer small RTF 0.334 against 0.170.
+
 ## Options
 
 **1. A clang-cl Windows build** (ADR-096 Option 2). clang-cl defines the macros, so it fixes item 1 alone,
@@ -40,7 +44,7 @@ says the remaining gap needs it.
 
 ## Decision
 
-Option 3, as two patches:
+Option 3, as three patches:
 * **`ggml-0060-x86-sse-without-avx2.patch`**:
   * the SSE macros for MSVC's `GGML_SSE42` build, next to ggml's AVX shim;
   * an SSE arm of the direct-conv tile (4 channels x 2 `__m128`, multiply then add, the AVX2 tile's
@@ -50,22 +54,31 @@ Option 3, as two patches:
   FTZ | DAZ as the mode bits. It is set on entry to each compute thread's graph and restored on exit, so the
   caller's thread is unaffected after the compute. `GGML_CPU_RUNFAST=0` turns it off. It applies to every x86-64
   variant: assists cost there too (Citrinet on a native AVX2 build, Core Ultra 9 285K: 1.12x).
+* **`ggml-0062-x86-sse-q8-0-gemm.patch`**, added 2026-11-11:
+  * `tinyBLAS_Q0_SSE` for Q8_0 x Q8_0 on SSSE3 without AVX, x86-64 only. Each `__m128` lane of C is one
+    weight row, in tiles of 4 rows x 1-4 columns.
+  * an SSSE3 arm of `ggml_vec_dot_q8_0_q8_0`, for the matmuls with one column.
+  * Only the integer dot is vectorised, and it is exact. Each output then adds `(float)sumi * (da * db)` block
+    by block, in the scalar loop's order, so the results are bit-identical to the path it replaces.
 
 ## Consequences
 
-* **Celeron N4100, Windows, wheel rebuilt with both patches, F32 / Q8_0_PC RTF, before → after:**
+* **Celeron N4100, Windows, F32 / Q8_0_PC RTF.** "0060-0061" is the wheel rebuilt with the first two
+  patches. "+ 0062" is a later run of the final wheel, with every CPU arm re-timed in the same rounds:
 
-  | | before | after | onnxruntime F32 / int8 |
-  |---|---|---|---|
-  | Citrinet-256 | 0.179 / 0.109 | 0.042 / 0.040 | 0.058 / 0.380 |
-  | Zipformer small | 0.520 / 0.449 | 0.170 / 0.334 | 0.315 / 0.159 (9 clips) |
-  | VITS (miro) | 0.917 / 0.936 | 0.304 / 0.306 | 0.259 / 1.324 |
-  | Matcha | 13.26 / 13.03 | 3.78 / 4.60 | 2.59 / 14.36 |
+  | | before | 0060-0061 | + 0062 | onnxruntime F32 / int8 |
+  |---|---|---|---|---|
+  | Citrinet-256 | 0.179 / 0.109 | 0.042 / 0.040 | 0.040 / 0.039 | 0.058 / 0.380 |
+  | Zipformer small | 0.520 / 0.449 | 0.170 / 0.334 | 0.165 / **0.144** | 0.315 / 0.159 (9 clips) |
+  | VITS (miro) | 0.917 / 0.936 | 0.304 / 0.306 | 0.307 / 0.305 | 0.259 / 1.324 |
+  | Matcha | 13.26 / 13.03 | 3.78 / 4.60 | 3.63 / **3.78** | 2.59 / 14.36 |
 
-  * loom now leads onnxruntime on both ASR models at equal WER, and trails on TTS F32 (VITS 1.17x, Matcha 1.46x).
-  * The CPU now beats the UHD 600 iGPU on every arm except Zipformer Q8_0_PC.
+  * loom now leads onnxruntime on both ASR models at equal WER. Zipformer Q8_0_PC (WER 7.65) is also faster
+    than onnxruntime's int8 (WER 16.82). loom trails on TTS F32 (VITS 1.17x, Matcha 1.46x).
+  * The CPU beats the UHD 600 iGPU on every arm.
   * Per step: the conv tile (VITS 1.54x, Matcha 2.15x), the macros (Zipformer 2.8x), tinyBLAS (1.04-1.17x),
-    RunFast (Citrinet 2.9x on the Celeron).
+    RunFast (Citrinet 2.9x on the Celeron), the Q8_0 GEMM (Zipformer Q8_0_PC 2.32x, Matcha 1.22x).
+  * VITS and Citrinet Q8_0_PC don't move with 0062: their quantized convolutions dequantize to F32 first.
 * **Not bit-identical.** The SSE tile does the scalar tile's arithmetic per element, but it covers 8 positions
   rather than 4, and `ggml_conv_1d_direct_ok`'s shape rules are written in that width, so some convolutions
   change path.
@@ -73,6 +86,8 @@ Option 3, as two patches:
   * ASR F32 transcripts are identical on all 73 clips.
   * Zipformer Q8_0_PC changed 3 of 73 transcripts, WER 7.57 → 7.65: the macros also vectorise ggml's int8
     quantization of activations.
+  * 0062 changes no output. Against the 0060-0061 wheel: 20/20 VITS and Matcha clips byte-identical, and
+    Zipformer and Citrinet Q8_0_PC transcripts identical on all 73 clips.
   * RunFast flushes values below 2^-126; ADR-078's caveat stands (`logf` of a denormal gives -inf, not -103.97).
   * Gate (`v5`): 21 of 22 real-model tests pass on a native build. CosyVoice3's cloned-voice free-running
     arm fails with or without these patches.
@@ -81,11 +96,12 @@ Option 3, as two patches:
     accumulation-order case its header warns about.
 * **Linux gains too:** an SSE4.2-only build on a Ryzen 3 3250U, 0060 alone, Citrinet 1.61x, Zipformer 1.39x,
   VITS 1.72x, Matcha 1.55x. `ctest -L ci` passes on SSE2-only, SSE4.2, AVX-only and native builds.
-* **Q8_0_PC matmuls don't reach tinyBLAS on this path**, so after the fix Zipformer Q8_0_PC is 2x slower than
-  its F32 and Matcha's 1.2x. That's in the hub.
+  * 0062 on the same SSE4.2 build: Zipformer small Q8_0_PC 1.83 -> 1.28 s, and `ctest -L ci` 153/153.
+* **Not covered:** Q4_0 and the other types `tinyBLAS_Q0_AVX` takes. Quantized convolutions still
+  dequantize to F32 before the GEMM.
 
 ## Related
 
 * [ADR-096](adr-096-windows-builds-with-msvc-and-luajit-is-built-by-cmake.md) — the Windows port and its first
   benchmark. [ADR-078](adr-078-runfast-on-armv6-compute-threads.md) — RunFast on ARMv6.
-* [Epic-05](../epics/epic-05-edge-performance.md). `cmake/patches/UPSTREAM.md` PRs 55 and 56.
+* [Epic-05](../epics/epic-05-edge-performance.md). `cmake/patches/UPSTREAM.md` PRs 55, 56 and 57.
