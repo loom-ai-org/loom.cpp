@@ -241,6 +241,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 * [ ] **`log_softmax` lowers as `log(softmax(x))`** (coremltools' torch frontend), which is -inf below
   about -103 in f32. Canary's head stops before it; the CTC heads still carry it. Harmless for an argmax,
   wrong as a tensor. A stable form needs a row max the engine has no primitive for.
+* [ ] **Nemotron 3.5 ASR at Q8_0: a one-chunk stream call drifts.** `encoder_step` on 4 rows is 0.376 from the F32
+  encoder where the one call and 2+ chunks per call are 0.148 (f5_tts_ref, dev-box AVX2); ids still matched on
+  two clips. Find the op that is less accurate at 4 rows before a Q8_0 file is published. *Context:
+  [ADR-109](../adrs/adr-109-nemotron-asr-streams-its-cache-aware-encoder-a-chunk-at-a-time.md)*
 * [ ] **Kyutai STT and LFM2.5-Audio are published at F32** (rc14, 2026-10-02): at F32 Kyutai runs
   about 5x slower than real time on the 2-core box and LFM2.5's two files are 5.2 and 5.5 GB. Measure
   Q8_0 against each gate (`test_e2e_kyutai_stt_lua_driver`, `test_e2e_lfm25_audio_{asr,tts}_lua_driver`,
@@ -959,8 +963,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   state, encoder windows; the stream ends on one call's ids; small is 0.81x real time on the dev-box CPU),
   and Kyutai STT, frame-synchronous
   ([ADR-108](../adrs/adr-108-kyutai-stt-streams-its-encoder-with-moshis-state-carried.md): moshi's encoder state
-  carried on the device, the RVQ in one graph; Q8_0 0.68x real time on the dev-box CPU, as fast as its one pass).
-  Next on the ASR side: Nemotron 3.5 streaming; then the other audio-out rows (VoxCPM2, Voxtral, LFM2.5-Audio, CosyVoice3, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  carried on the device, the RVQ in one graph; Q8_0 0.68x real time on the dev-box CPU, as fast as its one pass),
+  and Nemotron 3.5 ASR, cache-aware
+  ([ADR-109](../adrs/adr-109-nemotron-asr-streams-its-cache-aware-encoder-a-chunk-at-a-time.md): the encoder a few
+  320 ms chunks per call with its caches carried; the stream ends on one call's ids; a stream's language by name).
+  Next on the ASR side: the unified ASR's streaming mode; then the other audio-out rows (VoxCPM2, Voxtral, LFM2.5-Audio, CosyVoice3, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   No GPU has run either door yet; the per-stream cache mode is what `Auto` picks there.
