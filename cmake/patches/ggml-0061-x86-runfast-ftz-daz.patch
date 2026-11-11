@@ -1,0 +1,35 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 4cfaa21e..c65cb6b5 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -3213,14 +3213,28 @@ static bool ggml_cpu_conv_epilogue = false;   // initialized once in ggml_cpu_in
+ // the range that bounces).
+ //
+ // The cost is that results below 2^-126 become +0, inputs below it are read as +0, and a NaN result is
+-// the default NaN; every other result is bit-identical. ARMv6 only: later cores do this in hardware, so
+-// they have nothing to gain. GGML_CPU_RUNFAST=0 turns it off.
++// the default NaN; every other result is bit-identical. GGML_CPU_RUNFAST=0 turns it off.
+ #if defined(__ARM_ARCH) && (__ARM_ARCH == 6) && !defined(__aarch64__) && defined(__ARM_FP)
+ #define GGML_CPU_HAS_RUNFAST 1
+ #define GGML_CPU_FPSCR_RUNFAST ((1u << 24) | (1u << 25))  // FZ | DN
+ static bool ggml_cpu_runfast = true;  // initialized once in ggml_cpu_init(), read-only afterwards
+ static inline unsigned ggml_cpu_fpscr_get(void) { unsigned f; __asm__ volatile("vmrs %0, fpscr" : "=r"(f)); return f; }
+ static inline void ggml_cpu_fpscr_set(unsigned f) { __asm__ volatile("vmsr fpscr, %0" : : "r"(f) : "memory"); }
++// x86-64 (loom ggml-0061): the same two modes are MXCSR's FTZ (bit 15) and DAZ (bit 6), and the same
++// weights hit the same wall. An x86 core does denormals in microcode assists, not a kernel trap, but they
++// are still 10-100x a normal multiply-add, and the products of those ~1e-33 weights with ordinary
++// activations land below 2^-126 even though no stored tensor holds a single denormal. Citrinet-256-ls on
++// an SSE4.2 build: three 1x1 convolutions whose weights include dead channels took 12 ms against 0.25 ms
++// for their siblings on a Core Ultra 9 285K, and 150 ms against 5 ms on a Celeron N4100; the whole
++// model's node time went 0.188 -> 0.081 s (285K), same transcript. NaN handling is unchanged on x86:
++// MXCSR has no default-NaN mode, and none is set.
++#elif defined(__x86_64__) || defined(_M_X64)
++#include <xmmintrin.h>
++#define GGML_CPU_HAS_RUNFAST 1
++#define GGML_CPU_FPSCR_RUNFAST (0x8000u | 0x0040u)  // MXCSR FTZ | DAZ
++static bool ggml_cpu_runfast = true;  // initialized once in ggml_cpu_init(), read-only afterwards
++static inline unsigned ggml_cpu_fpscr_get(void) { return _mm_getcsr(); }
++static inline void ggml_cpu_fpscr_set(unsigned f) { _mm_setcsr(f); }
+ #endif
+ 
+ // The tensor a chain of views ultimately reads from. A reshape of a convolution's result is a
