@@ -3,7 +3,9 @@
 //
 // THE DRIVER CONTRACT. A file that can stream exports three Lua functions beside its one-pass `infer`:
 //
-//   stream_open(inputs)               starts a stream; nothing is decoded yet
+//   stream_open(inputs)               starts a stream; nothing is decoded yet. `inputs` are the host's
+//                                     knobs for the live path (Moonshine's `update_seconds`), empty by
+//                                     default; a driver ignores what it does not read
 //   stream_feed({waveform = pcm})     takes the next samples, returns the token ids they completed
 //   stream_finish(inputs)             the input has ended: decodes what is left, returns those ids
 //
@@ -15,8 +17,13 @@
 // door beside `transcribe`, never a change to it.
 //
 // What the ids mean is the transcript, so the same `AsrText` turns them into text as `transcribe` does.
-// A transducer's emissions are final, so `text` only grows; `revised` is for a family whose live path
-// re-decodes (a growing window), and is false for every file today.
+// A transducer's emissions are final, so its ids are appended and `text` only grows.
+//
+// A RE-DECODING DRIVER (ADR-106) keeps its whole transcript so far in the state value `hypothesis`
+// instead: an encoder-decoder whose decoder cross-attends to every encoder row (Moonshine streaming) has
+// no prefix that a later row cannot change, so each decode replaces the last. When the driver has set
+// `hypothesis`, it is the stream's ids after every call and the returned array is ignored; `revised`
+// says the new text does not extend the old, and `delta` is then the whole of `text`.
 #include "loom/core/asr_text.h"
 #include "loom/core/gguf_model.h"
 #include "loom/core/lua_bridge.h"
@@ -25,13 +32,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace loom {
 namespace audio {
 
 struct TranscriptUpdate {
-    // The ids this call committed, control ids included.
+    // The ids this call committed, control ids included -- for a re-decoding driver, the whole
+    // hypothesis.
     std::vector<int32_t> tokens;
     // The whole transcript so far.
     std::string text;
@@ -45,9 +54,12 @@ struct TranscriptUpdate {
 
 class TranscriptionStream {
 public:
-    // Opens a stream on a loaded model (`stream_open`). Throws loom::LoadError when the file's driver
-    // has no streaming entry points. `bridge` and `model` are not owned and must outlive this object.
-    TranscriptionStream(LoomLuaBridge& bridge, const GgufModel& model);
+    using Inputs = std::unordered_map<std::string, LoomLuaBridge::Value>;
+
+    // Opens a stream on a loaded model (`stream_open`, handed `inputs`). Throws loom::LoadError when the
+    // file's driver has no streaming entry points. `bridge` and `model` are not owned and must outlive
+    // this object.
+    TranscriptionStream(LoomLuaBridge& bridge, const GgufModel& model, Inputs inputs = {});
 
     // Whether the loaded driver exports `stream_open`, `stream_feed` and `stream_finish`.
     static bool supported(const LoomLuaBridge& bridge);
@@ -70,6 +82,7 @@ private:
     TranscriptUpdate absorb(const LoomLuaBridge::Value& result);
 
     LoomLuaBridge& bridge_;
+    Inputs inputs_;
     AsrText asr_text_;
     StreamState state_;
     std::vector<int32_t> tokens_;

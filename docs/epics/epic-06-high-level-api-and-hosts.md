@@ -110,9 +110,9 @@ functions in one call, and the one-pass gate then covers the live code.
 
 | Host | Door |
 |---|---|
-| engine | `loom::audio::TranscriptionStream`: `push(samples)` -> ids, `text`, `delta`; `finish()`; `reset()` |
+| engine | `loom::audio::TranscriptionStream`: `push(samples)` -> ids, `text`, `delta`, `revised`; `finish()`; `reset()`; `stream_open` inputs |
 | `loom_cli` | `--wav x.wav --stream MS`: the clip pushed in MS pieces, each new piece of text printed at its audio time |
-| loom-py | `model.speech2text.stream()` -> `TranscriptStream.push(samples)` / `.finish()` -> `TranscriptUpdate` |
+| loom-py | `model.speech2text.stream(**options)` -> `TranscriptStream.push(samples)` / `.finish()` -> `TranscriptUpdate` |
 | engine (tokens out) | `loom::text::GenerationStream`: `next(n)` -> up to n more ids, `generate`'s ids exactly; `reset()` |
 | `loom_cli` | `--prompt ... --stream N [--stream-caches auto\|park\|per-stream]`: N tokens per pull, text printed as drawn |
 | loom-py | `model.text2text.stream(prompt)` / `chat_stream(messages)` -> `TextStream`, iterated for text pieces |
@@ -173,6 +173,17 @@ VAD runs `infer`'s three graphs per push: `frontend` over a window that starts o
 On jfk the rows are 1.9e-06 from one call at any piece size (3.3e-06 from upstream's own frame loop), at 46x
 real time in 32 ms pieces.
 
+**A re-decoding ASR: Moonshine streaming** ([ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md)).
+Its decoder cross-attends to every encoder row, so no prefix of the transcript is final. The driver keeps
+its whole hypothesis in the state value `hypothesis`, the door shows it as the transcript, and an update
+that changes earlier text is `revised`. The encoder runs over windows of the one-pass graph: a new
+`row_offset` input places the position table, and the margins (93 rows back and 12 ahead for tiny) come
+from the bands and the convolutions. Rows are encoded when a decode needs them, every `update_seconds`
+(0.5 s), and a mid-stream decode teacher-forces the last hypothesis. The stream ends on one call's ids at
+every cut tried. Tiny runs at 2.84x real time on jfk at 100 ms pushes, small at 0.81x (dev-box CPU). The
+cost grows with the stream, since every update re-decodes from its start, so a host opens one stream per
+utterance.
+
 ### Streaming: which other models can, and how
 
 Every other door takes a whole input and returns a whole output. A streaming API covers three things.
@@ -201,7 +212,7 @@ The kinds of streaming, by how close a streamed result is to the one-pass one:
 | zipformer-small-streaming | exact | **built** (ADR-098); publishes with the rc21 republish |
 | nemotron-3.5-asr-streaming-0.6b | reference's streaming mode (cache-aware: chunked attention, K/V and conv caches) | re-export: the encoder step with its caches; today the export is the offline mode, the whole clip at once |
 | kyutai-stt-1b-en-fr | exact (frame-synchronous) | re-export: Mimi encoder with its conv state and ring KV carried; the LM loop is per frame already |
-| moonshine-streaming-tiny / -small | exact encoder, decoder re-run per update | re-export: incremental encoder (windows (16, 4) and (16, 0), 3 frames lookahead on 4 layers) |
+| moonshine-streaming-tiny / -small | exact encoder, decoder re-run per update | **built** (ADR-107): encoder windows with its receptive field either side, the hypothesis re-decoded every `update_seconds`; the stream ends on one call's ids; publishes on rc21+ |
 | silero-vad | exact (LSTMCell state) | **built** (ADR-106): `infer`'s graphs per push behind one frame of lead, the cell's h and c carried; publishes on rc21+ |
 | wakehubert-tiny | exact (strictly causal, 2.5 s receptive field) | driver only: re-run over the last 2.5 s per chunk, or a state-carrying re-export |
 | nemotron-labs-unified-asr-0.6b | reference's streaming mode (buffered: chunked masks, 5.6 s left context recomputed per chunk) | re-export: the streaming-mode encoder beside the offline one |
@@ -261,7 +272,8 @@ ADR-099):
    re-export even where no weight changes: the driver is in the GGUF.
 2. **A door per direction:** built. `TranscriptionStream` is audio in, `GenerationStream` tokens out and
    `SpeechStream` audio out; a codec pair is a text-to-codes `SpeechStream` composed with a `CodecStream`
-   by the host (ADR-102); a frame classifier or embedder answers through `FrameStream` (ADR-106).
+   by the host (ADR-102); a frame classifier or embedder answers through `FrameStream` (ADR-106); a
+   re-decoding recognizer keeps its `hypothesis` in the state (ADR-107).
 3. **Per-call context in the stream state** for the decode loops that have it (Whisper's and T5's
    encoder output, a speech LM's built prompt), so their `PrefillDecodeLoop` can be cut per token too.
 4. **A chunked front end per family**, as Zipformer's windowed fbank: mel phases still run over the
@@ -285,7 +297,7 @@ fixture set is kept for exactly this reason; `v5` is the contract-declaring set.
 | | |
 |---|---|
 | Authority | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) |
-| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md) (per-module ring caches; MOSS-TTS, Dia), [ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md) (a carried LSTM, per-frame noise; MusicGen, EnCodec, SNAC), [ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md) (frame rows; Silero VAD), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
+| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md) (per-module ring caches; MOSS-TTS, Dia), [ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md) (a carried LSTM, per-frame noise; MusicGen, EnCodec, SNAC), [ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md) (frame rows; Silero VAD), [ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md) (a re-decoding ASR; Moonshine streaming), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
 | Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md), [Retro-104](../retros/retro-104-a-state-value-that-dropped-its-named-keys.md) (a stream's state value dropped its named keys) |
 | Active tasks | [Backlog → Host API](../backlog/active-index.md#host-api) |
 
