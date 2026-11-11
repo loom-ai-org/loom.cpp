@@ -952,8 +952,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   ([ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md): EnCodec's LSTM
   carried across pushes by `run_recurrent`'s `carry`, its convolutions windowed; SNAC's noise drawn per frame),
   and Silero VAD through a fifth door, `FrameStream`, audio in and rows out
-  ([ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md): 1.9e-06 from one call).
-  Next on the ASR side: Moonshine streaming, Kyutai STT, Nemotron 3.5 streaming; then the other audio-out rows (VoxCPM2, Voxtral, LFM2.5-Audio, CosyVoice3, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  ([ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md): 1.9e-06 from one call),
+  and Moonshine streaming tiny and small, which re-decode
+  ([ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md): the hypothesis in the
+  state, encoder windows; the stream ends on one call's ids; small is 0.81x real time on the dev-box CPU).
+  Next on the ASR side: Kyutai STT, Nemotron 3.5 streaming; then the other audio-out rows (VoxCPM2, Voxtral, LFM2.5-Audio, CosyVoice3, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   No GPU has run either door yet; the per-stream cache mode is what `Auto` picks there.

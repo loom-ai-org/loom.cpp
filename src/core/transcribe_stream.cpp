@@ -4,6 +4,7 @@
 #include "loom/loom_errors.h"
 
 #include <unordered_map>
+#include <utility>
 
 namespace loom {
 namespace audio {
@@ -29,8 +30,8 @@ bool TranscriptionStream::supported(const LoomLuaBridge& bridge) {
     return true;
 }
 
-TranscriptionStream::TranscriptionStream(LoomLuaBridge& bridge, const GgufModel& model)
-    : bridge_(bridge), asr_text_(load_text(model)) {
+TranscriptionStream::TranscriptionStream(LoomLuaBridge& bridge, const GgufModel& model, Inputs inputs)
+    : bridge_(bridge), inputs_(std::move(inputs)), asr_text_(load_text(model)) {
     if (!supported(bridge)) {
         throw LoadError("this model's driver has no live path (stream_open / stream_feed / stream_finish): "
                         "it was exported before streaming, or its family does not stream yet. Its one-pass "
@@ -45,7 +46,7 @@ void TranscriptionStream::reset() {
     text_.clear();
     samples_ = 0;
     finished_ = false;
-    bridge_.call("stream_open", {}, state_);
+    bridge_.call("stream_open", inputs_, state_);
 }
 
 TranscriptUpdate TranscriptionStream::push(const float* samples, size_t n) {
@@ -63,10 +64,16 @@ TranscriptUpdate TranscriptionStream::finish() {
 
 TranscriptUpdate TranscriptionStream::absorb(const LoomLuaBridge::Value& result) {
     TranscriptUpdate update;
-    if (std::holds_alternative<std::vector<double>>(result)) {
-        for (double v : std::get<std::vector<double>>(result)) update.tokens.push_back(static_cast<int32_t>(v));
+    if (const StreamState::Value* hypothesis = state_.value("hypothesis")) {
+        // A re-decoding driver's whole transcript so far (ADR-106): it replaces, it does not append.
+        for (double v : hypothesis->data) update.tokens.push_back(static_cast<int32_t>(v));
+        tokens_ = update.tokens;
+    } else {
+        if (std::holds_alternative<std::vector<double>>(result)) {
+            for (double v : std::get<std::vector<double>>(result)) update.tokens.push_back(static_cast<int32_t>(v));
+        }
+        tokens_.insert(tokens_.end(), update.tokens.begin(), update.tokens.end());
     }
-    tokens_.insert(tokens_.end(), update.tokens.begin(), update.tokens.end());
     std::string text = asr_text_.detokenize(tokens_);
     // A detokenizer may rewrite earlier text when more ids arrive (a byte-level BPE completing a
     // multi-byte character); the delta is only a suffix when the old text is a prefix of the new.
