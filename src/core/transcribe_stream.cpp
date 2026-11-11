@@ -30,6 +30,19 @@ bool TranscriptionStream::supported(const LoomLuaBridge& bridge) {
     return true;
 }
 
+double TranscriptionStream::language_input(const GgufModel& model, const std::string& name) {
+    AsrText text(model);
+    const AsrDecodeTable table = AsrDecodeTable::read(model, text.bpe(), ModelContract::read(model));
+    const int32_t id = table.language(name);
+    if (id < 0) {
+        std::string have;
+        for (const auto& l : table.language_names) have += (have.empty() ? "" : " ") + l;
+        throw LoadError("this model's stream has no language named \"" + name + "\" (" +
+                        (have.empty() ? std::string("it declares none") : "it declares: " + have) + ")");
+    }
+    return static_cast<double>(id);
+}
+
 TranscriptionStream::TranscriptionStream(LoomLuaBridge& bridge, const GgufModel& model, Inputs inputs)
     : bridge_(bridge), inputs_(std::move(inputs)), asr_text_(load_text(model)) {
     if (!supported(bridge)) {
