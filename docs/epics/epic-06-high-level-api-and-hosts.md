@@ -184,6 +184,14 @@ every cut tried. Tiny runs at 2.84x real time on jfk at 100 ms pushes, small at 
 cost grows with the stream, since every update re-decodes from its start, so a host opens one stream per
 utterance.
 
+**A frame-synchronous ASR: Kyutai STT** ([ADR-108](../adrs/adr-108-kyutai-stt-streams-its-encoder-with-moshis-state-carried.md)). moshi streams it already, and the
+export now does what moshi does. `mimi_encode_step` carries the encoder's state on the device: each causal conv's
+last inputs, and the transformer's last 250 keys and values, masked as moshi's ring fills two positions at a time.
+`rvq_encode` draws all 32 codes in one graph. The LM takes one step per frame over its ring KV cache. Each step's
+id is final, so the transcript only grows, 0.5 s behind the audio as the model was trained. The stream ends on
+one call's ids. The LM step sets the speed: at Q8_0 the stream is 0.68x real time at 80 ms pushes against 0.70x
+for the one pass (dev-box CPU).
+
 ### Streaming: which other models can, and how
 
 Every other door takes a whole input and returns a whole output. A streaming API covers three things.
@@ -211,7 +219,7 @@ The kinds of streaming, by how close a streamed result is to the one-pass one:
 |---|---|---|
 | zipformer-small-streaming | exact | **built** (ADR-098); publishes with the rc21 republish |
 | nemotron-3.5-asr-streaming-0.6b | reference's streaming mode (cache-aware: chunked attention, K/V and conv caches) | re-export: the encoder step with its caches; today the export is the offline mode, the whole clip at once |
-| kyutai-stt-1b-en-fr | exact (frame-synchronous) | re-export: Mimi encoder with its conv state and ring KV carried; the LM loop is per frame already |
+| kyutai-stt-1b-en-fr | exact (frame-synchronous) | **built** (ADR-108): the Mimi encoder a few frames per call with moshi's streaming state carried, the RVQ in one graph, an LM step per frame; the stream ends on one call's ids; publishes on rc21+ |
 | moonshine-streaming-tiny / -small | exact encoder, decoder re-run per update | **built** (ADR-107): encoder windows with its receptive field either side, the hypothesis re-decoded every `update_seconds`; the stream ends on one call's ids; publishes on rc21+ |
 | silero-vad | exact (LSTMCell state) | **built** (ADR-106): `infer`'s graphs per push behind one frame of lead, the cell's h and c carried; publishes on rc21+ |
 | wakehubert-tiny | exact (strictly causal, 2.5 s receptive field) | driver only: re-run over the last 2.5 s per chunk, or a state-carrying re-export |
@@ -273,7 +281,8 @@ ADR-099):
 2. **A door per direction:** built. `TranscriptionStream` is audio in, `GenerationStream` tokens out and
    `SpeechStream` audio out; a codec pair is a text-to-codes `SpeechStream` composed with a `CodecStream`
    by the host (ADR-102); a frame classifier or embedder answers through `FrameStream` (ADR-106); a
-   re-decoding recognizer keeps its `hypothesis` in the state (ADR-107).
+   re-decoding recognizer keeps its `hypothesis` in the state (ADR-107); a frame-synchronous one appends a final
+   id per frame (Kyutai STT, ADR-108).
 3. **Per-call context in the stream state** for the decode loops that have it (Whisper's and T5's
    encoder output, a speech LM's built prompt), so their `PrefillDecodeLoop` can be cut per token too.
 4. **A chunked front end per family**, as Zipformer's windowed fbank: mel phases still run over the
@@ -297,7 +306,7 @@ fixture set is kept for exactly this reason; `v5` is the contract-declaring set.
 | | |
 |---|---|
 | Authority | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) |
-| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md) (per-module ring caches; MOSS-TTS, Dia), [ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md) (a carried LSTM, per-frame noise; MusicGen, EnCodec, SNAC), [ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md) (frame rows; Silero VAD), [ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md) (a re-decoding ASR; Moonshine streaming), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
+| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md) (per-module ring caches; MOSS-TTS, Dia), [ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md) (a carried LSTM, per-frame noise; MusicGen, EnCodec, SNAC), [ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md) (frame rows; Silero VAD), [ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md) (a re-decoding ASR; Moonshine streaming), [ADR-108](../adrs/adr-108-kyutai-stt-streams-its-encoder-with-moshis-state-carried.md) (Kyutai STT's encoder state carried), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
 | Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md), [Retro-104](../retros/retro-104-a-state-value-that-dropped-its-named-keys.md) (a stream's state value dropped its named keys) |
 | Active tasks | [Backlog → Host API](../backlog/active-index.md#host-api) |
 
