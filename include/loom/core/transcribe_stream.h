@@ -64,6 +64,13 @@ public:
     // Whether the loaded driver exports `stream_open`, `stream_feed` and `stream_finish`.
     static bool supported(const LoomLuaBridge& bridge);
 
+    // The `language` input that selects `name` on a stream over `model` (ADR-109): the id `transcribe`
+    // resolves the same name to, from the file's declared language table. Inputs are numbers, so a host
+    // turns the name into this before opening the stream. Throws loom::LoadError for a name the file
+    // does not declare, listing what it does -- a language asked for and silently not applied would
+    // be a wrong transcript with no explanation.
+    static double language_input(const GgufModel& model, const std::string& name);
+
     // Samples at the model's own rate (`loom.sample_rate`), mono, any count including zero.
     TranscriptUpdate push(const float* samples, size_t n);
     TranscriptUpdate push(const std::vector<float>& samples) { return push(samples.data(), samples.size()); }

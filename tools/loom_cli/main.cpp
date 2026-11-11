@@ -623,10 +623,10 @@ std::string format_time(double seconds) {
 // text prints with the audio time it was decoded at -- the end of the piece that completed it -- which
 // is the transcript a live caller would have seen by then.
 void run_asr_stream(loom::Session& session, const loom::GgufModel& model, const std::vector<float>& waveform,
-                    uint32_t rate, uint32_t stream_ms) {
+                    uint32_t rate, uint32_t stream_ms, loom::audio::TranscriptionStream::Inputs inputs) {
     using clock = std::chrono::steady_clock;
     const size_t piece = std::max<size_t>(1, static_cast<size_t>(rate) * stream_ms / 1000);
-    loom::audio::TranscriptionStream stream(session.bridge(), model);
+    loom::audio::TranscriptionStream stream(session.bridge(), model, std::move(inputs));
     const auto print = [&](const loom::audio::TranscriptUpdate& u) {
         if (u.delta.empty()) return;
         std::printf("[%s] %s%s\n", format_time(static_cast<double>(u.samples) / rate).c_str(),
@@ -756,13 +756,17 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     if (stream_ms > 0) {
         // The live door, fed from a file: the clip pushed in pieces of `stream_ms` as fast as they
         // decode, each piece's new text printed when it lands. The options below select a decode the
-        // live door does not take yet, so naming one is refused rather than ignored.
-        if (!language_name.empty() || !task_name.empty() || !target_language_name.empty() || timestamps ||
-            !condition_on_previous) {
-            throw loom::Error("--stream takes no --language, --task, --target-language, --timestamps or "
+        // live door does not take yet, so naming one is refused rather than ignored. `--language` it
+        // takes, as the id `transcribe` would resolve it to (Nemotron's prompt, ADR-109).
+        if (!task_name.empty() || !target_language_name.empty() || timestamps || !condition_on_previous) {
+            throw loom::Error("--stream takes no --task, --target-language, --timestamps or "
                               "--no-condition-on-previous: the live door decodes with the file's defaults");
         }
-        run_asr_stream(session, model, waveform, asr_rate ? asr_rate : 16000, stream_ms);
+        loom::audio::TranscriptionStream::Inputs inputs;
+        if (!language_name.empty()) {
+            inputs["language"] = loom::audio::TranscriptionStream::language_input(model, language_name);
+        }
+        run_asr_stream(session, model, waveform, asr_rate ? asr_rate : 16000, stream_ms, std::move(inputs));
         print_device_report(session.bridge());
         return;
     }
