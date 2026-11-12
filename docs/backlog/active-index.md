@@ -908,6 +908,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   number to take. (`ggml-0023`'s coopmat and coopmat2 branches HAVE run, on the RTX 5090.)
   → [ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md),
   [Epic-04 §6](../epics/epic-04-backends-and-accelerators.md#6-gpu-correctness-f32-matmul-precision-the-metal-norm-the-cuda-mat-vec-stride-2026-10-08)
+* [ ] **CosyVoice3's flow is now its largest GPU stage (0.42 s of 1.05 s on an RTX 5090).** It is 20 estimator calls
+  over ~620 frames, and the guided and unguided passes run separately. One batch of two per Euler step is what
+  upstream does, and would halve the calls. After that comes the LM's rotary: ~10 kernels a layer, spelled as
+  the reference spells it. ggml's fused `ROPE` computes its own angles instead of reading the reference's
+  tables, so it needs a check that the pinned LM draws survive.
+  → [ADR-113](../adrs/adr-113-a-gpu-decode-step-fewer-kernels-and-cuda-graphs.md)
 * [ ] **`device_report()` still buckets every node as either device or CPU**, deliberately — it does not
   say *why* a node fell back.
 * [ ] **Whisper's 400-wide reflect pad** is cheaper to fall back on than to compose. CUDA, Metal and SYCL
