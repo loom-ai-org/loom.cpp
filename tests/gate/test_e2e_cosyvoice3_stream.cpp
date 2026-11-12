@@ -16,6 +16,8 @@
 //   4. `reset`, and two streams interleaved with a one-pass call between, under both cache modes: each
 //      bit-identical to itself alone.
 //   5. Not `infer`: the full-attention one pass's mel is far from the stream's (it is another mode).
+//   6. A seed alone, nothing pinned: the stream's mel and length are the seeded one pass's (streaming
+//      mode) -- both draw in one order.
 //
 // LOOM_COSYVOICE3_STREAM_GGUF       a CosyVoice3 exported with the stream functions
 // LOOM_COSYVOICE3_STREAM_REF_DIR    text_ids, draws, noise, nsf_noise, mel_streaming, mel_stream_loop,
@@ -234,6 +236,30 @@ int main() {
                      max_abs_diff(full, stream_mel.empty() ? std::vector<float>{} : stream_mel));
         LOOM_CHECK(d_full <= kMelReferenceTolerance);
         LOOM_CHECK(max_abs_diff(full, stream_mel) > 1.0);
+    }
+
+    // --- 6. A seed alone, nothing pinned: the same take both ways. ---
+    // The checks above pin every draw, which is how the stream is compared with the REFERENCE; a caller
+    // passes a seed. Until the export drew in one order for both (the LM's uniforms as one block, the
+    // noise a frame at a time), the stream interleaved its draws per hop and `infer` drew phase by phase,
+    // so after the first hop the LM sampled other tokens: seed 7 was 7.32 s streamed and 6.92 s in one
+    // pass (loom-py, 2026-11-12). An export from before fails here, on the frame count.
+    {
+        const Inputs seeded{{"tokens", as_doubles(text_ids)}, {"seed", 7.0}};
+        const auto one = std::get<std::vector<double>>(
+            bridge.call("infer", with(seeded, {{"streaming", 1.0}, {"return_mel", 1.0}})));
+        loom::audio::SpeechStream s(bridge, with(seeded, {{"return_mel", 1.0}}));
+        const auto streamed = pull_all(s).samples;
+        const double d = max_abs_diff(one, streamed);
+        std::fprintf(stderr, "seed only: stream %zu mel frames, one pass %zu, max|d| %.3g\n",
+                     streamed.size() / kMel, one.size() / kMel, d);
+        LOOM_CHECK(streamed.size() == one.size());
+        LOOM_CHECK(d <= kMelReRunTolerance);
+        const auto one_wave_seeded = std::get<std::vector<double>>(bridge.call("infer", with(seeded, {{"streaming", 1.0}})));
+        loom::audio::SpeechStream w(bridge, seeded);
+        const auto wave = pull_all(w).samples;
+        std::fprintf(stderr, "seed only: stream %zu samples, one pass %zu\n", wave.size(), one_wave_seeded.size());
+        LOOM_CHECK(wave.size() == one_wave_seeded.size());
     }
 
     if (const char* old = loom_test::fixture_env("LOOM_COSYVOICE3_STREAM_OLD_GGUF")) {
