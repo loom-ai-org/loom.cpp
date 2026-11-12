@@ -908,22 +908,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   number to take. (`ggml-0023`'s coopmat and coopmat2 branches HAVE run, on the RTX 5090.)
   → [ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md),
   [Epic-04 §6](../epics/epic-04-backends-and-accelerators.md#6-gpu-correctness-f32-matmul-precision-the-metal-norm-the-cuda-mat-vec-stride-2026-10-08)
-* [ ] **CUDA runs every F32 product in TF32, so `GGML_PREC_F32` means nothing there.** ggml-cuda creates each
-  cuBLAS handle with `CUBLAS_TF32_TENSOR_OP_MATH`, and its F32 `cublasSgemm` path never reads the precision
-  ADR-069's tag sets. On the RTX 5090 (2026-11-12) CosyVoice3's one-pass gate, with the published v5 file and the
-  re-export alike, draws a different LM token at step 7 under pinned uniforms (80 tokens, not 76). Its teacher-forced
-  flow mel is 0.40 off, against 1.7e-3 on the CPU. `NVIDIA_TF32_OVERRIDE=0` brings both back (LM exact, mel 3.8e-3,
-  126/127). The likely fix is a ggml patch in ADR-069's line: `CUBLAS_DEFAULT_MATH` around a `GGML_PREC_F32` F32
-  product. Cost unmeasured. The one check still red then is the cloned voice's free-running waveform (rmse 0.158
-  against the 6e-2 bound; see the next item).
-  → [ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md),
-  [ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md)
-* [ ] **CUDA's cumsum rounds a prefix differently for a different length.** Its block size grows with the row
-  (`min(ceil(n/32)*32, CUDA_CUMSUM_BLOCK_SIZE)`, and CUB above 1024 elements). A vocoder whose sine phase is a
-  cumsum reaching ~1e6 rad (an f32 ulp there is 0.06 rad) therefore gives different samples for the same frames
-  when the mel is longer. CosyVoice3's stream, which re-runs HiFT over a growing mel, is 5.9e-3 from one call on
-  the RTX 5090 against 5.5e-06 on the CPU (stream gate 43/44, TF32 off). That is the mechanism read off the
-  kernel, not yet isolated. The choice is a prefix-stable cumsum (a ggml patch) or a device tolerance on the gate.
+* [ ] **CosyVoice3's cloned-voice free-running bound is one machine's.** `test_e2e_cosyvoice3_lua_driver` holds
+  the JFK clone's free-running waveform to rmse 6e-2 against the f64 reference, a bound fitted on the dev box.
+  On the workstation it fails on the CPU too (0.104, and identically with the engine from before 2026-11-12's
+  CUDA patches), as well as on the RTX 5090 (0.158). The sine phase makes this arm chaotic. 0.104 sits next to
+  what a silenced waveform scores (0.11), so the bound cannot simply be raised. Settle it with an ASR check
+  (whisper on each build's audio) before moving it, as the bound's own comment did for the softmax.
   → [ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md)
 * [ ] **`device_report()` still buckets every node as either device or CPU**, deliberately — it does not
   say *why* a node fell back.
@@ -997,9 +987,9 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   Next: the other audio-out rows (Voxtral, LFM2.5-Audio, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
-  CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): its mel and both cache modes
-  are green, and its vocoder probe and CUDA's TF32 are open items under Backends. No other stream has run on one; the
-  per-stream cache mode is what `Auto` picks there.
+  CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,
+  after the native RSQRT, ggml-0063 (no TF32 for a tagged product) and ggml-0064 (a prefix-stable cumsum). No other
+  stream has run on one; the per-stream cache mode is what `Auto` picks there.
   The user asked that every model amenable to streaming gets it, name or no name (2026-11-08).
 
 * [ ] **lfm2-350m-modular re-feeds the whole sequence every token.** Its per-layer export carries no KV
