@@ -2,9 +2,10 @@
 // the waveform `infer` returns, and streams on one model must not see each other.
 //
 //   1. One stream, seeded: its pieces joined are `infer`'s samples -- the same count, and the same values to
-//      within f32 summation order. A driver that cuts where its one pass already cuts (Soprano's sentences)
-//      gives them bit for bit; one that decodes a frame at a time through a state-carrying step (Pocket-TTS)
-//      sums the same terms in another order, ~1e-6 apart. There are at least two pieces, and the first is
+//      within f32 summation order. A driver that cuts where its one pass already cuts (a sentence), or
+//      recomputes a window holding the decoder's whole receptive field (Soprano's rows, ADR-114), gives them
+//      bit for bit; one that decodes a frame at a time through a state-carrying step (Pocket-TTS) sums the
+//      same terms in another order, ~1e-6 apart. There are at least two pieces, and the first is
 //      ready before the whole is.
 //   2. `reset` gives the same pieces again, bit for bit.
 //   3. Two streams pulled in alternation, with a one-pass `infer` between their pulls, under both cache
