@@ -162,6 +162,16 @@ output is read across a call. Pieces grow from one patch (160 ms) to eight. On t
 audio is ready after 3.4 s instead of 49 s, and the join is within 7.0e-07 of `infer`. Unlike `infer`, the
 stream never retries a badcase, because upstream's stream does not.
 
+**CosyVoice3 by re-running, as its reference does** ([ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md)).
+Upstream's `tts(stream=True)` carries no flow state: each hop of tokens (25 plus a prompt pad, then 50, then
+100) it runs the flow over the prompt and every token so far in the DiT's streaming mode (a block-causal mask
+of 50 frames), keeps the new mel, and runs CausalHiFT over all of it, handing out what the next hop cannot
+change. The export does the same. The estimator takes a chunk id per frame (all 0 is full attention), so
+`infer` keeps the non-streaming mode by default and takes `streaming = 1`. A stream joins to that, not to the
+default: the two modes' mels differ by ~5. Because the vocoder's sine phase turns 5e-3 of mel rounding into
+O(1) sample differences, the gate compares a stream's mel with the one pass's (9.1e-4) and checks the vocoder
+on its own (5.5e-06). On the dev-box CPU the first 1.36 s is ready after 46.5 s instead of 141 s.
+
 **Codec pairs: two doors, the codec carrying its state** ([ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md)).
 A pair streams as its two files do one pass: the LM's `SpeechStream` hands back each frame of codes as it is
 drawn, and the codec's `CodecStream` decodes pushes as they arrive, with the decoder's state carried by a
@@ -281,7 +291,7 @@ the text classifiers distilbert-ner and punctuate-all (whole text in, labels out
 | voxtral-4b-tts-2603 | exact: chunked codec equals one call | driver: emit each `codec_chunk` as it is made |
 | soprano-1.1-80m | exact: `infer_stream` re-runs the decoder over hidden states with a receptive-field margin ("lossless") | **per sentence: built** (ADR-100), after a re-export. Within a sentence: driver only, the decoder phase takes any length already |
 | lfm2.5-audio-1.5b-tts | exact up to one ISTFT hop: detokenizer is LFM2 with a causal window of 30, then a 'same' ISTFT | driver: chunked detokenize with a hop of lookahead |
-| fun-cosyvoice3-0.5b | reference's streaming mode ("bi-streaming": chunk-aware flow mask, HiFT cache) | re-export: the streaming flow and HiFT; the export rewrote only the cache-less call |
+| fun-cosyvoice3-0.5b | reference's streaming mode: the flow re-run per hop under a chunk mask, HiFT over all the mel with the last 8 frames withheld | **per hop: built** (ADR-112): the estimator takes chunk ids, the stream joins to `infer` `streaming = 1` (mel 9.1e-4), not to the full-attention default (~5 apart); publishes on rc21+ |
 | chatterbox | generic: S3Gen's flow has a `finalize` lookahead hook, but the `S3GenStreamer` its docstring names is not shipped | driver: chunked flow + vocoder with overlap |
 | dia-1.6b, musicgen-small | generic: AR codes, non-causal codec (DAC, EnCodec 32 kHz `use_causal_conv: false`) | **built** (dia ADR-103, musicgen-small ADR-104): the talker hands back a frame once every delayed channel has reached it; DAC decodes windows with 16 frames of context each side, which its receptive field makes one call's result to f32 rounding; EnCodec windows its convolutions (3 frames before the LSTM, 1 after) and carries the LSTM's h and c |
 | speecht5-tts | generic: AR mel frames, HiFi-GAN over a window | driver: vocode overlapping mel windows |

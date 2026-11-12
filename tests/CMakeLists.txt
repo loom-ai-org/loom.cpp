@@ -170,6 +170,14 @@ add_test(NAME test_e2e_speech_stream COMMAND test_e2e_speech_stream)
 set_tests_properties(test_e2e_speech_stream PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_speech_stream PROPERTIES SKIP_RETURN_CODE 77)
 
+# CosyVoice3's live stream (ADR-112) against upstream's streaming mode: its mel, its vocoder's streaming,
+# reset and interleaving. LOOM_COSYVOICE3_STREAM_GGUF + LOOM_COSYVOICE3_STREAM_REF_DIR.
+add_executable(test_e2e_cosyvoice3_stream gate/test_e2e_cosyvoice3_stream.cpp)
+target_link_libraries(test_e2e_cosyvoice3_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_cosyvoice3_stream COMMAND test_e2e_cosyvoice3_stream)
+set_tests_properties(test_e2e_cosyvoice3_stream PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_cosyvoice3_stream PROPERTIES SKIP_RETURN_CODE 77)
+
 # The codec half of a streamed pair (ADR-102): `CodecStream`'s pushes decode to `infer`'s waveform, and
 # streams on one codec do not see each other. LOOM_STREAM_CODEC_GGUF + LOOM_STREAM_CODES_NPY.
 add_executable(test_e2e_codec_stream gate/test_e2e_codec_stream.cpp)
