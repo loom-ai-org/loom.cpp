@@ -25,6 +25,7 @@
 #include "test_util.h"
 #include "fixtures.h"
 #include "npy_fixture.h"
+#include "cpu_backend.h"
 
 #include "loom/loom.h"
 
@@ -101,7 +102,8 @@ int main() {
     const auto ref_full_mel = loom_test::read_npy_f32(dir + "/mel_full.npy", shape);
     LOOM_CHECK(!text_ids.empty() && !draws.empty() && !ref_mel.empty());
 
-    loom::Device device = loom::Device::open("cpu");
+    loom::Device device = loom::Device::open(loom_test::test_device_name());
+    std::fprintf(stderr, "device: %s\n", device.name().c_str());
     auto model = loom::GgufModel::load(gguf, device.backends().primary);
     LOOM_CHECK(model != nullptr);
     loom::Session session(*model, device.backends());
