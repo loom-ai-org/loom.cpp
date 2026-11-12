@@ -1355,6 +1355,12 @@ CPU-only custom op it had put a host round trip into every RMSNorm on every devi
 0.38x to 7.3x real time on the 5090
 ([ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md)).
 
+**A GPU decode step, fewer kernels and replayed as a graph** ([ADR-113](../adrs/adr-113-a-gpu-decode-step-fewer-kernels-and-cuda-graphs.md)).
+With the host costs out, the LM was GPU-bound on ~1,420 small kernels a token. The exporter now emits `RMS_NORM`
+for any spelling of the square, including `x * x`, and leaves out the `ADD` of an all-zero bias. The engine builds
+ggml-cuda with CUDA graphs (`LOOM_CUDA_GRAPHS`), and a decode step that reuses its graph within a KV bucket is
+replayed. CosyVoice3's LM went 3.1 → 2.1 ms a token, and the sentence runs at 8.5x real time on the 5090.
+
 ## 7. P4.43: V3DV on the Raspberry Pi 4 (2026-10-28)
 
 The user asked for the Pi 4's GPU now that Mesa's V3DV exposes it as a Vulkan 1.3 device, and to
