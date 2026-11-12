@@ -1359,7 +1359,10 @@ CPU-only custom op it had put a host round trip into every RMSNorm on every devi
 With the host costs out, the LM was GPU-bound on ~1,420 small kernels a token. The exporter now emits `RMS_NORM`
 for any spelling of the square, including `x * x`, and leaves out the `ADD` of an all-zero bias. The engine builds
 ggml-cuda with CUDA graphs (`LOOM_CUDA_GRAPHS`), and a decode step that reuses its graph within a KV bucket is
-replayed. CosyVoice3's LM went 3.1 → 2.1 ms a token, and the sentence runs at 8.5x real time on the 5090.
+replayed. CosyVoice3's LM went 3.1 → 2.1 ms a token. A grouped convolution now batches on a device at sizes
+the CPU's bound refused, and the DiT runs its guidance as upstream does, one batch of two per step. Its LM
+projects q, k and v at once and rotates q and k together, exactly. The sentence runs at 10.3x real time on the
+5090 (from 0.38x before `RSQRT` went native).
 
 ## 7. P4.43: V3DV on the Raspberry Pi 4 (2026-10-28)
 
