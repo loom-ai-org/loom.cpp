@@ -95,8 +95,10 @@ What a stream must equal was measured in PyTorch before choosing:
   (45/46). The mel checks still pass, because the patch touches only the vocoder's output.
 * CUDA, RTX 5090 (`LOOM_TEST_DEVICE=gpu`), with `NVIDIA_TF32_OVERRIDE=0`: 43/44. The mel is within 3.7e-3 of
   the one pass and 4.5e-3 of upstream's loop. Both cache modes interleave bit-identically, which is the first
-  check of the per-stream mode on a discrete GPU. The first piece comes after 4.5 s and the one pass takes
-  23.7 s. The one red check is the vocoder probe: 5.9e-3 against 1e-4. CUDA's cumsum rounds a prefix differently
+  check of the per-stream mode on a discrete GPU. The first piece comes after 0.5 s and the one pass takes
+  1.2 s: 7.4x real time (RTF 0.135). It was 23.7 s (0.38x real time) until `RSQRT` was lowered to ggml's own
+  ops. Its CPU-only custom op had put a host round trip into every RMSNorm, 49 per LM token, and made the LM 79 ms
+  a token; it is now 2.8 ms, bound by kernel launches. The one red check is the vocoder probe: 5.9e-3 against 1e-4. CUDA's cumsum rounds a prefix differently
   for a different length, and the sine phase amplifies that. With TF32 on (ggml-cuda's default) the LM's draws
   move and the gate cannot start. That is the same for the published file's one pass, so it predates this
   stream. Both are hub items.
