@@ -969,8 +969,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   320 ms chunks per call with its caches carried; the stream ends on one call's ids; a stream's language by name),
   and the unified ASR, buffered
   ([ADR-110](../adrs/adr-110-the-unified-asr-streams-the-way-nemos-buffered-streaming-does.md): NeMo's streaming
-  loop, its latency a stream option; ends on NeMo's streamed ids; 0.33x real time at the default on the dev-box CPU).
-  Next: the audio-out rows (VoxCPM2, Voxtral, LFM2.5-Audio, CosyVoice3, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  loop, its latency a stream option; ends on NeMo's streamed ids; 0.33x real time at the default on the dev-box CPU),
+  and VoxCPM2, a patch at a time
+  ([ADR-111](../adrs/adr-111-voxcpm2-streams-a-patch-at-a-time-through-a-state-carrying-vae-step.md): the AudioVAE's
+  conv state carried; first 160 ms after 3.4 s where the one pass takes 49 s on the dev-box CPU).
+  Next: CosyVoice3 (the user's next, 2026-11-12), then the other audio-out rows (Voxtral, LFM2.5-Audio, CosyVoice3, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   No GPU has run either door yet; the per-stream cache mode is what `Auto` picks there.

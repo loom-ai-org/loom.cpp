@@ -154,6 +154,14 @@ upstream's `generate_audio_stream` decodes. A stream's pieces grow from one fram
 first audio is ready after 0.20 s instead of 3.65 s, at the one-pass speed (1.68x real time, RTF 0.595),
 and the join is within 1.2e-06 of `infer`, which still decodes a chunk per call.
 
+**VoxCPM2 a patch at a time** ([ADR-111](../adrs/adr-111-voxcpm2-streams-a-patch-at-a-time-through-a-state-carrying-vae-step.md)).
+The same cut for a diffusion-AR loop: the AudioVAE runs as `vae_step`, with its 26 causal-conv tails and
+transposed-conv overlaps carried, as upstream's `streaming_decode()` decodes each patch. `infer` and the
+stream run one loop, and each step brings the LMs up to the patch it was handed before drawing, so no graph
+output is read across a call. Pieces grow from one patch (160 ms) to eight. On the dev-box CPU the first
+audio is ready after 3.4 s instead of 49 s, and the join is within 7.0e-07 of `infer`. Unlike `infer`, the
+stream never retries a badcase, because upstream's stream does not.
+
 **Codec pairs: two doors, the codec carrying its state** ([ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md)).
 A pair streams as its two files do one pass: the LM's `SpeechStream` hands back each frame of codes as it is
 drawn, and the codec's `CodecStream` decodes pushes as they arrive, with the decoder's state carried by a
@@ -268,7 +276,7 @@ the text classifiers distilbert-ner and punctuate-all (whole text in, labels out
 | pocket-tts, pocket-tts-18m / -7m / -2m | exact: AR latents, causal Mimi decoder (`generate_audio_stream`) | **per frame: built** (ADR-101; a sentence chunk per piece with `piece_frames = 0`, ADR-100), after a re-export |
 | qwen3-tts-12hz-0.6b + qwen3-tts-tokenizer-12hz | exact: AR frames, causal codec | **built** (ADR-102): the talker hands back a frame per pull, the codec decodes pushes with its state carried; after a re-export of both |
 | audio8-tts-realistic-0.6b + audio8-tts-codec | exact by construction: AR frames; codec all causal (convs, transposed convs, window-128 transformer) | **built** (ADR-102): the talker hands back a frame per pull, the codec decodes pushes with its state carried; after a re-export of both. Upstream's own code has no streaming entry point |
-| voxcpm2 | exact: `generate_streaming`, the AudioVAE's `streaming_decode` carries causal-conv state per patch | re-export: the VAE decoder step with its state |
+| voxcpm2 | exact: `generate_streaming`, the AudioVAE's `streaming_decode` carries causal-conv state per patch | **per patch: built** (ADR-111): `vae_step` with its 26 conv states carried, pieces of 1, 2, 4, then 8 patches; 7.0e-07 from one pass; never retries a badcase, as upstream's stream does not; publishes on rc21+ |
 | moss-tts-local-transformer-v1.5 + moss-audio-tokenizer-v2 | exact: causal-transformer codec with streaming encode/decode (ring KV per layer) | **built** (ADR-103): the codec's six transformer stages each over a ring KV cache of its own, the talker a frame per pull; after a re-export of both |
 | voxtral-4b-tts-2603 | exact: chunked codec equals one call | driver: emit each `codec_chunk` as it is made |
 | soprano-1.1-80m | exact: `infer_stream` re-runs the decoder over hidden states with a receptive-field margin ("lossless") | **per sentence: built** (ADR-100), after a re-export. Within a sentence: driver only, the decoder phase takes any length already |
