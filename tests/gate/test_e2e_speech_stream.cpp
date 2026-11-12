@@ -12,8 +12,10 @@
 //      their decoder state is their own, so a piece of one stream between two of the other's moves
 //      neither.
 //
-// LOOM_STREAM_TTS_GGUF: a TTS exported with the stream functions (pocket-tts, soprano). A file exported
-// before them is refused by the door, which is checked too when LOOM_STREAM_TTS_OLD_GGUF names one.
+// LOOM_STREAM_TTS_GGUF: a TTS exported with the stream functions (pocket-tts, soprano, voxcpm2). A file
+// exported before them is refused by the door, which is checked too when LOOM_STREAM_TTS_OLD_GGUF names one.
+// LOOM_STREAM_TTS_TEXT_A / _B replace the two texts: VoxCPM2 takes ~20 s per second of audio on the 2-core
+// dev box, and the gate synthesises each text about ten times.
 
 #include "test_util.h"
 #include "fixtures.h"
@@ -26,6 +28,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -59,6 +62,8 @@ std::vector<double> encode(const loom::GgufModel& model, const std::string& text
         ids = loom::PocketTtsVocab::load(model)->encode(text);
     } else if (tag == "soprano") {
         ids = loom::SopranoVocab::load(model)->encode(text);
+    } else if (tag == "voxcpm2") {
+        ids = loom::VoxCpmVocab::load(model)->encode(text);
     } else {
         throw std::runtime_error("test_e2e_speech_stream: no text front end here for tokenizer '" + tag + "'");
     }
@@ -104,8 +109,12 @@ int main() {
     loom::LoomLuaBridge& bridge = session.bridge();
     LOOM_CHECK(loom::audio::SpeechStream::supported(bridge));
 
-    const loom::audio::SpeechStream::Inputs a{{"tokens", encode(*model, kTextA)}, {"seed", 1234.0}};
-    const loom::audio::SpeechStream::Inputs b{{"tokens", encode(*model, kTextB)}, {"seed", 99.0}};
+    const char* text_a = std::getenv("LOOM_STREAM_TTS_TEXT_A");
+    const char* text_b = std::getenv("LOOM_STREAM_TTS_TEXT_B");
+    const loom::audio::SpeechStream::Inputs a{{"tokens", encode(*model, text_a ? text_a : kTextA)},
+                                              {"seed", 1234.0}};
+    const loom::audio::SpeechStream::Inputs b{{"tokens", encode(*model, text_b ? text_b : kTextB)},
+                                              {"seed", 99.0}};
 
     using clock = std::chrono::steady_clock;
     auto t0 = clock::now();
