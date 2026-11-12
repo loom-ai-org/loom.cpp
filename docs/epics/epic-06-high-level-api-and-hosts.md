@@ -172,6 +172,13 @@ default: the two modes' mels differ by ~5. Because the vocoder's sine phase turn
 O(1) sample differences, the gate compares a stream's mel with the one pass's (9.1e-4) and checks the vocoder
 on its own (5.5e-06). On the dev-box CPU the first 1.36 s is ready after 46.5 s instead of 141 s.
 
+**Soprano within a sentence** ([ADR-114](../adrs/adr-114-soprano-streams-within-a-sentence-by-decoding-windows-of-hidden-rows.md)).
+Its decoder is local in time (a linear upsample, kernel-3 ConvNeXt blocks, a centred ISTFT), so a piece
+of hidden rows is decoded from a window with the receptive field either side, 3 rows before and 4 after,
+as upstream's `infer_stream` does with 4 and 4. No new graph: the driver cuts the LM loop per draw and keeps
+only the rows a later window reaches. The pieces grow from one row (64 ms) to 16, join to `infer` bit for
+bit, and the first is ready after 0.32 s on the dev box, against 2.4 s for a whole first sentence.
+
 **Codec pairs: two doors, the codec carrying its state** ([ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md)).
 A pair streams as its two files do one pass: the LM's `SpeechStream` hands back each frame of codes as it is
 drawn, and the codec's `CodecStream` decodes pushes as they arrive, with the decoder's state carried by a
@@ -289,7 +296,7 @@ the text classifiers distilbert-ner and punctuate-all (whole text in, labels out
 | voxcpm2 | exact: `generate_streaming`, the AudioVAE's `streaming_decode` carries causal-conv state per patch | **per patch: built** (ADR-111): `vae_step` with its 26 conv states carried, pieces of 1, 2, 4, then 8 patches; 7.0e-07 from one pass; never retries a badcase, as upstream's stream does not; publishes on rc21+ |
 | moss-tts-local-transformer-v1.5 + moss-audio-tokenizer-v2 | exact: causal-transformer codec with streaming encode/decode (ring KV per layer) | **built** (ADR-103): the codec's six transformer stages each over a ring KV cache of its own, the talker a frame per pull; after a re-export of both |
 | voxtral-4b-tts-2603 | exact: chunked codec equals one call | driver: emit each `codec_chunk` as it is made |
-| soprano-1.1-80m | exact: `infer_stream` re-runs the decoder over hidden states with a receptive-field margin ("lossless") | **per sentence: built** (ADR-100), after a re-export. Within a sentence: driver only, the decoder phase takes any length already |
+| soprano-1.1-80m | exact: `infer_stream` re-runs the decoder over hidden states with a receptive-field margin ("lossless") | **within a sentence: built** (ADR-114): the decoder over windows of rows with its receptive field either side (3 rows before, 4 after), pieces of 1, 2, 4, 8, then 16 rows; bit-identical to `infer`; first 64 ms after 0.32 s on the dev box; publishes on rc21+ (a sentence per piece: ADR-100) |
 | lfm2.5-audio-1.5b-tts | exact up to one ISTFT hop: detokenizer is LFM2 with a causal window of 30, then a 'same' ISTFT | driver: chunked detokenize with a hop of lookahead |
 | fun-cosyvoice3-0.5b | reference's streaming mode: the flow re-run per hop under a chunk mask, HiFT over all the mel with the last 8 frames withheld | **per hop: built** (ADR-112): the estimator takes chunk ids, the stream joins to `infer` `streaming = 1` (mel 9.1e-4), not to the full-attention default (~5 apart); publishes on rc21+ |
 | chatterbox | generic: S3Gen's flow has a `finalize` lookahead hook, but the `S3GenStreamer` its docstring names is not shipped | driver: chunked flow + vocoder with overlap |

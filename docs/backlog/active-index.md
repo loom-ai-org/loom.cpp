@@ -976,7 +976,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   and CosyVoice3, a hop of tokens at a time
   ([ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md):
   upstream's streaming mode, the flow re-run per hop under the DiT's chunk mask; so it joins to `infer` with
-  `streaming = 1`, not the default; first 1.36 s after 46.5 s where the one pass takes 141 s on the dev-box CPU).
+  `streaming = 1`, not the default; first 1.36 s after 46.5 s where the one pass takes 141 s on the dev-box CPU),
+  and Soprano within a sentence
+  ([ADR-114](../adrs/adr-114-soprano-streams-within-a-sentence-by-decoding-windows-of-hidden-rows.md): the decoder
+  over windows of rows with its receptive field either side; bit-identical to `infer`; first 64 ms after 0.32 s).
   Next: the other audio-out rows (Voxtral, LFM2.5-Audio, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
