@@ -908,13 +908,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   number to take. (`ggml-0023`'s coopmat and coopmat2 branches HAVE run, on the RTX 5090.)
   → [ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md),
   [Epic-04 §6](../epics/epic-04-backends-and-accelerators.md#6-gpu-correctness-f32-matmul-precision-the-metal-norm-the-cuda-mat-vec-stride-2026-10-08)
-* [ ] **CosyVoice3's cloned-voice free-running bound is one machine's.** `test_e2e_cosyvoice3_lua_driver` holds
-  the JFK clone's free-running waveform to rmse 6e-2 against the f64 reference, a bound fitted on the dev box.
-  On the workstation it fails on the CPU too (0.104, and identically with the engine from before 2026-11-12's
-  CUDA patches), as well as on the RTX 5090 (0.158). The sine phase makes this arm chaotic. 0.104 sits next to
-  what a silenced waveform scores (0.11), so the bound cannot simply be raised. Settle it with an ASR check
-  (whisper on each build's audio) before moving it, as the bound's own comment did for the softmax.
-  → [ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md)
 * [ ] **`device_report()` still buckets every node as either device or CPU**, deliberately — it does not
   say *why* a node fell back.
 * [ ] **Whisper's 400-wide reflect pad** is cheaper to fall back on than to compose. CUDA, Metal and SYCL

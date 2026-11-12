@@ -136,6 +136,11 @@ set_tests_properties(test_transcribe_wordpiece PROPERTIES FIXTURES_REQUIRED cont
 
 # --- Phase 2: primitive registry / topology parsing / graph builder ---
 
+add_executable(test_log_mel ci/test_log_mel.cpp)
+target_link_libraries(test_log_mel PRIVATE loom::engine)
+add_test(NAME test_log_mel COMMAND test_log_mel)
+set_tests_properties(test_log_mel PROPERTIES LABELS ci)
+
 add_executable(test_primitive_registry ci/test_primitive_registry.cpp)
 target_link_libraries(test_primitive_registry PRIVATE loom::engine)
 add_test(NAME test_primitive_registry COMMAND test_primitive_registry)

@@ -109,6 +109,16 @@ What a stream must equal was measured in PyTorch before choosing:
 
   `tests/gate/test_gpu_cumsum_prefix_stable` holds the last one: it fails on 223 of 250 rows without the
   patch.
+* The one-pass gate passes 139/139 on the dev box's CPU, the workstation's CPU and the RTX 5090.
+  * Its free-running arms were graded by waveform rmse, which the vocoder's sine phase makes meaningless
+    across machines. On the cloned voice the reference's own f32 run is 0.249, worse than silence
+    (0.205). The workstation's CPU (0.104) and the 5090 (0.158) failed the 6e-2 bound with every phase at
+    its floor, while a waveform 3 dB down passed it.
+  * The arms are now graded by log-mel distance against the f64 waveform (`tests/support/log_mel.h`,
+    bound 1.4 dB). Builds score 0.07-0.68 dB and the reference's own f32 run 1.04 dB. A 10 ms shift
+    scores 1.7-3.7 dB, a level change of 3 dB scores 3.0 dB, and silence over 100 dB.
+  * The clone also gained the teacher-forced mel check it lacked (2.3e-3 to 3.3e-3).
+  * A 3 dB level sabotage reddens both free-running arms (3.1 and 3.3 dB).
 * The one pass is unchanged by moving the LM loop: `test_e2e_cosyvoice3_lua_driver` 108/108 on the
   re-export (LM 76/76 tokens, flow mel 1.66e-3).
 * Graded in PyTorch (`test_cosyvoice3_export.py`): the estimator against a tiny random DiT in either
