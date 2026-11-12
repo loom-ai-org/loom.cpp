@@ -16,7 +16,8 @@
 //     redraw, which fired 6 times on the default sentence.
 //   * **Flow**: the reference's (silence-filtered) tokens in as `speech_tokens`, `return_mel`.
 //   * **Vocoder**: the reference's mel through `vocoder` alone, from a probe beside the driver.
-//   * **Free-running**: everything from the text, the draws and the two noises.
+//   * **Free-running**: everything from the text, the draws and the two noises, graded in log-mel against
+//     the float64 waveform (COSYVOICE3_FREE_LOG_MEL_DB says why not sample by sample).
 //
 // The text arrives through `loom::CosyVoice3Vocab`, so each run above goes through the driver's chunk
 // loop (one chunk, `<|endoftext|>` first). Two more arms cover what the text path and voice files add:
@@ -27,8 +28,8 @@
 //   * **A cloned voice**: a voice FILE written by `cosyvoice3_voices` from a clip the default voice is
 //     not (JFK, whisper.cpp's sample), loaded through `loom::load_voice`: its arrays must be the
 //     reference front end's for that clip exactly, and with them the LM must draw the reference's
-//     tokens exactly and the free-running waveform land inside the default voice's bound -- against
-//     the reference's float64 waveform, which on this voice its own f32 run is far from.
+//     tokens exactly, the flow on its tokens land at the mel floor, and the free-running waveform
+//     land inside the default voice's log-mel bound against the reference's float64 waveform.
 //
 // Fixtures:
 //   LOOM_COSYVOICE3_GGUF           cosyvoice3.gguf        -- `loom-export ~/Dev/models/fun-cosyvoice3-0.5b-2512 -o ...`
@@ -40,6 +41,7 @@
 #include "test_util.h"
 #include "fixtures.h"
 #include "npy_fixture.h"
+#include "log_mel.h"
 #include "cpu_backend.h"
 
 #include "loom/loom.h"
@@ -75,23 +77,29 @@ constexpr double COSYVOICE3_MEL_MAX_ABS = 1e-2;
 constexpr double COSYVOICE3_MEL_RMSE = 1e-3;
 constexpr double COSYVOICE3_VOCODER_MAX_ABS = 5e-2;
 constexpr double COSYVOICE3_VOCODER_RMSE = 3e-3;
-// The free-running waveform is NOT bounded by a multiple of one measurement: the sine source integrates
-// F0 into the phase, so a one-ulp change in attention moves this rmse by an order of magnitude while the
-// mel and the words do not move. Measured 2026-10-14 on four fixtures (these two, plus a third sentence
-// on the default voice and a fourth on the JFK clone, seeds 21 and 31), against the f64 waveform:
+// The free-running waveform is graded by its LOG-MEL against the reference's float64 waveform, not sample by
+// sample. CausalHiFT's sine source integrates F0 into a phase that reaches ~1e6 rad, where an f32 ulp is
+// 0.06 rad, so two correct f32 builds emit waveforms that are uncorrelated sample by sample while their
+// spectrograms agree. The rmse bound this replaced (6e-2, fitted on the dev box) failed the workstation's
+// CPU on the cloned voice (0.104) and the RTX 5090 (0.158), with every phase at its floor (the clone's
+// teacher-forced mel 1.5e-03 from f64). On that voice the reference's OWN f32 run is rmse 0.249, worse
+// than silence (0.205). And it passed what it should not: on the default voice a waveform 3 dB or 6 dB
+// down, or with noise 20 dB below it, scored 0.011-0.056. Measured 2026-11-12 with `log_mel_distance_db`
+// (its numpy mirror gives the same numbers):
 //
-//                                 free-running rmse              log-mel |d| mean
-//   unpatched ggml                0.0069 .. 0.019                0.06 .. 0.12 dB
-//   + the XNNPACK softmax         0.0076 .. 0.058                0.07 .. 0.26 dB
-//   ggml's own exp, only the      0.012  .. 0.030                0.07 .. 0.25 dB
-//     row sum's order changed
-//   the reference's own f32 run   0.0090 .. 0.249                0.13 .. 1.09 dB
+//                                        default voice   cloned voice
+//   the reference's own f32 run              0.13 dB        1.04 dB
+//   loom: dev box CPU (AVX2)                     -          0.23 dB   (rmse 0.033: passed the old bound)
+//   loom: workstation CPU / RTX 5090    0.25 / 0.12 dB   0.51 / 0.68 dB   (rmse 0.104 / 0.158: failed it)
+//   10 ms late                               3.69 dB        1.73 dB
+//   5 ms late                                1.84 dB        0.88 dB
+//   3 dB down                                3.00 dB        3.00 dB
+//   noise 20 dB below                        4.89 dB        3.33 dB
+//   silence                                   110 dB         114 dB
 //
-// whisper-small transcribed all of them -- every build and both reference runs, on all four -- to the same
-// words. So 2e-2 (set from the first build alone) failed a softmax with ggml's accuracy. The bound sits
-// above every build measured and under half of what a silenced (rmse 0.11 / 0.21 here) or 10 ms-shifted
-// (0.16 / 0.30) waveform scores, which is what this arm is for: the join, not the rounding.
-constexpr double COSYVOICE3_FREE_RMSE = 6e-2;
+// 1.4 dB passes the reference's own f32 run with margin and fails every defect above but the cloned voice
+// 5 ms late, which no bound that passes that f32 run can catch. The rmse is still printed.
+constexpr double COSYVOICE3_FREE_LOG_MEL_DB = 1.4;
 
 std::string meta_string(const std::string& json, const std::string& key) {
     const std::string needle = "\"" + key + "\": \"";
@@ -156,6 +164,7 @@ int main() {
     const auto ref_mel_cm = loom_test::read_npy_f32(ref_dir + "/mel.npy", shape);   // (80, m)
     const int64_t n_mel_frames = shape.size() == 2 ? shape[1] : 0;
     const auto ref_wave = loom_test::read_npy_f32(ref_dir + "/wave.npy", shape);
+    const auto ref_wave_f64 = loom_test::read_npy_f32(ref_dir + "/wave_f64.npy", shape);
     LOOM_CHECK(!ref_ids.empty() && !draws.empty() && !raw_tokens.empty() && n_mel_frames > 0);
     // The mel FRAME-major, the layout the driver returns and the vocoder takes.
     std::vector<float> ref_mel(ref_mel_cm.size());
@@ -241,12 +250,13 @@ int main() {
         const auto got = std::get<std::vector<double>>(session.bridge().call("infer", {
             {"tokens", tokens}, {"draws", as_doubles(draws)}, {"noise", as_doubles(noise)},
             {"nsf_noise", as_doubles(nsf_noise)}}));
-        std::fprintf(stderr, "free-running: loom=%zu reference=%zu samples\n", got.size(), ref_wave.size());
-        LOOM_CHECK(got.size() == ref_wave.size());
-        const Diff d = compare(got, ref_wave);
-        std::fprintf(stderr, "free-running max_abs_diff=%g rmse=%g peak=%g\n", d.max_abs, d.rmse, d.peak);
+        std::fprintf(stderr, "free-running: loom=%zu reference=%zu samples\n", got.size(), ref_wave_f64.size());
+        LOOM_CHECK(got.size() == ref_wave_f64.size());
+        const Diff d = compare(got, ref_wave_f64);
+        const double db = loom_test::log_mel_distance_db(got, as_doubles(ref_wave_f64), 24000);
+        std::fprintf(stderr, "free-running: log-mel %.3f dB from f64 (rmse %g, peak %g)\n", db, d.rmse, d.peak);
         LOOM_CHECK(d.peak > 0.05);
-        LOOM_CHECK(d.rmse < COSYVOICE3_FREE_RMSE);
+        LOOM_CHECK(db < COSYVOICE3_FREE_LOG_MEL_DB);
     }
 
     // --- 5. Chunks: whole == its chunks in turn, on one stream. ---
@@ -320,10 +330,15 @@ int main() {
         const auto clone_nsf = loom_test::read_npy_f32(dir + "/nsf_noise.npy", shape);
         // The FLOAT64 reference, not its f32 run: on this voice (a loud 11 s clip, 254 generated frames)
         // the reference's own f32 waveform is rmse 0.249 from its f64 one -- uncorrelated in four of eight
-        // segments -- while loom lands at rmse 6.9e-03 from the f64 one (3.3e-02 with ggml-0029's softmax;
-        // see COSYVOICE3_FREE_RMSE). Measured 2026-09-25; the flow's mel is at its floor either way
-        // (max 2.3e-03, rmse 1.6e-04 against the f32 reference).
+        // segments -- which is why the waveform is graded in log-mel (COSYVOICE3_FREE_LOG_MEL_DB).
         const auto clone_wave = loom_test::read_npy_f32(dir + "/wave_f64.npy", shape);
+        const auto clone_speech = loom_test::read_npy_f32(dir + "/speech_tokens.npy", shape);
+        const auto clone_mel_cm = loom_test::read_npy_f32(dir + "/mel.npy", shape);   // (80, m)
+        const int64_t clone_frames = shape.size() == 2 ? shape[1] : 0;
+        std::vector<float> clone_mel(clone_mel_cm.size());
+        for (int64_t f = 0; f < clone_frames; ++f) {
+            for (int64_t c = 0; c < 80; ++c) clone_mel[f * 80 + c] = clone_mel_cm[c * clone_frames + f];
+        }
         // The voice's arrays as driver inputs by name, as `loom_cli --voice` and loom-py pass them.
         using Inputs = std::unordered_map<std::string, loom::LoomLuaBridge::Value>;
         auto with_voice = [&](Inputs in) {
@@ -347,6 +362,19 @@ int main() {
             lm_exact = got.size() == clone_raw.size() && same == got.size();
             LOOM_CHECK(lm_exact);
         }
+        // The flow on the reference's tokens with this voice's prompt: the phase-exact half of the clone,
+        // which the free-running arm below can only see through a phase-blind metric.
+        {
+            loom::Session session(*model, device.backends());
+            const auto got = std::get<std::vector<double>>(session.bridge().call("infer", with_voice({
+                {"tokens", clone_tokens}, {"speech_tokens", as_doubles(clone_speech)},
+                {"noise", as_doubles(clone_noise)}, {"return_mel", 1.0}})));
+            LOOM_CHECK(got.size() == clone_mel.size());
+            const Diff d = compare(got, clone_mel);
+            std::fprintf(stderr, "cloned voice flow mel max_abs_diff=%g rmse=%g\n", d.max_abs, d.rmse);
+            LOOM_CHECK(d.max_abs < COSYVOICE3_MEL_MAX_ABS);
+            LOOM_CHECK(d.rmse < COSYVOICE3_MEL_RMSE);
+        }
         // The reference's noise is sized for ITS token count, so a diverged decode cannot use it.
         if (lm_exact) {
             loom::Session session(*model, device.backends());
@@ -355,10 +383,11 @@ int main() {
                 {"nsf_noise", as_doubles(clone_nsf)}})));
             LOOM_CHECK(got.size() == clone_wave.size());
             const Diff d = compare(got, clone_wave);
-            std::fprintf(stderr, "cloned voice free-running: max_abs_diff=%g rmse=%g peak=%g\n", d.max_abs,
+            const double db = loom_test::log_mel_distance_db(got, as_doubles(clone_wave), 24000);
+            std::fprintf(stderr, "cloned voice free-running: log-mel %.3f dB from f64 (rmse %g, peak %g)\n", db,
                          d.rmse, d.peak);
             LOOM_CHECK(d.peak > 0.05);
-            LOOM_CHECK(d.rmse < COSYVOICE3_FREE_RMSE);
+            LOOM_CHECK(db < COSYVOICE3_FREE_LOG_MEL_DB);
         }
     }
 
