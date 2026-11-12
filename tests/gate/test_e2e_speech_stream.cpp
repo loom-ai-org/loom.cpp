@@ -13,7 +13,8 @@
 //      their decoder state is their own, so a piece of one stream between two of the other's moves
 //      neither.
 //
-// LOOM_STREAM_TTS_GGUF: a TTS exported with the stream functions (pocket-tts, soprano, voxcpm2). A file
+// LOOM_STREAM_TTS_GGUF: a TTS exported with the stream functions (pocket-tts, soprano, voxcpm2,
+// lfm2.5-audio's tts). A file
 // exported before them is refused by the door, which is checked too when LOOM_STREAM_TTS_OLD_GGUF names one.
 // LOOM_STREAM_TTS_TEXT_A / _B replace the two texts: VoxCPM2 takes ~20 s per second of audio on the 2-core
 // dev box, and the gate synthesises each text about ten times.
@@ -65,6 +66,9 @@ std::vector<double> encode(const loom::GgufModel& model, const std::string& text
         ids = loom::SopranoVocab::load(model)->encode(text);
     } else if (tag == "voxcpm2") {
         ids = loom::VoxCpmVocab::load(model)->encode(text);
+    } else if (tag == "gpt2") {
+        // A plain byte-level BPE whose driver builds the rest of the prompt (LFM2.5-Audio's TTS).
+        ids = loom::BpeVocab::load(model)->encode(text);
     } else {
         throw std::runtime_error("test_e2e_speech_stream: no text front end here for tokenizer '" + tag + "'");
     }

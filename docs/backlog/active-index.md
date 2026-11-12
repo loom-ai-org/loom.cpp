@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-12
+last_updated: 2026-11-13
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -979,8 +979,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   `streaming = 1`, not the default; first 1.36 s after 46.5 s where the one pass takes 141 s on the dev-box CPU),
   and Soprano within a sentence
   ([ADR-114](../adrs/adr-114-soprano-streams-within-a-sentence-by-decoding-windows-of-hidden-rows.md): the decoder
-  over windows of rows with its receptive field either side; bit-identical to `infer`; first 64 ms after 0.32 s).
-  Next: the other audio-out rows (Voxtral, LFM2.5-Audio, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  over windows of rows with its receptive field either side; bit-identical to `infer`; first 64 ms after 0.32 s),
+  and LFM2.5-Audio's TTS a frame at a time
+  ([ADR-115](../adrs/adr-115-lfm25-audio-tts-streams-a-frame-at-a-time-by-detokenizing-windows.md): the detokenizer
+  over windows from its receptive field back; first 60 ms after 2.1 s where the one pass takes 41 s on the dev-box CPU).
+  Next: the other audio-out rows (Voxtral, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,

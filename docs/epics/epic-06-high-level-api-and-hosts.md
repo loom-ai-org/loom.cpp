@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: host-api
-last_updated: 2026-11-12
+last_updated: 2026-11-13
 ---
 
 # Epic-06: The High-Level API and Its Hosts
@@ -179,6 +179,12 @@ as upstream's `infer_stream` does with 4 and 4. No new graph: the driver cuts th
 only the rows a later window reaches. The pieces grow from one row (64 ms) to 16, join to `infer` bit for
 bit, and the first is ready after 0.32 s on the dev box, against 2.4 s for a whole first sentence.
 
+**LFM2.5-Audio's TTS a frame at a time** ([ADR-115](../adrs/adr-115-lfm25-audio-tts-streams-a-frame-at-a-time-by-detokenizing-windows.md)).
+The same cut as Soprano's for a causal detokenizer: each piece's frames go through the existing
+`detokenizer` phase from the backbone's receptive field back (97 rows: 5 convolutions x 2, 3 windowed
+attentions x 29), and the last 480 samples wait for the next frame's ISTFT overlap. The join is within
+1.6e-06 of `infer`; on the dev-box CPU at F32 the first 60 ms is ready after 2.1 s instead of 41 s.
+
 **Codec pairs: two doors, the codec carrying its state** ([ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md)).
 A pair streams as its two files do one pass: the LM's `SpeechStream` hands back each frame of codes as it is
 drawn, and the codec's `CodecStream` decodes pushes as they arrive, with the decoder's state carried by a
@@ -297,7 +303,7 @@ the text classifiers distilbert-ner and punctuate-all (whole text in, labels out
 | moss-tts-local-transformer-v1.5 + moss-audio-tokenizer-v2 | exact: causal-transformer codec with streaming encode/decode (ring KV per layer) | **built** (ADR-103): the codec's six transformer stages each over a ring KV cache of its own, the talker a frame per pull; after a re-export of both |
 | voxtral-4b-tts-2603 | exact: chunked codec equals one call | driver: emit each `codec_chunk` as it is made |
 | soprano-1.1-80m | exact: `infer_stream` re-runs the decoder over hidden states with a receptive-field margin ("lossless") | **within a sentence: built** (ADR-114): the decoder over windows of rows with its receptive field either side (3 rows before, 4 after), pieces of 1, 2, 4, 8, then 16 rows; bit-identical to `infer`; first 64 ms after 0.32 s on the dev box; publishes on rc21+ (a sentence per piece: ADR-100) |
-| lfm2.5-audio-1.5b-tts | exact up to one ISTFT hop: detokenizer is LFM2 with a causal window of 30, then a 'same' ISTFT | driver: chunked detokenize with a hop of lookahead |
+| lfm2.5-audio-1.5b-tts | exact up to one ISTFT hop: detokenizer is LFM2 with a causal window of 30, then a 'same' ISTFT | **per frame: built** (ADR-115): the detokenizer over windows from its 97-row receptive field back, 480 samples held for the next frame's overlap; pieces of 1, 2, 4, then 8 frames; 1.6e-06 from `infer`; publishes on rc21+ |
 | fun-cosyvoice3-0.5b | reference's streaming mode: the flow re-run per hop under a chunk mask, HiFT over all the mel with the last 8 frames withheld | **per hop: built** (ADR-112): the estimator takes chunk ids, the stream joins to `infer` `streaming = 1` (mel 9.1e-4), not to the full-attention default (~5 apart); publishes on rc21+ |
 | chatterbox | generic: S3Gen's flow has a `finalize` lookahead hook, but the `S3GenStreamer` its docstring names is not shipped | driver: chunked flow + vocoder with overlap |
 | dia-1.6b, musicgen-small | generic: AR codes, non-causal codec (DAC, EnCodec 32 kHz `use_causal_conv: false`) | **built** (dia ADR-103, musicgen-small ADR-104): the talker hands back a frame once every delayed channel has reached it; DAC decodes windows with 16 frames of context each side, which its receptive field makes one call's result to f32 rounding; EnCodec windows its convolutions (3 frames before the LSTM, 1 after) and carries the LSTM's h and c |
