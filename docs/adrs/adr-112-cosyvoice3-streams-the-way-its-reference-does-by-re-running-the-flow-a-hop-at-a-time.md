@@ -132,6 +132,33 @@ What a stream must equal was measured in PyTorch before choosing:
 * Re-export needed: the estimator gains an input, and a file exported before this has no `stream_open`.
   Publishing waits for an rc21+ engine like the other streamed re-exports.
 
+## Amendment 2026-11-12: a seed is the same take both ways
+
+The first loom-py run of the stream found that a seed alone did not give `infer` `streaming = 1`'s audio.
+Seed 7 came out 7.32 s streamed and 6.92 s in one pass, though loom-py's docstring promised the join.
+Both paths seed one generator, but `infer` drew every LM uniform, then the whole grid's flow noise, then
+the whole wave's sine noise, while the stream interleaved them hop by hop. So after the first hop the LM
+sampled from other uniforms. Every check above pins `draws`, `noise` and `nsf_noise`, so none could see it.
+
+* Options: (a) document that only a fully pinned stream joins; (b) give each phase its own generator,
+  which the bridge does not have (one per stream, ADR-099); (c) make both paths draw in one order. Chose (c),
+  driver only.
+* The LM's uniforms are one block drawn when its loop begins: two per step of the whole budget,
+  `max_token_text_ratio` x the text's tokens, used or not.
+* The flow noise and the sine noise are drawn a FRAME at a time in frame order (80 gaussians, then
+  9 x 480 uniforms for a generated frame) by `cosyvoice3_draw_frames`, which `infer` calls for the whole
+  grid and the stream for a hop's worth. Per frame, so the cut cannot change the order. A pinned one is
+  not drawn, in both.
+* Cost: a seed's audio from `infer` moves on re-export, in both modes. Old files keep theirs, as with
+  ADR-104's SNAC. A short `draws` pin now throws instead of silently falling back to the generator.
+* Gate section 6: a seed alone, stream against one pass, mel and samples. RTX 5090 49/49 (seed only:
+  438/438 frames, mel 2.0e-3, 210,240 samples both ways); workstation CPU 47/47 (7.6e-4). The previous
+  export fails it (44/47: 204,480 against 205,440 samples). The one-pass gate stays 139/139 on both;
+  its arms pin their draws.
+* loom-py, seed only: 390/390 frames, mel 1.65e-3 (CUDA) / 8.8e-4 (CPU); waveform log-mel 0.17 / 0.11 dB
+  mean, against 2.8 dB between the two attention modes. 5090: one pass 9.5x real time (RTF 0.105), first
+  piece 0.31 s, whole stream 3.9x (RTF 0.256).
+
 ## Related
 
 * `loom-exporter/loom_exporter/cosyvoice3_export.py` (`chunk_mask`, `_dit_attention`, `EstimatorPhase`,
