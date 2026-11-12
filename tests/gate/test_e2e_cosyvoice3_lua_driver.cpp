@@ -40,6 +40,7 @@
 #include "test_util.h"
 #include "fixtures.h"
 #include "npy_fixture.h"
+#include "cpu_backend.h"
 
 #include "loom/loom.h"
 
@@ -162,7 +163,8 @@ int main() {
         for (int64_t c = 0; c < 80; ++c) ref_mel[f * 80 + c] = ref_mel_cm[c * n_mel_frames + f];
     }
 
-    loom::Device device = loom::Device::open("cpu");
+    loom::Device device = loom::Device::open(loom_test::test_device_name());
+    std::fprintf(stderr, "device: %s\n", device.name().c_str());
     auto model = loom::GgufModel::load(gguf_env, device.backends().primary);
     LOOM_CHECK(model != nullptr);
 
