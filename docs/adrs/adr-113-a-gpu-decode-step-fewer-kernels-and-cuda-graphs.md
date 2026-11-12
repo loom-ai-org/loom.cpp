@@ -77,9 +77,29 @@ condition ggml-cuda needs to capture a step once and replay it.
   graphs on.
 * A re-export picks this up; a file already exported keeps its graph. The exporter's structure baselines
   move for every model with a bias-free `linear`.
-* What is left. The flow is now the largest stage (0.42 s): 20 estimator calls over ~620 frames, with the
-  guided and unguided passes run separately rather than as one batch of two. The LM's rotary (~10 kernels
-  a layer) is the next per-token target if a rewrite can keep the reference's tables. Both are in the hub.
+* **Amendment, same day: the flow and the rotary.**
+  * **The flow's grouped convolution.** The DiT's position convolution (K = 31, groups = 16, 1024 channels)
+    ran as 32 direct `CONV_2D`s and 30 `CONCAT`s per estimator call, because `conv_1d_grouped` batches only
+    below a 1M-element im2col, a bound measured on the CPU. A device primary now batches up to 64M elements
+    (256 MB). Flow 0.410 → 0.341 s. The CPU's bound is unchanged.
+  * **Guidance inside the estimator.** `CausalConditionalCFM.solve_euler` runs one estimator call over a
+    batch of two (the second row with `mu`, `spks` and `cond` zeroed) and combines the rows as
+    `(1 + cfg)·v_cond − cfg·v_uncond` in f32. The engine ran the rows as two calls and combined them on the
+    host in double. `EstimatorPhase` now does upstream's batch and combine itself, with `cfg` an input, and
+    the sampler makes one call a step. Flow 0.341 → 0.268 s. The default voice's flow mel moved closer to
+    the reference on CUDA (3.8e-3 → 2.3e-3).
+  * **The rotary, exactly.** q, k and v are now one projection (the three weights' rows stacked: each
+    output is the same dot product), so q and k come out as adjacent heads and one rotation covers both.
+    `rotate_half`'s negation moves onto the sine table (`swap_halves(x)·[−sin₁, sin₂]` is the same
+    products: `(−a)·s == a·(−s)` exactly, a CI test checks bit-equality). The LM topology goes from 779
+    to 539 non-view nodes, and the LM from 2.1 to 1.9 ms a token.
+  * **Rejected: ggml's `ROPE`.** It computes its own angles. Against the reference's cos/sin tables it is
+    up to 1.5e-5 off (ggml's CPU and CUDA formulas alike, positions 0–599), above the margins the LM's
+    pinned draws need. After the exact rewrite the rotary is 4 kernels a layer, so `ROPE` would save 3, about
+    0.07 ms a token.
+  * **Result on the RTX 5090:** the 8.92 s sentence takes 1.29 → **0.87 s, 10.3x real time (RTF 0.097)**;
+    the stream's first piece comes after 0.3 s. Gates: one pass 139/139 on the dev box CPU, the workstation
+    CPU and the 5090, with LM tokens exact on all three; stream 44/44 on CUDA.
 
 ## Related
 
