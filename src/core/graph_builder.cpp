@@ -20,11 +20,13 @@ namespace {
 // lets a GPU backend stage its tiles in half precision: Vulkan's matmul_f32_f32 keeps both operands in
 // float16_t shared memory on any fp16-capable device (and its coopmat paths convert them to f16
 // outright), and Metal's kernel_mul_mm_f32_f32 loads both into `half` threadgroup tiles. Any |value| >
-// 65504 becomes inf there, and inf * 0 is NaN. CPU and CUDA (cuBLAS SGEMM) never do this, so a model can
-// be exact on both and still produce nothing on Vulkan or Metal: SenseVoice's kaldi power spectrum peaks
+// 65504 becomes inf there, and inf * 0 is NaN. The CPU never does this, so a model can be exact there and
+// still produce nothing on Vulkan or Metal: SenseVoice's kaldi power spectrum peaks
 // near 1e10, its mel projection came back 99.5% NaN, and the transcript was ''. GGML_PREC_F32 is ggml's
 // own way of asking for full precision; cmake/patches/ggml-0023 and ggml-0024 make those two backends
-// honour it for F32 x F32 (stock ggml ignores it there). It is set with ggml_prec_set_acc, which since
+// honour it for F32 x F32 (stock ggml ignores it there). CUDA is not exact by default either: every cuBLAS
+// handle runs F32 in TF32 (a 10-bit mantissa), and so do MMF's F32 tiles; ggml-0063 makes a tagged
+// product skip both. CosyVoice3's pinned LM draws and its 10-step ODE mel moved under TF32 (ADR-069). It is set with ggml_prec_set_acc, which since
 // ggml v0.26 (llama/26675) is what ggml_mul_mat_set_prec became: the same op_params[0], so the patches
 // read it unchanged. Tagged here, on the finished graph, rather than at each ggml_mul_mat call site, so
 // that a new primitive cannot forget it. A non-F32 `a` (F16, a quantized weight) is left alone: that is

@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: backends
-last_updated: 2026-11-03
+last_updated: 2026-11-12
 ---
 
 # Epic-04: Backends and Accelerators
@@ -1343,6 +1343,17 @@ per-node dump (NaN count, sum, abs-sum) written from the profiler's eval callbac
 and joined on (op, name, shape, occurrence), named the first divergent node in all four cases in one
 run each. That hook was scratch and was not committed; see
 [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md#the-fix).
+
+**CUDA, 2026-11-12: TF32, and a cumsum that was not prefix-stable.** CUDA was believed exact for F32. It is
+not by default: every cuBLAS handle runs F32 in TF32, and so do MMF's F32 tiles. `ggml-0063` makes a
+`GGML_PREC_F32` product skip both (ADR-069's 2026-11-12 amendment, UPSTREAM PR 58). It costs CosyVoice3's flow
++34% on an RTX 5090. The same model's live stream re-runs its vocoder over a growing mel, and CUDA's cumsum
+returned a row's first n sums differently for a different row length. `ggml-0064` makes it prefix-stable
+(PR 59), and `tests/gate/test_gpu_cumsum_prefix_stable` checks the property on whatever GPU the build has. It
+has run on CUDA only; Vulkan's and Metal's cumsums are unchecked. The same day `RSQRT` became native: as a
+CPU-only custom op it had put a host round trip into every RMSNorm on every device, and CosyVoice3 went from
+0.38x to 7.3x real time on the 5090
+([ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md)).
 
 ## 7. P4.43: V3DV on the Raspberry Pi 4 (2026-10-28)
 

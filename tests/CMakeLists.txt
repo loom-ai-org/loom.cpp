@@ -755,6 +755,12 @@ set_tests_properties(test_e2e_conformer_ctc_mil_export PROPERTIES SKIP_RETURN_CO
 
 # --- CPU vs GPU on the same real encoder (BACKLOG.md P4.7). Skips on a missing fixture AND on a build
 #     with no device backend compiled in, so it is green everywhere it cannot say anything. ---
+add_executable(test_gpu_cumsum_prefix_stable gate/test_gpu_cumsum_prefix_stable.cpp)
+target_link_libraries(test_gpu_cumsum_prefix_stable PRIVATE loom::engine)
+add_test(NAME test_gpu_cumsum_prefix_stable COMMAND test_gpu_cumsum_prefix_stable)
+set_tests_properties(test_gpu_cumsum_prefix_stable PROPERTIES LABELS gate)
+set_tests_properties(test_gpu_cumsum_prefix_stable PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_e2e_device_parity gate/test_e2e_device_parity.cpp)
 target_link_libraries(test_e2e_device_parity PRIVATE loom::engine)
 add_test(NAME test_e2e_device_parity COMMAND test_e2e_device_parity)

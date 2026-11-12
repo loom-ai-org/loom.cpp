@@ -2202,6 +2202,56 @@ else allocates command buffers.
 So the buffers the next large graph re-allocates do not show. Qwen3-0.6B (251-token prefill, 64
 steps) is unchanged, 18.0 s.
 
+
+## PR 58 — `cuda`: honour `GGML_PREC_F32` for an F32 x F32 `mul_mat` (no TF32)
+
+*(`cmake/patches/ggml-0063-cuda-f32-matmul-prec.patch`; numbered after the x86 branch's PRs 55–57, independent of them)*
+
+**Problem.** `cublas_handle()` (common.cuh) creates every handle with `CUBLAS_TF32_TENSOR_OP_MATH`, so
+an F32 x F32 product through `cublasSgemm`/`cublasGemmEx` (`CUBLAS_COMPUTE_32F`) multiplies with a 10-bit
+mantissa whatever `op_params[0]` says. `ggml_cuda_mul_mat_cublas` reads `GGML_PREC_F32` only to pick the
+compute *type*, which is F32 already. MMF's F32 tiles are TF32 too (`mma ... .tf32.tf32.f32`), for 9–16
+columns. Only `mul_mat_vec_f` (≤ 8 columns) is plain F32. On an RTX 5090 CosyVoice3's one pass, under
+pinned sampling uniforms, drew a different LM token at step 7 (its prefill runs through cuBLAS), and the
+teacher-forced flow mel, after a 10-step guided ODE, was 0.40 off against 1.7e-3 on the CPU.
+`NVIDIA_TF32_OVERRIDE=0` fixed both, which is how the cause was pinned down.
+
+**Change.** In `ggml_cuda_mul_mat_cublas_impl`, a product whose compute type is F32 and whose
+`op_params[0]` is `GGML_PREC_F32` sets `CUBLAS_DEFAULT_MATH` for its own calls and restores TF32 after,
+the switch `solve_tri.cu` already makes for its `cublasStrsmBatched`. In `ggml_cuda_mul_mat`, such a
+product skips MMF and reaches cuBLAS. Default-precision products, and every F16/BF16/quantized path,
+are unchanged.
+
+**Measured** (RTX 5090, CosyVoice3, same 224 speech tokens fed to both builds, 6 calls each): the flow
+0.32 → 0.43 s (+34%), the LM's 224 decode steps unchanged (mat-vec), the whole 8.92 s sentence about 9%
+slower, at 7.3x real time. With the patch the gate is exact (LM 76/76, mel 3.8e-3) without the
+environment override. Not covered: `mul_mat_id`'s MMF and cuBLAS paths (loom emits no MoE).
+
+## PR 59 — `cuda`: a prefix-stable `cumsum`
+
+*(`cmake/patches/ggml-0064-cuda-cumsum-prefix-stable.patch`, independent of the others)*
+
+**Problem.** A row's first n sums depended on the row's length, by more than rounding noise at the
+scale it matters. The launcher sized the block from the row (`min(ceil(n/32)*32, 256)`), switched to a
+CUB block kernel at 1024 elements, and for one long row used `cub::DeviceScan`, whose decoupled
+look-back sums a tile's predecessors in whatever order they finish. Within the fallback kernel each
+offset was an inclusive scan minus the thread's own total, and that total includes the elements after
+`i`. A model that re-runs a cumsum over a growing input sees the frames it already had change.
+CosyVoice3's live stream re-runs CausalHiFT over every mel frame so far, and its sine phase is a cumsum
+reaching ~1e6 rad, where an f32 ulp is 0.06 rad. On an RTX 5090 the stream's join came out 5.9e-03
+from one vocoder call over the same mel, against 5.5e-06 on the CPU.
+
+**Change.** One kernel at `CUDA_CUMSUM_BLOCK_SIZE` for every length. Every offset is an exclusive scan
+built from earlier lanes and warps only: `__shfl_up` of the inclusive warp scan, which reads lanes ≤ l,
+and the same one level up for warp totals. The sum is then `(carry + warps before) + threads before +
+own running sum`, in an order fixed by `i`. The CUB paths are no longer called.
+
+**Measured** (RTX 5090): `tests/gate/test_gpu_cumsum_prefix_stable` (rows of 1 and 9, 25 lengths
+across every old switch point up to 40000): 223 of 250 rows differed in their prefix before, 0 after,
+also run to run, and the distance from the CPU's sequential sums is unchanged (6.7e-06 relative).
+CosyVoice3's stream joins bit-identical to one vocoder call (0 against 5.9e-03). Not measured: a
+long-row speed comparison against CUB. The rows loom sends are short (9 x frames), and one block
+walks a 40000-element row.
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the

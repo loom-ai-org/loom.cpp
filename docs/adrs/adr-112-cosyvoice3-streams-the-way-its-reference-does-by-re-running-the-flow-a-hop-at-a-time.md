@@ -93,15 +93,22 @@ What a stream must equal was measured in PyTorch before choosing:
   hop hands out samples the next one rewrites): the first piece grows by 8 frames to 36,480 samples, the
   joined wave is 0.591 off one vocoder call over the same mel, and the gate fails exactly that check
   (45/46). The mel checks still pass, because the patch touches only the vocoder's output.
-* CUDA, RTX 5090 (`LOOM_TEST_DEVICE=gpu`), with `NVIDIA_TF32_OVERRIDE=0`: 43/44. The mel is within 3.7e-3 of
-  the one pass and 4.5e-3 of upstream's loop. Both cache modes interleave bit-identically, which is the first
-  check of the per-stream mode on a discrete GPU. The first piece comes after 0.5 s and the one pass takes
-  1.2 s: 7.4x real time (RTF 0.135). It was 23.7 s (0.38x real time) until `RSQRT` was lowered to ggml's own
-  ops. Its CPU-only custom op had put a host round trip into every RMSNorm, 49 per LM token, and made the LM 79 ms
-  a token; it is now 2.8 ms, bound by kernel launches. The one red check is the vocoder probe: 5.9e-3 against 1e-4. CUDA's cumsum rounds a prefix differently
-  for a different length, and the sine phase amplifies that. With TF32 on (ggml-cuda's default) the LM's draws
-  move and the gate cannot start. That is the same for the published file's one pass, so it predates this
-  stream. Both are hub items.
+* CUDA, RTX 5090 (`LOOM_TEST_DEVICE=gpu`): the stream gate passes 44/44.
+  * The mel is within 3.7e-3 of the one pass and 4.5e-3 of upstream's loop.
+  * The joined wave is bit-identical to one vocoder call over the same mel.
+  * Both cache modes interleave bit-identically, the first check of the per-stream mode on a discrete GPU.
+  * The first piece comes after 0.5 s and the one pass takes 1.2 s, 7.3x real time (RTF 0.137).
+
+  Three engine fixes it took, each found here:
+  * `RSQRT` lowered to ggml's own ops. Its CPU-only custom op had put a host round trip into every
+    RMSNorm and made the LM 79 ms a token (0.38x real time); it is now ~3 ms.
+  * `ggml-0063`: a `GGML_PREC_F32` product skips TF32 (ADR-069's 2026-11-12 amendment). With TF32, the
+    LM's pinned draws moved and the mel was 0.40 off.
+  * `ggml-0064`: a prefix-stable cumsum. The vocoder's sine phase is one, and the stream re-runs it over
+    a growing mel. Before it, the join was 5.9e-3 from one call.
+
+  `tests/gate/test_gpu_cumsum_prefix_stable` holds the last one: it fails on 223 of 250 rows without the
+  patch.
 * The one pass is unchanged by moving the LM loop: `test_e2e_cosyvoice3_lua_driver` 108/108 on the
   re-export (LM 76/76 tokens, flow mel 1.66e-3).
 * Graded in PyTorch (`test_cosyvoice3_export.py`): the estimator against a tiny random DiT in either
