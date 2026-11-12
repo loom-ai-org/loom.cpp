@@ -93,6 +93,13 @@ What a stream must equal was measured in PyTorch before choosing:
   hop hands out samples the next one rewrites): the first piece grows by 8 frames to 36,480 samples, the
   joined wave is 0.591 off one vocoder call over the same mel, and the gate fails exactly that check
   (45/46). The mel checks still pass, because the patch touches only the vocoder's output.
+* CUDA, RTX 5090 (`LOOM_TEST_DEVICE=gpu`), with `NVIDIA_TF32_OVERRIDE=0`: 43/44. The mel is within 3.7e-3 of
+  the one pass and 4.5e-3 of upstream's loop. Both cache modes interleave bit-identically, which is the first
+  check of the per-stream mode on a discrete GPU. The first piece comes after 4.5 s and the one pass takes
+  23.7 s. The one red check is the vocoder probe: 5.9e-3 against 1e-4. CUDA's cumsum rounds a prefix differently
+  for a different length, and the sine phase amplifies that. With TF32 on (ggml-cuda's default) the LM's draws
+  move and the gate cannot start. That is the same for the published file's one pass, so it predates this
+  stream. Both are hub items.
 * The one pass is unchanged by moving the LM loop: `test_e2e_cosyvoice3_lua_driver` 108/108 on the
   re-export (LM 76/76 tokens, flow mel 1.66e-3).
 * Graded in PyTorch (`test_cosyvoice3_export.py`): the estimator against a tiny random DiT in either
