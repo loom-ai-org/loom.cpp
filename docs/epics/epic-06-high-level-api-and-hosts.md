@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: host-api
-last_updated: 2026-11-11
+last_updated: 2026-11-12
 ---
 
 # Epic-06: The High-Level API and Its Hosts
@@ -201,6 +201,14 @@ decode carries its LSTM state across calls, and its emissions are final, so the 
 A stream's `language` is the prompt id, which `TranscriptionStream::language_input` resolves from a name
 (`stream(language="de-DE")` in loom-py).
 
+**A buffered transducer: Nemotron-Labs-Unified-ASR** ([ADR-110](../adrs/adr-110-the-unified-asr-streams-the-way-nemos-buffered-streaming-does.md)).
+Its streaming mode is NeMo's buffered loop, not a cache: every step runs the whole model on up to
+`left + chunk + right` seconds (5.6 + 0.56 + 0.56 by default) under a chunked attention mask, and decodes the
+chunk. `encoder_step` is the encoder with that mask, its three sizes inputs, so `stream_open`'s `left_seconds`,
+`chunk_seconds` and `right_seconds` pick the latency (0.16 to 2.08 s). The driver is the script's buffer
+arithmetic. The stream ends on NeMo's streamed ids, which are not the one pass's. Every step re-encodes the
+buffer, so it costs the buffer over the chunk: 0.33x real time at the default on the dev-box CPU.
+
 ### Streaming: which other models can, and how
 
 Every other door takes a whole input and returns a whole output. A streaming API covers three things.
@@ -232,7 +240,7 @@ The kinds of streaming, by how close a streamed result is to the one-pass one:
 | moonshine-streaming-tiny / -small | exact encoder, decoder re-run per update | **built** (ADR-107): encoder windows with its receptive field either side, the hypothesis re-decoded every `update_seconds`; the stream ends on one call's ids; publishes on rc21+ |
 | silero-vad | exact (LSTMCell state) | **built** (ADR-106): `infer`'s graphs per push behind one frame of lead, the cell's h and c carried; publishes on rc21+ |
 | wakehubert-tiny | exact (strictly causal, 2.5 s receptive field) | driver only: re-run over the last 2.5 s per chunk, or a state-carrying re-export |
-| nemotron-labs-unified-asr-0.6b | reference's streaming mode (buffered: chunked masks, 5.6 s left context recomputed per chunk) | re-export: the streaming-mode encoder beside the offline one |
+| nemotron-labs-unified-asr-0.6b | reference's streaming mode (buffered: chunked masks, 5.6 s left context recomputed per chunk) | **built** (ADR-110): the encoder over each buffer under the chunked mask, NeMo's buffer arithmetic in the driver; the stream ends on NeMo's streamed ids; publishes on rc21+ |
 | qwen3-asr-0.6b | reference's streaming mode (every 2 s, all audio so far re-fed; previous transcript minus its last 5 tokens as prefix; first 2 chunks unprefixed) | driver/host only: a prefix input; cost grows with the stream |
 | oruk-loop-153m | generic: Qwen3-ASR's scheme (its teacher) | as qwen3-asr; no reference streaming mode to grade against |
 | parakeet-tdt-0.6b, parakeet-rnnt-0.6b, canary-1b-v2, conformer-ctc-small, citrinet-1024, citrinet-256-ls | generic: NeMo's buffered chunked inference (overlapping windows, merged tokens) | host: the window + merge loop; Canary's long-form merge ([ADR-063](../adrs/adr-063-a-long-clip-is-decoded-the-way-its-reference-decodes-it.md)) is the nearest code |
@@ -291,7 +299,8 @@ ADR-099):
    `SpeechStream` audio out; a codec pair is a text-to-codes `SpeechStream` composed with a `CodecStream`
    by the host (ADR-102); a frame classifier or embedder answers through `FrameStream` (ADR-106); a
    re-decoding recognizer keeps its `hypothesis` in the state (ADR-107); a frame-synchronous one appends a final
-   id per frame (Kyutai STT, ADR-108), as a cache-aware transducer does per chunk (Nemotron 3.5 ASR, ADR-109).
+   id per frame (Kyutai STT, ADR-108), as a cache-aware transducer does per chunk (Nemotron 3.5 ASR, ADR-109) and a buffered one per buffer
+   (the unified ASR, ADR-110).
 3. **Per-call context in the stream state** for the decode loops that have it (Whisper's and T5's
    encoder output, a speech LM's built prompt), so their `PrefillDecodeLoop` can be cut per token too.
 4. **A chunked front end per family**, as Zipformer's windowed fbank: mel phases still run over the
@@ -315,7 +324,7 @@ fixture set is kept for exactly this reason; `v5` is the contract-declaring set.
 | | |
 |---|---|
 | Authority | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) |
-| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md) (per-module ring caches; MOSS-TTS, Dia), [ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md) (a carried LSTM, per-frame noise; MusicGen, EnCodec, SNAC), [ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md) (frame rows; Silero VAD), [ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md) (a re-decoding ASR; Moonshine streaming), [ADR-108](../adrs/adr-108-kyutai-stt-streams-its-encoder-with-moshis-state-carried.md) (Kyutai STT's encoder state carried), [ADR-109](../adrs/adr-109-nemotron-asr-streams-its-cache-aware-encoder-a-chunk-at-a-time.md) (Nemotron 3.5 ASR's cache-aware encoder), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
+| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md) (per-module ring caches; MOSS-TTS, Dia), [ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md) (a carried LSTM, per-frame noise; MusicGen, EnCodec, SNAC), [ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md) (frame rows; Silero VAD), [ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md) (a re-decoding ASR; Moonshine streaming), [ADR-108](../adrs/adr-108-kyutai-stt-streams-its-encoder-with-moshis-state-carried.md) (Kyutai STT's encoder state carried), [ADR-109](../adrs/adr-109-nemotron-asr-streams-its-cache-aware-encoder-a-chunk-at-a-time.md) (Nemotron 3.5 ASR's cache-aware encoder), [ADR-110](../adrs/adr-110-the-unified-asr-streams-the-way-nemos-buffered-streaming-does.md) (the unified ASR's buffered streaming), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
 | Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md), [Retro-104](../retros/retro-104-a-state-value-that-dropped-its-named-keys.md) (a stream's state value dropped its named keys) |
 | Active tasks | [Backlog → Host API](../backlog/active-index.md#host-api) |
 

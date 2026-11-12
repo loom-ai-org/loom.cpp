@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-11
+last_updated: 2026-11-12
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -966,8 +966,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   carried on the device, the RVQ in one graph; Q8_0 0.68x real time on the dev-box CPU, as fast as its one pass),
   and Nemotron 3.5 ASR, cache-aware
   ([ADR-109](../adrs/adr-109-nemotron-asr-streams-its-cache-aware-encoder-a-chunk-at-a-time.md): the encoder a few
-  320 ms chunks per call with its caches carried; the stream ends on one call's ids; a stream's language by name).
-  Next on the ASR side: the unified ASR's streaming mode; then the other audio-out rows (VoxCPM2, Voxtral, LFM2.5-Audio, CosyVoice3, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  320 ms chunks per call with its caches carried; the stream ends on one call's ids; a stream's language by name),
+  and the unified ASR, buffered
+  ([ADR-110](../adrs/adr-110-the-unified-asr-streams-the-way-nemos-buffered-streaming-does.md): NeMo's streaming
+  loop, its latency a stream option; ends on NeMo's streamed ids; 0.33x real time at the default on the dev-box CPU).
+  Next: the audio-out rows (VoxCPM2, Voxtral, LFM2.5-Audio, CosyVoice3, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   No GPU has run either door yet; the per-stream cache mode is what `Auto` picks there.
