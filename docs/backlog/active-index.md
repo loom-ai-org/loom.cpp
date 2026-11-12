@@ -972,8 +972,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   loop, its latency a stream option; ends on NeMo's streamed ids; 0.33x real time at the default on the dev-box CPU),
   and VoxCPM2, a patch at a time
   ([ADR-111](../adrs/adr-111-voxcpm2-streams-a-patch-at-a-time-through-a-state-carrying-vae-step.md): the AudioVAE's
-  conv state carried; first 160 ms after 3.4 s where the one pass takes 49 s on the dev-box CPU).
-  Next: CosyVoice3 (the user's next, 2026-11-12), then the other audio-out rows (Voxtral, LFM2.5-Audio, CosyVoice3, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  conv state carried; first 160 ms after 3.4 s where the one pass takes 49 s on the dev-box CPU),
+  and CosyVoice3, a hop of tokens at a time
+  ([ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md):
+  upstream's streaming mode, the flow re-run per hop under the DiT's chunk mask; so it joins to `infer` with
+  `streaming = 1`, not the default; first 1.36 s after 46.5 s where the one pass takes 141 s on the dev-box CPU).
+  Next: the other audio-out rows (Voxtral, LFM2.5-Audio, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   No GPU has run either door yet; the per-stream cache mode is what `Auto` picks there.
