@@ -38,7 +38,7 @@ void print_usage(const char* argv0) {
                   "usage: %s --model <path.gguf> --prompt \"<text or token ids>\" [--n-predict N]\n"
                   "       %s --model <asr.gguf> --wav <path.wav> [--language en] "
                   "[--task transcribe|translate] [--target-language xx] [--timestamps] "
-                  "[--no-condition-on-previous] [--stream MS]\n"
+                  "[--no-condition-on-previous] [--stream MS [--input name=v ...]]\n"
                   "       %s --model <lm.gguf> --prompt \"<text>\" --stream N "
                   "[--stream-caches auto|park|per-stream]\n"
                   "       %s --model <tts.gguf> --prompt \"<text>\" --out out.wav --stream 1 "
@@ -735,7 +735,7 @@ void run_text_stream(loom::Session& session, const loom::GgufModel& model, const
 void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string& wav_path,
              const std::string& language_name, const std::string& task_name,
              const std::string& target_language_name, bool timestamps,
-             bool condition_on_previous, uint32_t stream_ms) {
+             bool condition_on_previous, uint32_t stream_ms, const DriverInputs& extra_inputs) {
     // EVERYTHING BELOW THE ARGUMENT PARSING IS THE ENGINE'S NOW (loom/core/transcribe.h). This function
     // used to hold the whole long-form loop -- windowing, segment splitting, the timestamp-aware seek,
     // prev_tokens conditioning -- and loom-py could not reach any of it, so its users got fixed cuts
@@ -763,6 +763,12 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
                               "--no-condition-on-previous: the live door decodes with the file's defaults");
         }
         loom::audio::TranscriptionStream::Inputs inputs;
+        // `--input name=v` goes to the driver's `stream_open`: the stream's own options (Moonshine's
+        // `update_seconds`; the unified ASR's `left_seconds`, `chunk_seconds`, `right_seconds`, ADR-110).
+        for (const DriverInput& in : extra_inputs) {
+            if (in.values.size() == 1 && !in.array) inputs[in.name] = in.values[0];
+            else inputs[in.name] = in.values;
+        }
         if (!language_name.empty()) {
             inputs["language"] = loom::audio::TranscriptionStream::language_input(model, language_name);
         }
@@ -1592,7 +1598,7 @@ int main(int argc, char** argv) {
 
         if (has_wav) {
             run_asr(*model, backends, wav_path, language_name, task_name, target_language_name, timestamps,
-                    condition_on_previous, stream_ms);
+                    condition_on_previous, stream_ms, extra_inputs);
         }
     } catch (const loom::Error& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
