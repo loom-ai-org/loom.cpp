@@ -14,7 +14,7 @@
 //      neither.
 //
 // LOOM_STREAM_TTS_GGUF: a TTS exported with the stream functions (pocket-tts, soprano, voxcpm2,
-// lfm2.5-audio's tts, voxtral-4b-tts). A file
+// lfm2.5-audio's tts, voxtral-4b-tts, speecht5). A file
 // exported before them is refused by the door, which is checked too when LOOM_STREAM_TTS_OLD_GGUF names one.
 // LOOM_STREAM_TTS_TEXT_A / _B replace the two texts: VoxCPM2 takes ~20 s per second of audio on the 2-core
 // dev box, and the gate synthesises each text about ten times.
@@ -40,6 +40,15 @@ constexpr int kSkipReturnCode = 77;
 // A stream against one pass. Pocket-TTS's frame step measured 1.0e-6 against its one-call decoder on a
 // waveform peaking near 1; a frame decoded from the wrong state is off by the signal itself.
 constexpr double kOnePassTolerance = 1e-4;
+// SpeechT5 (ADR-119) decodes each piece's window of mel frames through its postnet and HiFi-GAN, and the
+// window's arithmetic is not the one pass's to the ulp: the CPU convolution runs im2col + GEMM in batches
+// of patches, so a long one-pass postnet call ends on a remainder batch another GEMM tile sums. Those
+// ~1e-6 postnet differences reach the waveform ~40x larger (HiFi-GAN amplifies rounding: in PyTorch its
+// own f32 is 2.7e-5 from f64 on a 4 s clip); a 21 s text measured 9.0e-5. What 1e-3 still catches, by
+// patching MEL_RIGHT_FRAMES in a copy (short texts): 34 -> 14 is 5.8e-2 off, 10 is 0.12, 4 is 0.27; 20 is
+// only 1.4e-4 -- real speech barely reaches the far taps -- so no f32 tolerance pins the last frames of
+// the margin. The exporter's CI test does (f64 windows, a NaN probe of the structural reach).
+constexpr double kSpeechT5Tolerance = 1e-3;
 
 double max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
     double d = 0.0;
@@ -69,6 +78,9 @@ std::vector<double> encode(const loom::GgufModel& model, const std::string& text
     } else if (tag == "gpt2") {
         // A plain byte-level BPE whose driver builds the rest of the prompt (LFM2.5-Audio's TTS).
         ids = loom::BpeVocab::load(model)->encode(text);
+    } else if (tag == "t5") {
+        // SpeechT5's SentencePiece characters, `</s>` appended and numbers spelled (ADR-057, ADR-059).
+        ids = loom::Vocab::load(model)->encode(text);
     } else {
         throw std::runtime_error("test_e2e_speech_stream: no text front end here for tokenizer '" + tag + "'");
     }
@@ -113,6 +125,9 @@ int main() {
     loom::Session session(*model, backend.get());
     loom::LoomLuaBridge& bridge = session.bridge();
     LOOM_CHECK(loom::audio::SpeechStream::supported(bridge));
+    const double tolerance =
+        model->has_kv("general.architecture") && model->kv_str("general.architecture") == "loom-speecht5"
+            ? kSpeechT5Tolerance : kOnePassTolerance;
 
     const char* text_a = std::getenv("LOOM_STREAM_TTS_TEXT_A");
     const char* text_b = std::getenv("LOOM_STREAM_TTS_TEXT_B");
@@ -143,7 +158,7 @@ int main() {
                      got.pieces, stream.pieces_total(), got.first_piece, got.samples.size(), want_a.size(), d,
                      first_s, one_pass_s);
         LOOM_CHECK(got.samples.size() == want_a.size());
-        LOOM_CHECK(d <= kOnePassTolerance);
+        LOOM_CHECK(d <= tolerance);
         LOOM_CHECK(got.pieces >= 2);
         LOOM_CHECK(stream.pieces_total() == 0 || stream.pieces_total() == stream.pieces_done());
         LOOM_CHECK(got.first_piece < want_a.size());
@@ -159,7 +174,7 @@ int main() {
     {
         loom::audio::SpeechStream stream(bridge, b);
         alone_b = pull_all(stream).samples;
-        LOOM_CHECK(alone_b.size() == want_b.size() && max_abs_diff(alone_b, want_b) <= kOnePassTolerance);
+        LOOM_CHECK(alone_b.size() == want_b.size() && max_abs_diff(alone_b, want_b) <= tolerance);
     }
 
     // 3. Interleaved, under both cache modes.

@@ -143,8 +143,8 @@ uint32_t rate_override(const DriverInputs& extra) {
 
 // `--stream` on a model whose answer is audio: `SpeechStream`, each piece reported as it is made -- a
 // few hidden rows for Soprano (ADR-114; `--input piece_tokens=N`, 0 a sentence), a few latent frames for
-// Pocket-TTS (ADR-101) or audio frames for LFM2.5-Audio and Voxtral (ADR-115, ADR-116; `--input
-// piece_frames=N` fixes the count). The waveform is written whole at the end, so what this shows is when each piece
+// Pocket-TTS (ADR-101), audio frames for LFM2.5-Audio and Voxtral (ADR-115, ADR-116) or mel frames for
+// SpeechT5 (ADR-119; `--input piece_frames=N` fixes the count). The waveform is written whole at the end, so what this shows is when each piece
 // WOULD have been playable.
 std::vector<float> run_speech_stream(loom::Session& session, loom::audio::SpeechStream::Inputs inputs,
                                      uint32_t rate, uint32_t channels) {
