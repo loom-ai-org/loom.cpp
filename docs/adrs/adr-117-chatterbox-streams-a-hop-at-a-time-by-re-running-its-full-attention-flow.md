@@ -95,7 +95,9 @@ Two things differ from CosyVoice3 (ADR-112):
     (2.8e-04 against its 2e-3 bound); stream gate 49/49, the mel 7.4e-05 from the PyTorch loop, HiFT
     streamed bit-identical to one call, both cache modes interleaving bit-identically. The one pass takes
     1.8 s, 4.4x real time (RTF 0.225); the first piece is ready after 0.6 s and the whole stream after
-    3.6 s, 2.2x real time (RTF 0.45).
+    3.6 s, 2.2x real time (RTF 0.45). Since [ADR-118](adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md)
+    (both guidance pairs one batch of two): the one pass 1.3 s, the first piece 0.5 s, the stream 2.7 s; on the
+    CPU at 16 threads the one pass 16.3 s.
 * One-pass gate `test_e2e_chatterbox_lua_driver` 45/45 on the re-export, 2.80e-05 from the reference
   (the v5 file gives 2.82e-05 on the same build).
 * Its first run failed one check, 48/49: in park mode the sampled stream was not bit-identical to itself.

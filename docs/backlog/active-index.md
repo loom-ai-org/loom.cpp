@@ -420,6 +420,18 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — performance
 
+* [ ] **The default thread count on a hybrid CPU.** `default_cpu_thread_count()` is the physical core count,
+  24 on a Core Ultra 9 285K (8 performance + 16 efficiency cores), and every node's barrier then waits on
+  the slow cores: Chatterbox's batched T3 step is 61 ms at 24 threads and 44 at 16, the whole one pass
+  20.4 s against 16.3 s ([ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md)).
+  The estimator goes the other way (4.1 s at 24, 4.9 at 16). Measure across the zoo before choosing a rule
+  (performance cores only? a count per graph?), and read
+  [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) first.
+* [ ] **Chatterbox's estimator against PyTorch's.** The flow's 10 guided steps take 4.0 s on the workstation's
+  CPU where upstream's take 2.6 s, the same batch of two (ADR-118): a compute-bound U-Net (convolutions,
+  12 transformer blocks over ~700 frames), so ggml's F32 GEMM and conv paths on these shapes. Profile per op
+  with one thread before guessing.
+
 * [ ] **P4.35/P4.36 follow-ups.** P4.35-P4.39 are merged (#89-#93, 2026-10-23), and their record is
   [Epic-05](../epics/epic-05-edge-performance.md#p435-p439-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22), ADR-082 and ADR-083. Two things are still open. (1) A job owning
   all 64 `A@V` rows, with narrow column blocks, measured 1.08x more on the op on the Pi 4 and is not built. (2) Moonshine
@@ -999,7 +1011,8 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   ([ADR-117](../adrs/adr-117-chatterbox-streams-a-hop-at-a-time-by-re-running-its-full-attention-flow.md):
   CosyVoice2's re-run loop over S3Gen's `finalize` hook, HiFT re-run with 20 frames held; its flow attends over
   everything, so the join is not `infer`'s audio but nearer it than another noise draw; first 0.6 s after 37 s
-  where the one pass takes 126 s on the dev-box CPU; RTX 5090: 49/49, first piece after 0.6 s, the stream 2.2x real time).
+  where the one pass takes 126 s on the dev-box CPU; RTX 5090: 49/49, first piece after 0.5 s, the stream 3.0x real time; both guidance pairs one batch of two since
+  [ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md)).
   Next: the other audio-out row (SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
