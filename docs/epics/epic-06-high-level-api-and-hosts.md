@@ -185,6 +185,11 @@ The same cut as Soprano's for a causal detokenizer: each piece's frames go throu
 attentions x 29), and the last 480 samples wait for the next frame's ISTFT overlap. The join is within
 1.6e-06 of `infer`; on the dev-box CPU at F32 the first 60 ms is ready after 2.1 s instead of 41 s.
 
+**Voxtral-4B-TTS a frame at a time** ([ADR-116](../adrs/adr-116-voxtral-tts-streams-a-frame-at-a-time-through-its-chunked-causal-codec.md)).
+Its codec is causal and the one pass already decodes it in chunks that re-read 32 frames before them, so
+a piece is that decode started at the first frame not yet handed out, with nothing held back. The join is
+within 4.7e-07 of `infer`; on the workstation's CPU the first 80 ms is ready after 4.4 s instead of 38 s.
+
 **Codec pairs: two doors, the codec carrying its state** ([ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md)).
 A pair streams as its two files do one pass: the LM's `SpeechStream` hands back each frame of codes as it is
 drawn, and the codec's `CodecStream` decodes pushes as they arrive, with the decoder's state carried by a
@@ -301,7 +306,7 @@ the text classifiers distilbert-ner and punctuate-all (whole text in, labels out
 | audio8-tts-realistic-0.6b + audio8-tts-codec | exact by construction: AR frames; codec all causal (convs, transposed convs, window-128 transformer) | **built** (ADR-102): the talker hands back a frame per pull, the codec decodes pushes with its state carried; after a re-export of both. Upstream's own code has no streaming entry point |
 | voxcpm2 | exact: `generate_streaming`, the AudioVAE's `streaming_decode` carries causal-conv state per patch | **per patch: built** (ADR-111): `vae_step` with its 26 conv states carried, pieces of 1, 2, 4, then 8 patches; 7.0e-07 from one pass; never retries a badcase, as upstream's stream does not; publishes on rc21+ |
 | moss-tts-local-transformer-v1.5 + moss-audio-tokenizer-v2 | exact: causal-transformer codec with streaming encode/decode (ring KV per layer) | **built** (ADR-103): the codec's six transformer stages each over a ring KV cache of its own, the talker a frame per pull; after a re-export of both |
-| voxtral-4b-tts-2603 | exact: chunked codec equals one call | driver: emit each `codec_chunk` as it is made |
+| voxtral-4b-tts-2603 | exact: chunked codec equals one call | **per frame: built** (ADR-116): the one pass's chunked causal decode started at the first new frame, 32 frames of context; pieces of 1, 2, 4, then 8 frames; 4.7e-07 from `infer`; publishes on rc21+ |
 | soprano-1.1-80m | exact: `infer_stream` re-runs the decoder over hidden states with a receptive-field margin ("lossless") | **within a sentence: built** (ADR-114): the decoder over windows of rows with its receptive field either side (3 rows before, 4 after), pieces of 1, 2, 4, 8, then 16 rows; bit-identical to `infer`; first 64 ms after 0.32 s on the dev box; publishes on rc21+ (a sentence per piece: ADR-100) |
 | lfm2.5-audio-1.5b-tts | exact up to one ISTFT hop: detokenizer is LFM2 with a causal window of 30, then a 'same' ISTFT | **per frame: built** (ADR-115): the detokenizer over windows from its 97-row receptive field back, 480 samples held for the next frame's overlap; pieces of 1, 2, 4, then 8 frames; 1.6e-06 from `infer`; publishes on rc21+ |
 | fun-cosyvoice3-0.5b | reference's streaming mode: the flow re-run per hop under a chunk mask, HiFT over all the mel with the last 8 frames withheld | **per hop: built** (ADR-112): the estimator takes chunk ids, the stream joins to `infer` `streaming = 1` (mel 9.1e-4), not to the full-attention default (~5 apart); publishes on rc21+ |
