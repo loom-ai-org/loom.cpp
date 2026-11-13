@@ -14,7 +14,7 @@
 //      neither.
 //
 // LOOM_STREAM_TTS_GGUF: a TTS exported with the stream functions (pocket-tts, soprano, voxcpm2,
-// lfm2.5-audio's tts). A file
+// lfm2.5-audio's tts, voxtral-4b-tts). A file
 // exported before them is refused by the door, which is checked too when LOOM_STREAM_TTS_OLD_GGUF names one.
 // LOOM_STREAM_TTS_TEXT_A / _B replace the two texts: VoxCPM2 takes ~20 s per second of audio on the 2-core
 // dev box, and the gate synthesises each text about ten times.
