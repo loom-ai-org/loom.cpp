@@ -11,9 +11,14 @@
 //      what it answered alone.
 //   4. With LOOM_FRAME_STREAM_OLD_GGUF, the file exported before the stream functions: its one-pass answer
 //      is this file's, bit for bit (`infer` did not move), and the door refuses it.
+//   5. With LOOM_FRAME_STREAM_LOOKAHEAD=N, a model whose frames read audio after them (ADR-120): a stream
+//      opened with `lookahead_frames = N` answers its first frame once N + 1 frames of audio are in, where
+//      the exact stream has answered nothing yet; it answers as many rows as one call; and a look-ahead
+//      past the exact one is refused. Its values are approximate by design and only reported.
 //
 // LOOM_FRAME_STREAM_GGUF: a frame classifier or frame embedder exported with the stream functions
-// (silero-vad: the cell's h and c carried across pushes, ADR-106).
+// (silero-vad: the cell's h and c carried across pushes, ADR-106; wakehubert and marblenet-vad: the one-pass
+// graph over windows holding each frame's reach, ADR-120).
 // LOOM_FRAME_STREAM_WAV_NPY: mono F32 audio at the file's rate -- real speech, since a VAD on noise sits
 // near one probability and hides a wrong carry; one that does not end on a frame covers `stream_finish`.
 
@@ -28,6 +33,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -37,7 +43,9 @@ constexpr int kSkipReturnCode = 77;
 // A push's frontend and head run over fewer frames than one call's -- a frame at a time is ggml's
 // one-column mul_mat path, not its tiled one -- so the sums inside a matmul are split differently; nothing
 // else differs. Measured on silero-vad (jfk): 1.9e-06 for every piece size up to 1000 samples, 3.0e-07 for
-// the whole clip in one push. The reference's own f32-against-f64 floor is 1.0e-05.
+// the whole clip in one push. The reference's own f32-against-f64 floor is 1.0e-05. A window over the one-pass
+// graph (ADR-120) splits them the same way: wakehubert 4.8e-06 on features of norm up to ~40 (0 for the
+// whole clip, one window), marblenet-vad 2.4e-07.
 constexpr double kTolerance = 1e-5;
 
 std::vector<float> one_pass(loom::LoomLuaBridge& bridge, const loom::GgufModel& model,
@@ -143,6 +151,37 @@ int main() {
         LOOM_CHECK(one_pass(old_session.bridge(), *old_model, wav) == want);
         LOOM_CHECK(!loom::audio::FrameStream::supported(old_session.bridge()));
         LOOM_CHECK_THROWS(loom::audio::FrameStream(old_session.bridge(), *old_model), loom::LoadError);
+    }
+
+    // 5. A shorter look-ahead.
+    if (const char* la = std::getenv("LOOM_FRAME_STREAM_LOOKAHEAD")) {
+        const int lookahead = std::atoi(la);
+        const loom::ModelContract contract = loom::ModelContract::read(*model);
+        const size_t hop = static_cast<size_t>(std::lround(contract.sample_rate / s.frame_rate()));
+        loom::audio::FrameStream exact(bridge, *model);
+        loom::audio::FrameStream early(bridge, *model, {{"lookahead_frames", static_cast<double>(lookahead)}});
+        std::vector<float> got;
+        uint32_t exact_rows = 0;
+        for (size_t at = 0; at < wav.size(); at += hop) {
+            const size_t n = std::min(hop, wav.size() - at);
+            const loom::audio::FrameUpdate u = early.push(wav.data() + at, n);
+            got.insert(got.end(), u.values.begin(), u.values.end());
+            exact_rows += exact.push(wav.data() + at, n).n_rows;
+            if (at / hop == static_cast<size_t>(lookahead)) {
+                std::printf("look-ahead %d: after %zu samples, %zu row(s) answered; exact: %u\n", lookahead,
+                            at + n, got.size() / s.width(), exact_rows);
+                LOOM_CHECK(got.size() / s.width() >= 1);
+                LOOM_CHECK(exact_rows == 0);
+            }
+        }
+        const loom::audio::FrameUpdate tail = early.finish();
+        got.insert(got.end(), tail.values.begin(), tail.values.end());
+        LOOM_CHECK(got.size() == want.size());
+        double sum = 0.0;
+        for (size_t i = 0; i < std::min(got.size(), want.size()); ++i) sum += std::fabs(double(got[i]) - want[i]);
+        std::printf("look-ahead %d: max|d| %.3g, mean|d| %.3g from one call\n", lookahead, max_diff(got, want),
+                    sum / std::max<size_t>(1, want.size()));
+        LOOM_CHECK_THROWS(loom::audio::FrameStream(bridge, *model, {{"lookahead_frames", 1e6}}), std::exception);
     }
 
     LOOM_TEST_REPORT_AND_RETURN();

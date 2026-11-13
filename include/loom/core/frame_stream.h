@@ -6,7 +6,8 @@
 //
 // THE DRIVER CONTRACT. ADR-098's three functions, as `TranscriptionStream` calls them:
 //
-//   stream_open(inputs)               starts a stream; nothing is run yet
+//   stream_open(inputs)               starts a stream; nothing is run yet. `inputs` are the caller's
+//                                     options (MarbleNet's `lookahead_frames`, ADR-120)
 //   stream_feed({waveform = pcm})     takes the next samples, returns the rows of the frames they completed
 //   stream_finish(inputs)             the input has ended: returns the rows of what is left
 //
@@ -26,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace loom {
@@ -43,11 +45,13 @@ struct FrameUpdate {
 
 class FrameStream {
 public:
-    // Opens a stream on a loaded model (`stream_open`). Throws loom::LoadError when the driver has no
-    // streaming entry points, and loom::Error when the contract is not audio in and `class` or
-    // `embeddings` out per `frame`, or does not say how wide a row is. `bridge` is not owned and must
-    // outlive this object.
-    FrameStream(LoomLuaBridge& bridge, const GgufModel& model);
+    using Inputs = std::unordered_map<std::string, LoomLuaBridge::Value>;
+
+    // Opens a stream on a loaded model (`stream_open`, handed `inputs`; `reset` hands them again). Throws
+    // loom::LoadError when the driver has no streaming entry points, and loom::Error when the contract is
+    // not audio in and `class` or `embeddings` out per `frame`, or does not say how wide a row is. `bridge`
+    // is not owned and must outlive this object.
+    FrameStream(LoomLuaBridge& bridge, const GgufModel& model, Inputs inputs = {});
 
     // Whether the loaded driver exports `stream_open`, `stream_feed` and `stream_finish`.
     static bool supported(const LoomLuaBridge& bridge);
@@ -79,6 +83,7 @@ private:
     FrameUpdate absorb(const LoomLuaBridge::Value& result, const char* fn);
 
     LoomLuaBridge& bridge_;
+    Inputs inputs_;
     std::string output_kind_;
     std::vector<std::string> labels_;
     uint32_t width_ = 0;
