@@ -420,17 +420,21 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — performance
 
-* [ ] **The default thread count on a hybrid CPU.** `default_cpu_thread_count()` is the physical core count,
-  24 on a Core Ultra 9 285K (8 performance + 16 efficiency cores), and every node's barrier then waits on
-  the slow cores: Chatterbox's batched T3 step is 61 ms at 24 threads and 44 at 16, the whole one pass
-  20.4 s against 16.3 s ([ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md)).
-  The estimator goes the other way (4.1 s at 24, 4.9 at 16). Measure across the zoo before choosing a rule
-  (performance cores only? a count per graph?), and read
-  [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) first.
-* [ ] **Chatterbox's estimator against PyTorch's.** The flow's 10 guided steps take 4.0 s on the workstation's
-  CPU where upstream's take 2.6 s, the same batch of two (ADR-118): a compute-bound U-Net (convolutions,
-  12 transformer blocks over ~700 frames), so ggml's F32 GEMM and conv paths on these shapes. Profile per op
-  with one thread before guessing.
+* [ ] **Chatterbox's remaining CPU gap to PyTorch.** Workstation CPU (Core Ultra 9 285K, 8 performance + 16
+  efficiency cores), 8 s of audio: upstream PyTorch 12.5 s; loom 16.25 s at 16 threads and 20.4 s at its default
+  24, after [ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md) batched both
+  guidance pairs (T3 is now ahead of PyTorch per token). Two parts, measured separately:
+  * *The default thread count on a hybrid CPU* (about 4 s). `default_cpu_thread_count()` is the physical core
+    count, 24 here, and every node's barrier then waits on the slow cores: the batched T3 step is 61 ms at 24
+    threads and 44 at 16. The estimator goes the other way (4.1 s at 24, 4.9 at 16). Measure across the zoo before
+    choosing a rule (performance cores only? a count per graph?); read
+    [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) first.
+  * *The estimator* (about 1.5-2.3 s). The flow's 10 guided steps take 4.0 s at 24 threads where upstream's take
+    2.6 s, the same batch of two: a compute-bound U-Net (convolutions, 12 transformer blocks over ~700 frames),
+    so ggml's F32 GEMM and conv paths on these shapes. Profile per op with one thread before guessing.
+
+  Kit on the workstation: `/mnt/datasets/loom-chatterbox-prof/` (the English checkpoint, `torch_baseline.py`,
+  `timer_patch.py` for per-module wall times in the bridge, `mm_bench.cpp`); a re-export takes ~100 s.
 
 * [ ] **P4.35/P4.36 follow-ups.** P4.35-P4.39 are merged (#89-#93, 2026-10-23), and their record is
   [Epic-05](../epics/epic-05-edge-performance.md#p435-p439-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22), ADR-082 and ADR-083. Two things are still open. (1) A job owning
