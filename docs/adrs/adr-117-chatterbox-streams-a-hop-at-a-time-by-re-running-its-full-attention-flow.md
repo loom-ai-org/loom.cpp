@@ -87,6 +87,15 @@ Two things differ from CosyVoice3 (ADR-112):
   samples the next one rewrites) grows the first piece from 14,400 to 23,040 samples, puts the join 0.476
   off one vocoder call over the same mel, and fails exactly that check (48/49); the mel checks still pass,
   the patch touching only the vocoder's output. Reverted, sha256 verified.
+* Workstation (2026-11-13; both gates, the same re-export, sha256-checked copies; the old file refused):
+  * CPU, 24 cores: one-pass gate 45/45 (2.77e-05); stream gate 49/49, the mel 1.8e-05 from the PyTorch
+    loop, HiFT streamed 8.3e-06 from one call. The first 0.6 s after 4.8 s against 20.2 s for the one pass
+    (8 s of audio, 0.40x real time, RTF 2.5); the whole stream 29.9 s (RTF 3.7).
+  * CUDA, RTX 5090 (`LOOM_TEST_DEVICE=gpu`, which the one-pass gate now honours): one-pass gate 45/45
+    (2.8e-04 against its 2e-3 bound); stream gate 49/49, the mel 7.4e-05 from the PyTorch loop, HiFT
+    streamed bit-identical to one call, both cache modes interleaving bit-identically. The one pass takes
+    1.8 s, 4.4x real time (RTF 0.225); the first piece is ready after 0.6 s and the whole stream after
+    3.6 s, 2.2x real time (RTF 0.45).
 * One-pass gate `test_e2e_chatterbox_lua_driver` 45/45 on the re-export, 2.80e-05 from the reference
   (the v5 file gives 2.82e-05 on the same build).
 * Its first run failed one check, 48/49: in park mode the sampled stream was not bit-identical to itself.

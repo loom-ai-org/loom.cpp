@@ -999,13 +999,13 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   ([ADR-117](../adrs/adr-117-chatterbox-streams-a-hop-at-a-time-by-re-running-its-full-attention-flow.md):
   CosyVoice2's re-run loop over S3Gen's `finalize` hook, HiFT re-run with 20 frames held; its flow attends over
   everything, so the join is not `infer`'s audio but nearer it than another noise draw; first 0.6 s after 37 s
-  where the one pass takes 126 s on the dev-box CPU).
+  where the one pass takes 126 s on the dev-box CPU; RTX 5090: 49/49, first piece after 0.6 s, the stream 2.2x real time).
   Next: the other audio-out row (SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,
-  after the native RSQRT, ggml-0063 (no TF32 for a tagged product) and ggml-0064 (a prefix-stable cumsum). No other
-  stream has run on one; the per-stream cache mode is what `Auto` picks there.
+  after the native RSQRT, ggml-0063 (no TF32 for a tagged product) and ggml-0064 (a prefix-stable cumsum). Chatterbox's is the second
+  (49/49, 2026-11-13); no other stream has been gated on one (Voxtral's ran there through `loom_cli`); the per-stream cache mode is what `Auto` picks there.
   The user asked that every model amenable to streaming gets it, name or no name (2026-11-08).
 
 * [ ] **lfm2-350m-modular re-feeds the whole sequence every token.** Its per-layer export carries no KV
