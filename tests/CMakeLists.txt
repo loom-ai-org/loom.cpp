@@ -183,6 +183,14 @@ add_test(NAME test_e2e_cosyvoice3_stream COMMAND test_e2e_cosyvoice3_stream)
 set_tests_properties(test_e2e_cosyvoice3_stream PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_cosyvoice3_stream PROPERTIES SKIP_RETURN_CODE 77)
 
+# Chatterbox's live stream (ADR-117) against the same re-run loop in PyTorch: its mel, its distance from the
+# one pass, its vocoder's streaming, reset and interleaving. LOOM_CHATTERBOX_STREAM_GGUF + _REF_DIR.
+add_executable(test_e2e_chatterbox_stream gate/test_e2e_chatterbox_stream.cpp)
+target_link_libraries(test_e2e_chatterbox_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_chatterbox_stream COMMAND test_e2e_chatterbox_stream)
+set_tests_properties(test_e2e_chatterbox_stream PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_chatterbox_stream PROPERTIES SKIP_RETURN_CODE 77)
+
 # The codec half of a streamed pair (ADR-102): `CodecStream`'s pushes decode to `infer`'s waveform, and
 # streams on one codec do not see each other. LOOM_STREAM_CODEC_GGUF + LOOM_STREAM_CODES_NPY.
 add_executable(test_e2e_codec_stream gate/test_e2e_codec_stream.cpp)
@@ -558,6 +566,16 @@ target_compile_definitions(test_gallocr_reserve_reuse PRIVATE LOOM_TEST_FIXTURE_
 add_test(NAME test_gallocr_reserve_reuse COMMAND test_gallocr_reserve_reuse)
 set_tests_properties(test_gallocr_reserve_reuse PROPERTIES LABELS ci)
 set_tests_properties(test_gallocr_reserve_reuse PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+
+# A graph's layout is its own (ADR-117): the same shape lands at the same offsets before and after a
+# larger graph of the same topology, so a layout-dependent kernel path (the CPU conv fusion) cannot make
+# one input give two results.
+add_executable(test_graph_layout_is_its_own ci/test_graph_layout_is_its_own.cpp)
+target_link_libraries(test_graph_layout_is_its_own PRIVATE loom::engine)
+target_compile_definitions(test_graph_layout_is_its_own PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_graph_layout_is_its_own COMMAND test_graph_layout_is_its_own)
+set_tests_properties(test_graph_layout_is_its_own PROPERTIES LABELS ci)
+set_tests_properties(test_graph_layout_is_its_own PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
 # --- Phase 3: KV cache / ATTENTION primitive / autoregressive generation ---
 

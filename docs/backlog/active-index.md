@@ -380,6 +380,14 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — correctness
 
+* [ ] **The hybrid path still lays a graph out by the graph before it.** `GraphBuilder::allocate_scheduled`
+  hands `ggml_backend_sched_alloc_graph` the graph, and the scheduler's gallocr re-plans only when it does not
+  fit, as the CPU path did until [Retro-105](../retros/retro-105-a-graph-laid-out-by-the-graph-before-it.md).
+  Not seen to bite (the conv fusion that read the layout is CPU-only, and CosyVoice3's CUDA stream
+  interleaved bit-identically), but a layout-dependent kernel on a device would. The fix is a
+  `ggml_backend_sched_reserve` per rebuild, held back because P4.46's re-split retry for the vc4 pool sits on
+  that path and needs a Pi to check.
+
 * [ ] **`RANGE_1D` with a negative step returns -1 elements, silently.** `op_range_1d` forces `end > start` so `ggml_arange` (which asserts it and has no negative steps) cannot abort, so `arange(T - 1, -T, -1)` becomes `arange(start, start + 1, -1)`; the first error is a downstream RESHAPE. Lower a negative step as `start + step * arange(0, n)` with `n = ceil((end - start) / step)`, and throw on an empty range rather than inventing one element. Nemotron ASR's export avoids it so its file runs on released wheels. *Context: [Retro-079](../retros/retro-079-the-references-default-path-was-the-broken-one.md)*
 * [ ] **Who still depends on the layout-"healing" heuristics?** The guards make size-guessing
   *unreachable for already-correct graphs*; they do not remove it, and `op_repeat`'s two branches are
@@ -986,8 +994,13 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   and Voxtral-4B-TTS a frame at a time
   ([ADR-116](../adrs/adr-116-voxtral-tts-streams-a-frame-at-a-time-through-its-chunked-causal-codec.md): the one
   pass's chunked causal codec decode, started at the first new frame; first 80 ms after 4.4 s where the one pass
-  takes 38 s on the workstation's CPU).
-  Next: the other audio-out rows (Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  takes 38 s on the workstation's CPU),
+  and Chatterbox a hop at a time
+  ([ADR-117](../adrs/adr-117-chatterbox-streams-a-hop-at-a-time-by-re-running-its-full-attention-flow.md):
+  CosyVoice2's re-run loop over S3Gen's `finalize` hook, HiFT re-run with 20 frames held; its flow attends over
+  everything, so the join is not `infer`'s audio but nearer it than another noise draw; first 0.6 s after 37 s
+  where the one pass takes 126 s on the dev-box CPU).
+  Next: the other audio-out row (SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,
