@@ -507,6 +507,20 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
         if (!galloc_) {
             galloc_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
         }
+        // **Planned for THIS graph, every rebuild** (ADR-117). `ggml_gallocr_alloc_graph` re-plans only
+        // when the graph does not fit the last plan, so a graph built after a larger one of the same
+        // topology took the larger one's offsets, and the same graph had another layout depending on what
+        // ran before it. The layout is not only where things are: the CPU backend's conv fusion
+        // (ggml-0036) checks whether its result overlaps its input, falls back to the unfused nodes when
+        // it does, and the two round differently. Chatterbox's HiFT came out 1.1e-07 apart for one mel run
+        // before and after a longer one, and a stream interleaved with another lost its bit-identity. The
+        // buffer still only grows here (reserve reallocates only past its size); the offsets are this
+        // graph's own, so its result is too. One planning pass per REBUILD, never per reuse: Soprano's one
+        // pass (an LM rebuilding per KV bucket, a decoder per window) took 2.86 s with it and 3.00 s without,
+        // five interleaved runs each on the dev box -- noise.
+        if (!ggml_gallocr_reserve(galloc_.get(), gf)) {
+            throw Error("GraphBuilder::build: ggml_gallocr_reserve failed");
+        }
         if (!ggml_gallocr_alloc_graph(galloc_.get(), gf)) {
             throw Error("GraphBuilder::build: ggml_gallocr_alloc_graph failed");
         }
