@@ -650,12 +650,18 @@ void run_asr_stream(loom::Session& session, const loom::GgufModel& model, const 
 // `--stream MS` on a frame classifier or embedder: `FrameStream` (ADR-106), one push per MS of audio. A
 // classifier prints each change of its most probable label when the push that revealed it returns, beside
 // the frame time it starts at -- what a live caller would have known by then; an embedder, the rows each
-// push answered. A presentation, like the one-pass table: no threshold, no smoothing.
+// push answered. A presentation, like the one-pass table: no threshold, no smoothing. `--input name=v`
+// goes to the driver's `stream_open` (MarbleNet's `lookahead_frames`, ADR-120).
 void run_frame_stream(loom::Session& session, const loom::GgufModel& model, const std::vector<float>& clip,
-                      uint32_t rate, uint32_t stream_ms) {
+                      uint32_t rate, uint32_t stream_ms, const DriverInputs& extra_inputs) {
     using clock = std::chrono::steady_clock;
     const size_t piece = std::max<size_t>(1, static_cast<size_t>(rate) * stream_ms / 1000);
-    loom::audio::FrameStream stream(session.bridge(), model);
+    loom::audio::FrameStream::Inputs inputs;
+    for (const DriverInput& in : extra_inputs) {
+        if (in.values.size() == 1 && !in.array) inputs[in.name] = in.values[0];
+        else inputs[in.name] = in.values;
+    }
+    loom::audio::FrameStream stream(session.bridge(), model, std::move(inputs));
     const bool classes = stream.output_kind() == loom::modality::CLASS;
     int64_t current = -1;
     const auto print = [&](const loom::audio::FrameUpdate& u) {
@@ -1061,7 +1067,7 @@ int main(int argc, char** argv) {
                                          "--stream it runs the clip in one call as before.\n");
                     return 1;
                 }
-                run_frame_stream(session, *model, clip, contract.sample_rate, stream_ms);
+                run_frame_stream(session, *model, clip, contract.sample_rate, stream_ms, extra_inputs);
                 print_device_report(session.bridge());
                 return 0;
             }

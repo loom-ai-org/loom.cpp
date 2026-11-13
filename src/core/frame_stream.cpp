@@ -5,6 +5,7 @@
 #include "loom/loom_errors.h"
 
 #include <string>
+#include <utility>
 
 namespace loom {
 namespace audio {
@@ -14,7 +15,8 @@ bool FrameStream::supported(const LoomLuaBridge& bridge) {
     return TranscriptionStream::supported(bridge);
 }
 
-FrameStream::FrameStream(LoomLuaBridge& bridge, const GgufModel& model) : bridge_(bridge) {
+FrameStream::FrameStream(LoomLuaBridge& bridge, const GgufModel& model, Inputs inputs)
+    : bridge_(bridge), inputs_(std::move(inputs)) {
     const ModelContract contract = ModelContract::read(model);
     if (contract.input_kind != modality::AUDIO ||
         (contract.output_kind != modality::CLASS && contract.output_kind != modality::EMBEDDINGS)) {
@@ -60,7 +62,7 @@ void FrameStream::reset() {
     rows_ = 0;
     samples_ = 0;
     finished_ = false;
-    bridge_.call("stream_open", {}, state_);
+    bridge_.call("stream_open", inputs_, state_);
 }
 
 FrameUpdate FrameStream::push(const float* samples, size_t n) {

@@ -1020,7 +1020,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   and SpeechT5 a few mel frames at a time
   ([ADR-119](../adrs/adr-119-speecht5-streams-mel-frames-by-vocoding-windows.md): the postnet + HiFi-GAN over
   windows of its 34-frame receptive field either side; first 32 ms after 1.7 s where the one pass takes 22.6 s
-  on the dev-box CPU; every audio-out row of the survey is now built).
+  on the dev-box CPU; every audio-out row of the survey is now built),
+  and WakeHuBERT and MarbleNet a frame at a time
+  ([ADR-120](../adrs/adr-120-a-frame-model-with-a-finite-reach-streams-by-windows-over-its-one-pass-graph.md): the
+  one-pass graph over windows holding each frame's measured reach; `FrameStream` takes `stream_open` options,
+  MarbleNet's `lookahead_frames`). Open there: a state-carrying WakeHuBERT step if a device needs 20 ms pushes
+  cheaper than recomputing 2.4 s of context (2.0x real time on the dev box).
   Next: the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
