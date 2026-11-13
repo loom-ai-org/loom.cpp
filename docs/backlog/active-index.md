@@ -1016,8 +1016,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   CosyVoice2's re-run loop over S3Gen's `finalize` hook, HiFT re-run with 20 frames held; its flow attends over
   everything, so the join is not `infer`'s audio but nearer it than another noise draw; first 0.6 s after 37 s
   where the one pass takes 126 s on the dev-box CPU; RTX 5090: 49/49, first piece after 0.5 s, the stream 3.0x real time; both guidance pairs one batch of two since
-  [ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md)).
-  Next: the other audio-out row (SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  [ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md)),
+  and SpeechT5 a few mel frames at a time
+  ([ADR-119](../adrs/adr-119-speecht5-streams-mel-frames-by-vocoding-windows.md): the postnet + HiFi-GAN over
+  windows of its 34-frame receptive field either side; first 32 ms after 1.7 s where the one pass takes 22.6 s
+  on the dev-box CPU; every audio-out row of the survey is now built).
+  Next: the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,
