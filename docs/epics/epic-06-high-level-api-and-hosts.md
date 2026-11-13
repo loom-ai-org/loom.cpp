@@ -195,7 +195,8 @@ S3Gen is CosyVoice2's flow and keeps its `finalize=False` look-ahead hook but no
 CosyVoice2's: each hop re-runs the flow over every token so far and HiFT over all the mel, handing out what
 its last 20 frames cannot change. The flow attends over everything, so no one pass is the join: the stream's
 mel is a mean 0.085 from `infer`'s, where `infer` under another noise draw is 0.378 from it, and T3's tokens
-are the same both ways. Its gate found an engine defect: a graph built after a larger one took that one's
+are the same both ways. On an RTX 5090 the first piece is ready after 0.6 s and the 8 s sentence streams at
+2.2x real time (4.4x in one pass). Its gate found an engine defect: a graph built after a larger one took that one's
 allocation plan, and the CPU conv fusion's layout check made the same input round two ways
 ([Retro-105](../retros/retro-105-a-graph-laid-out-by-the-graph-before-it.md)).
 
