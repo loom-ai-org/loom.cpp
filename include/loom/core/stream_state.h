@@ -76,6 +76,9 @@ public:
 
     // Null when nothing stored `name`.
     const Value* value(const std::string& name) const;
+    // The entry `name` to change in place, created empty when absent: what lets an array grow or shrink at
+    // its ends without the whole of it being copied (`loom.append_state`, `loom.drop_state`).
+    Value& value_for_write(const std::string& name);
     void set_value(const std::string& name, Value value);
     void erase_value(const std::string& name);
 
