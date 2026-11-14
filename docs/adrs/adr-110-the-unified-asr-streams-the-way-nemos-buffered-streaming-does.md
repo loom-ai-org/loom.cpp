@@ -102,4 +102,7 @@ Option **3**. `infer` is unchanged.
 * `loom-exporter/loom_exporter/nemotron_unified_export.py` (`UnifiedEncoderStepPhase`, `chunked_masks`),
   `nemotron_asr_driver/00_stream_decode.lua`, `02_unified_stream.lua`, `tests/ci/test_nemotron_unified_export.py`,
   `fixture_gen/reference_stream_nemotron_unified.py`
-* `tests/gate/test_e2e_nemotron_unified_stream.cpp`; `loom_cli --input` on `--stream`
+* `tests/gate/test_e2e_nemo_buffered_stream.cpp` (was `test_e2e_nemotron_unified_stream.cpp`); `loom_cli --input` on `--stream`
+* [ADR-122](adr-122-parakeet-streams-the-way-nemos-buffered-script-does.md) moved the loop and the decode to
+  `transducer_driver/11_buffered_stream.lua` and `10_stream_decode.lua`, shared with Parakeet; the oracle is now
+  `fixture_gen/reference_stream_nemo_buffered.py`.
