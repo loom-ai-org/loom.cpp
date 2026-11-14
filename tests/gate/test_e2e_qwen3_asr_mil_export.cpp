@@ -129,6 +129,16 @@ int main() {
     const std::vector<float> encoder_in = read_npy<float>(ref_dir + "/ref_asr_encoder_in.npy", enc_shape);
     const std::vector<float> expected_audio = read_npy<float>(ref_dir + "/ref_asr_audio.npy", audio_shape);
     const std::vector<int32_t> expected = read_npy<int32_t>(ref_dir + "/ref_asr_generated.npy", gen_shape);
+    // What the driver RETURNS: the ids after `<asr_text>`, since the exporter trims the stock checkpoint's
+    // `language English<asr_text>` preamble (loom-exporter 6cc57ea). This gate compared against the
+    // untrimmed ids and went red on every file exported after that commit, the published one included
+    // (52/80; found 2026-11-13 re-exporting for ADR-121). A fixture from before the reference wrote the
+    // trimmed ids has only the untrimmed ones, which is right for a driver that does not trim.
+    std::vector<int64_t> transcript_shape;
+    const std::vector<int32_t> transcript =
+        path_exists(ref_dir + "/ref_asr_transcript.npy")
+            ? read_npy<int32_t>(ref_dir + "/ref_asr_transcript.npy", transcript_shape)
+            : expected;
     const std::vector<int32_t> prompt_len =
         read_npy<int32_t>(ref_dir + "/ref_asr_prompt_len.npy", prompt_shape);
     const std::vector<int32_t> valid = read_npy<int32_t>(ref_dir + "/ref_asr_valid.npy", valid_shape);
@@ -264,9 +274,10 @@ int main() {
         for (int32_t t : generated) std::fprintf(stderr, "%d ", t);
         std::fprintf(stderr, "\n");
 
-        LOOM_CHECK(generated.size() == expected.size());
-        for (size_t i = 0; i < generated.size(); ++i) {
-            LOOM_CHECK(generated[i] == expected[i]);
+        // The budget is HF's whole answer (preamble included), the comparison the trimmed transcript.
+        LOOM_CHECK(generated.size() == transcript.size());
+        for (size_t i = 0; i < generated.size() && i < transcript.size(); ++i) {
+            LOOM_CHECK(generated[i] == transcript[i]);
         }
     }
 
@@ -320,9 +331,9 @@ int main() {
                      2 * samples_per_chunk, n_chunks, clipped.size());
         for (int32_t t : clipped) std::fprintf(stderr, "%d ", t);
         std::fprintf(stderr, "\n");
-        bool differs = clipped.size() != expected.size();
-        for (size_t i = 0; i < clipped.size() && i < expected.size() && !differs; ++i) {
-            differs = clipped[i] != expected[i];
+        bool differs = clipped.size() != transcript.size();
+        for (size_t i = 0; i < clipped.size() && i < transcript.size() && !differs; ++i) {
+            differs = clipped[i] != transcript[i];
         }
         LOOM_CHECK(differs);
     }

@@ -2203,3 +2203,8 @@ target_compile_definitions(test_transcribe_stream PRIVATE LOOM_TEST_FIXTURE_DIR=
 add_test(NAME test_transcribe_stream COMMAND test_transcribe_stream)
 set_tests_properties(test_transcribe_stream PROPERTIES LABELS ci)
 set_tests_properties(test_transcribe_stream PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
+
+add_executable(test_e2e_qwen3_asr_stream gate/test_e2e_qwen3_asr_stream.cpp)
+target_link_libraries(test_e2e_qwen3_asr_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_qwen3_asr_stream COMMAND test_e2e_qwen3_asr_stream)
+set_tests_properties(test_e2e_qwen3_asr_stream PROPERTIES LABELS gate SKIP_RETURN_CODE 77)

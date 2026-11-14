@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-13
+last_updated: 2026-11-14
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -1025,8 +1025,13 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   ([ADR-120](../adrs/adr-120-a-frame-model-with-a-finite-reach-streams-by-windows-over-its-one-pass-graph.md): the
   one-pass graph over windows holding each frame's measured reach; `FrameStream` takes `stream_open` options,
   MarbleNet's `lookahead_frames`). Open there: a state-carrying WakeHuBERT step if a device needs 20 ms pushes
-  cheaper than recomputing 2.4 s of context (2.0x real time on the dev box).
-  Next: the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  cheaper than recomputing 2.4 s of context (2.0x real time on the dev box),
+  and Qwen3-ASR and oruk-loop the way `streaming_transcribe` re-feeds everything
+  ([ADR-121](../adrs/adr-121-qwen3-asr-streams-the-way-its-reference-does-re-encoding-only-what-changed.md):
+  the prefix cut from text through `loom.tokenize`/`detokenize`; only the 8 s encoder window still filling
+  re-encoded, the decoder's keys over the rest kept; 0.37x real time on 30 s on the dev-box CPU where re-feeding
+  is 0.22x; the prefix still grows, as upstream's).
+  Next: the other ASR rows (NeMo buffered, the re-decoding rows, pyannote), and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,
