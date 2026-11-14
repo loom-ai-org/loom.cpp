@@ -136,6 +136,11 @@ set_tests_properties(test_transcribe_wordpiece PROPERTIES FIXTURES_REQUIRED cont
 
 # --- Phase 2: primitive registry / topology parsing / graph builder ---
 
+add_executable(test_log_mel ci/test_log_mel.cpp)
+target_link_libraries(test_log_mel PRIVATE loom::engine)
+add_test(NAME test_log_mel COMMAND test_log_mel)
+set_tests_properties(test_log_mel PROPERTIES LABELS ci)
+
 add_executable(test_primitive_registry ci/test_primitive_registry.cpp)
 target_link_libraries(test_primitive_registry PRIVATE loom::engine)
 add_test(NAME test_primitive_registry COMMAND test_primitive_registry)
@@ -169,6 +174,22 @@ target_link_libraries(test_e2e_speech_stream PRIVATE loom::engine)
 add_test(NAME test_e2e_speech_stream COMMAND test_e2e_speech_stream)
 set_tests_properties(test_e2e_speech_stream PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_speech_stream PROPERTIES SKIP_RETURN_CODE 77)
+
+# CosyVoice3's live stream (ADR-112) against upstream's streaming mode: its mel, its vocoder's streaming,
+# reset and interleaving. LOOM_COSYVOICE3_STREAM_GGUF + LOOM_COSYVOICE3_STREAM_REF_DIR.
+add_executable(test_e2e_cosyvoice3_stream gate/test_e2e_cosyvoice3_stream.cpp)
+target_link_libraries(test_e2e_cosyvoice3_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_cosyvoice3_stream COMMAND test_e2e_cosyvoice3_stream)
+set_tests_properties(test_e2e_cosyvoice3_stream PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_cosyvoice3_stream PROPERTIES SKIP_RETURN_CODE 77)
+
+# Chatterbox's live stream (ADR-117) against the same re-run loop in PyTorch: its mel, its distance from the
+# one pass, its vocoder's streaming, reset and interleaving. LOOM_CHATTERBOX_STREAM_GGUF + _REF_DIR.
+add_executable(test_e2e_chatterbox_stream gate/test_e2e_chatterbox_stream.cpp)
+target_link_libraries(test_e2e_chatterbox_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_chatterbox_stream COMMAND test_e2e_chatterbox_stream)
+set_tests_properties(test_e2e_chatterbox_stream PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_chatterbox_stream PROPERTIES SKIP_RETURN_CODE 77)
 
 # The codec half of a streamed pair (ADR-102): `CodecStream`'s pushes decode to `infer`'s waveform, and
 # streams on one codec do not see each other. LOOM_STREAM_CODEC_GGUF + LOOM_STREAM_CODES_NPY.
@@ -546,6 +567,16 @@ add_test(NAME test_gallocr_reserve_reuse COMMAND test_gallocr_reserve_reuse)
 set_tests_properties(test_gallocr_reserve_reuse PROPERTIES LABELS ci)
 set_tests_properties(test_gallocr_reserve_reuse PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+# A graph's layout is its own (ADR-117): the same shape lands at the same offsets before and after a
+# larger graph of the same topology, so a layout-dependent kernel path (the CPU conv fusion) cannot make
+# one input give two results.
+add_executable(test_graph_layout_is_its_own ci/test_graph_layout_is_its_own.cpp)
+target_link_libraries(test_graph_layout_is_its_own PRIVATE loom::engine)
+target_compile_definitions(test_graph_layout_is_its_own PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_graph_layout_is_its_own COMMAND test_graph_layout_is_its_own)
+set_tests_properties(test_graph_layout_is_its_own PROPERTIES LABELS ci)
+set_tests_properties(test_graph_layout_is_its_own PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+
 # --- Phase 3: KV cache / ATTENTION primitive / autoregressive generation ---
 
 add_executable(test_kv_cache ci/test_kv_cache.cpp)
@@ -747,6 +778,12 @@ set_tests_properties(test_e2e_conformer_ctc_mil_export PROPERTIES SKIP_RETURN_CO
 
 # --- CPU vs GPU on the same real encoder (BACKLOG.md P4.7). Skips on a missing fixture AND on a build
 #     with no device backend compiled in, so it is green everywhere it cannot say anything. ---
+add_executable(test_gpu_cumsum_prefix_stable gate/test_gpu_cumsum_prefix_stable.cpp)
+target_link_libraries(test_gpu_cumsum_prefix_stable PRIVATE loom::engine)
+add_test(NAME test_gpu_cumsum_prefix_stable COMMAND test_gpu_cumsum_prefix_stable)
+set_tests_properties(test_gpu_cumsum_prefix_stable PROPERTIES LABELS gate)
+set_tests_properties(test_gpu_cumsum_prefix_stable PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_e2e_device_parity gate/test_e2e_device_parity.cpp)
 target_link_libraries(test_e2e_device_parity PRIVATE loom::engine)
 add_test(NAME test_e2e_device_parity COMMAND test_e2e_device_parity)
@@ -1997,6 +2034,23 @@ target_link_libraries(test_e2e_kyutai_stt_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_kyutai_stt_lua_driver COMMAND test_e2e_kyutai_stt_lua_driver)
 set_tests_properties(test_e2e_kyutai_stt_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
 
+add_executable(test_e2e_kyutai_stream gate/test_e2e_kyutai_stream.cpp)
+target_link_libraries(test_e2e_kyutai_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_kyutai_stream COMMAND test_e2e_kyutai_stream)
+set_tests_properties(test_e2e_kyutai_stream PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+add_executable(test_e2e_nemotron_stream gate/test_e2e_nemotron_stream.cpp)
+target_link_libraries(test_e2e_nemotron_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_nemotron_stream COMMAND test_e2e_nemotron_stream)
+set_tests_properties(test_e2e_nemotron_stream PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+add_executable(test_e2e_nemo_buffered_stream gate/test_e2e_nemo_buffered_stream.cpp)
+target_link_libraries(test_e2e_nemo_buffered_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_nemo_buffered_stream COMMAND test_e2e_nemo_buffered_stream)
+set_tests_properties(test_e2e_nemo_buffered_stream PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+add_executable(test_e2e_nemo_ctc_buffered_stream gate/test_e2e_nemo_ctc_buffered_stream.cpp)
+target_link_libraries(test_e2e_nemo_ctc_buffered_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_nemo_ctc_buffered_stream COMMAND test_e2e_nemo_ctc_buffered_stream)
+set_tests_properties(test_e2e_nemo_ctc_buffered_stream PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
 add_executable(test_e2e_lfm25_audio_asr_lua_driver gate/test_e2e_lfm25_audio_asr_lua_driver.cpp)
 target_link_libraries(test_e2e_lfm25_audio_asr_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_lfm25_audio_asr_lua_driver COMMAND test_e2e_lfm25_audio_asr_lua_driver)
@@ -2127,3 +2181,34 @@ target_include_directories(test_host_primary_lowering PRIVATE ${ggml_SOURCE_DIR}
 target_compile_definitions(test_host_primary_lowering PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_host_primary_lowering COMMAND test_host_primary_lowering)
 set_tests_properties(test_host_primary_lowering PROPERTIES LABELS ci FIXTURES_REQUIRED minimal_gguf_fixture)
+
+add_executable(test_frame_stream ci/test_frame_stream.cpp)
+target_link_libraries(test_frame_stream PRIVATE loom::engine)
+target_compile_definitions(test_frame_stream PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_frame_stream COMMAND test_frame_stream)
+set_tests_properties(test_frame_stream PROPERTIES LABELS ci)
+set_tests_properties(test_frame_stream PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
+
+add_executable(test_e2e_frame_stream gate/test_e2e_frame_stream.cpp)
+target_link_libraries(test_e2e_frame_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_frame_stream COMMAND test_e2e_frame_stream)
+set_tests_properties(test_e2e_frame_stream PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_frame_stream PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_moonshine_stream gate/test_e2e_moonshine_stream.cpp)
+target_link_libraries(test_e2e_moonshine_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_moonshine_stream COMMAND test_e2e_moonshine_stream)
+set_tests_properties(test_e2e_moonshine_stream PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_moonshine_stream PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_transcribe_stream ci/test_transcribe_stream.cpp)
+target_link_libraries(test_transcribe_stream PRIVATE loom::engine)
+target_compile_definitions(test_transcribe_stream PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_transcribe_stream COMMAND test_transcribe_stream)
+set_tests_properties(test_transcribe_stream PROPERTIES LABELS ci)
+set_tests_properties(test_transcribe_stream PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
+
+add_executable(test_e2e_qwen3_asr_stream gate/test_e2e_qwen3_asr_stream.cpp)
+target_link_libraries(test_e2e_qwen3_asr_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_qwen3_asr_stream COMMAND test_e2e_qwen3_asr_stream)
+set_tests_properties(test_e2e_qwen3_asr_stream PROPERTIES LABELS gate SKIP_RETURN_CODE 77)

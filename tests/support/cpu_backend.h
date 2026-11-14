@@ -102,4 +102,13 @@ inline ggml_backend_t test_backend() {
     return cpu_backend();
 }
 
+// The same switch for a test that opens a `loom::Device` (a primary with the CPU behind it, so an op the
+// device lacks still runs) rather than one bare backend: "gpu" when `$LOOM_TEST_DEVICE=gpu`, else "cpu".
+// Unlike `test_backend` it does not fall back -- `Device::open("gpu")` with no GPU is an error, which is
+// the answer a GPU run wants.
+inline const char* test_device_name() {
+    const char* want = std::getenv("LOOM_TEST_DEVICE");
+    return (want != nullptr && std::string(want) == "gpu") ? "gpu" : "cpu";
+}
+
 } // namespace loom_test

@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: host-api
-last_updated: 2026-11-09
+last_updated: 2026-11-14
 ---
 
 # Epic-06: The High-Level API and Its Hosts
@@ -110,9 +110,9 @@ functions in one call, and the one-pass gate then covers the live code.
 
 | Host | Door |
 |---|---|
-| engine | `loom::audio::TranscriptionStream`: `push(samples)` -> ids, `text`, `delta`; `finish()`; `reset()` |
+| engine | `loom::audio::TranscriptionStream`: `push(samples)` -> ids, `text`, `delta`, `revised`; `finish()`; `reset()`; `stream_open` inputs |
 | `loom_cli` | `--wav x.wav --stream MS`: the clip pushed in MS pieces, each new piece of text printed at its audio time |
-| loom-py | `model.speech2text.stream()` -> `TranscriptStream.push(samples)` / `.finish()` -> `TranscriptUpdate` |
+| loom-py | `model.speech2text.stream(**options)` -> `TranscriptStream.push(samples)` / `.finish()` -> `TranscriptUpdate` |
 | engine (tokens out) | `loom::text::GenerationStream`: `next(n)` -> up to n more ids, `generate`'s ids exactly; `reset()` |
 | `loom_cli` | `--prompt ... --stream N [--stream-caches auto\|park\|per-stream]`: N tokens per pull, text printed as drawn |
 | loom-py | `model.text2text.stream(prompt)` / `chat_stream(messages)` -> `TextStream`, iterated for text pieces |
@@ -121,6 +121,9 @@ functions in one call, and the one-pass gate then covers the live code.
 | loom-py | `model.text2speech.stream(text, ...)` -> `SpeechStream` of `Audio` pieces, `exact` saying how it was cut |
 | engine (codec pairs) | `loom::audio::CodecStream`: `push(codes)` -> their samples, given every frame before them; `finish()` |
 | loom-py | `codec.codes2speech.stream(lm.text2codes.stream(text))` -> `Audio` per push, pushes growing 1 to 8 frames |
+| engine (frame rows) | `loom::audio::FrameStream`: `push(samples)` -> the rows of the frames it completed, `first_row`; `finish()` |
+| `loom_cli` | `--wav x.wav --stream MS` on a frame classifier: each change of the most probable label, printed when it is heard |
+| loom-py | `model.speech2class.stream()` / `speech2embeddings.stream()` -> `FrameStream`; each push an `AudioClasses` / `FrameEmbeddings` at stream times |
 
 A file without the three functions keeps its one-pass doors and is refused by the live one; streaming is a
 second door, never a change to the first. Zipformer streaming chunks its front end in the driver: the fbank
@@ -151,6 +154,60 @@ upstream's `generate_audio_stream` decodes. A stream's pieces grow from one fram
 first audio is ready after 0.20 s instead of 3.65 s, at the one-pass speed (1.68x real time, RTF 0.595),
 and the join is within 1.2e-06 of `infer`, which still decodes a chunk per call.
 
+**VoxCPM2 a patch at a time** ([ADR-111](../adrs/adr-111-voxcpm2-streams-a-patch-at-a-time-through-a-state-carrying-vae-step.md)).
+The same cut for a diffusion-AR loop: the AudioVAE runs as `vae_step`, with its 26 causal-conv tails and
+transposed-conv overlaps carried, as upstream's `streaming_decode()` decodes each patch. `infer` and the
+stream run one loop, and each step brings the LMs up to the patch it was handed before drawing, so no graph
+output is read across a call. Pieces grow from one patch (160 ms) to eight. On the dev-box CPU the first
+audio is ready after 3.4 s instead of 49 s, and the join is within 7.0e-07 of `infer`. Unlike `infer`, the
+stream never retries a badcase, because upstream's stream does not.
+
+**CosyVoice3 by re-running, as its reference does** ([ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md)).
+Upstream's `tts(stream=True)` carries no flow state: each hop of tokens (25 plus a prompt pad, then 50, then
+100) it runs the flow over the prompt and every token so far in the DiT's streaming mode (a block-causal mask
+of 50 frames), keeps the new mel, and runs CausalHiFT over all of it, handing out what the next hop cannot
+change. The export does the same. The estimator takes a chunk id per frame (all 0 is full attention), so
+`infer` keeps the non-streaming mode by default and takes `streaming = 1`. A stream joins to that, not to the
+default: the two modes' mels differ by ~5. Because the vocoder's sine phase turns 5e-3 of mel rounding into
+O(1) sample differences, the gate compares a stream's mel with the one pass's (9.1e-4) and checks the vocoder
+on its own (5.5e-06). On the dev-box CPU the first 1.36 s is ready after 46.5 s instead of 141 s.
+
+**Soprano within a sentence** ([ADR-114](../adrs/adr-114-soprano-streams-within-a-sentence-by-decoding-windows-of-hidden-rows.md)).
+Its decoder is local in time (a linear upsample, kernel-3 ConvNeXt blocks, a centred ISTFT), so a piece
+of hidden rows is decoded from a window with the receptive field either side, 3 rows before and 4 after,
+as upstream's `infer_stream` does with 4 and 4. No new graph: the driver cuts the LM loop per draw and keeps
+only the rows a later window reaches. The pieces grow from one row (64 ms) to 16, join to `infer` bit for
+bit, and the first is ready after 0.32 s on the dev box, against 2.4 s for a whole first sentence.
+
+**LFM2.5-Audio's TTS a frame at a time** ([ADR-115](../adrs/adr-115-lfm25-audio-tts-streams-a-frame-at-a-time-by-detokenizing-windows.md)).
+The same cut as Soprano's for a causal detokenizer: each piece's frames go through the existing
+`detokenizer` phase from the backbone's receptive field back (97 rows: 5 convolutions x 2, 3 windowed
+attentions x 29), and the last 480 samples wait for the next frame's ISTFT overlap. The join is within
+1.6e-06 of `infer`; on the dev-box CPU at F32 the first 60 ms is ready after 2.1 s instead of 41 s.
+
+**Voxtral-4B-TTS a frame at a time** ([ADR-116](../adrs/adr-116-voxtral-tts-streams-a-frame-at-a-time-through-its-chunked-causal-codec.md)).
+Its codec is causal and the one pass already decodes it in chunks that re-read 32 frames before them, so
+a piece is that decode started at the first frame not yet handed out, with nothing held back. The join is
+within 4.7e-07 of `infer`; on the workstation's CPU the first 80 ms is ready after 4.4 s instead of 38 s.
+
+**Chatterbox a hop at a time** ([ADR-117](../adrs/adr-117-chatterbox-streams-a-hop-at-a-time-by-re-running-its-full-attention-flow.md)).
+S3Gen is CosyVoice2's flow and keeps its `finalize=False` look-ahead hook but no loop, so the stream is
+CosyVoice2's: each hop re-runs the flow over every token so far and HiFT over all the mel, handing out what
+its last 20 frames cannot change. The flow attends over everything, so no one pass is the join: the stream's
+mel is a mean 0.085 from `infer`'s, where `infer` under another noise draw is 0.378 from it, and T3's tokens
+are the same both ways. On an RTX 5090 the first piece is ready after 0.5 s and the 8 s sentence streams at
+3.0x real time (6.2x in one pass), since both guidance pairs run as one batch of two
+([ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md)). Its gate found an engine defect: a graph built after a larger one took that one's
+allocation plan, and the CPU conv fusion's layout check made the same input round two ways
+([Retro-105](../retros/retro-105-a-graph-laid-out-by-the-graph-before-it.md)).
+
+**SpeechT5 a few mel frames at a time** ([ADR-119](../adrs/adr-119-speecht5-streams-mel-frames-by-vocoding-windows.md)).
+Soprano's cut on a spectrogram: the decoder loop is cut per step, and each piece of frames goes through the
+existing `postnet` and `vocoder` phases over a window holding their receptive field, 34 frames either side,
+derived from the layers. Pieces grow from 2 frames (32 ms) to 256. The join is within f32 rounding of
+`infer` (9.7e-05 on a 21 s text: HiFi-GAN amplifies the CPU convolution's batch-dependent ulps); on the
+dev-box CPU the first 32 ms is ready after 1.7 s, where the one pass takes 22.6 s.
+
 **Codec pairs: two doors, the codec carrying its state** ([ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md)).
 A pair streams as its two files do one pass: the LM's `SpeechStream` hands back each frame of codes as it is
 drawn, and the codec's `CodecStream` decodes pushes as they arrive, with the decoder's state carried by a
@@ -162,6 +219,58 @@ convolutions are windowed and its LSTM's state is carried across pushes (`loom.r
 SNAC's noise is drawn per frame, so a window decodes a frame with the noise it had before. For Qwen3-TTS the talker's stream is its one pass
 bit for bit, the pair's audio is within 1.2e-06 of decoding the same codes in one pass, and the first audio
 comes a frame after the talker draws it (1.58 s on the dev box, where the whole 30-frame generation took 28 s).
+
+**Frame rows: a VAD a frame at a time** ([ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md)).
+A frame classifier or embedder answers through `FrameStream`, cut by its contract as `classify` cuts. Silero
+VAD runs `infer`'s three graphs per push: `frontend` over a window that starts one whole frame back, so the
+64-sample context of each frame is read from inside it, and the LSTM's h and c carried by `run_recurrent`.
+On jfk the rows are 1.9e-06 from one call at any piece size (3.3e-06 from upstream's own frame loop), at 46x
+real time in 32 ms pieces.
+
+**Frame rows by windows: WakeHuBERT and MarbleNet** ([ADR-120](../adrs/adr-120-a-frame-model-with-a-finite-reach-streams-by-windows-over-its-one-pass-graph.md)).
+A single-graph frame model with a finite reach streams through its one-pass graph: a push's frames are that
+graph over a window holding every sample they read, measured at export by a NaN probe of the traced wrapper
+(WakeHuBERT 122 frames back and none ahead; MarbleNet 74 back and 73 ahead, so 1.46 s of latency unless
+`lookahead_frames` trades exactness for it). The synthesized driver gains the stream beside an unchanged
+`infer`; graph and weights stay byte-identical to the published files. Rows are 4.8e-06 (WakeHuBERT) and
+2.4e-07 (MarbleNet) from one call; each 20 ms push recomputes the whole window, 2.0x real time on the dev
+box.
+
+**A re-decoding ASR: Moonshine streaming** ([ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md)).
+Its decoder cross-attends to every encoder row, so no prefix of the transcript is final. The driver keeps
+its whole hypothesis in the state value `hypothesis`, the door shows it as the transcript, and an update
+that changes earlier text is `revised`. The encoder runs over windows of the one-pass graph: a new
+`row_offset` input places the position table, and the margins (93 rows back and 12 ahead for tiny) come
+from the bands and the convolutions. Rows are encoded when a decode needs them, every `update_seconds`
+(0.5 s), and a mid-stream decode teacher-forces the last hypothesis. The stream ends on one call's ids at
+every cut tried. Tiny runs at 2.84x real time on jfk at 100 ms pushes, small at 0.81x (dev-box CPU). The
+cost grows with the stream, since every update re-decodes from its start, so a host opens one stream per
+utterance.
+
+**A frame-synchronous ASR: Kyutai STT** ([ADR-108](../adrs/adr-108-kyutai-stt-streams-its-encoder-with-moshis-state-carried.md)). moshi streams it already, and the
+export now does what moshi does. `mimi_encode_step` carries the encoder's state on the device: each causal conv's
+last inputs, and the transformer's last 250 keys and values, masked as moshi's ring fills two positions at a time.
+`rvq_encode` draws all 32 codes in one graph. The LM takes one step per frame over its ring KV cache. Each step's
+id is final, so the transcript only grows, 0.5 s behind the audio as the model was trained. The stream ends on
+one call's ids. The LM step sets the speed: at Q8_0 the stream is 0.68x real time at 80 ms pushes against 0.70x
+for the one pass (dev-box CPU).
+
+**A cache-aware transducer: Nemotron 3.5 ASR** ([ADR-109](../adrs/adr-109-nemotron-asr-streams-its-cache-aware-encoder-a-chunk-at-a-time.md)).
+The encoder was trained to stream: chunked attention (4 frames, 14 chunks back) and causal convolutions.
+`encoder_step` takes whole 320 ms chunks with its 75 states on the device: each subsampling stage's last column,
+each layer's last 56 keys and values and its conv's last inputs. It is the one-pass encoder frame for frame,
+including the clip's last partial chunk, which `transformers`' own streaming recipe drops. The greedy RNN-T
+decode carries its LSTM state across calls, and its emissions are final, so the stream ends on one call's ids.
+A stream's `language` is the prompt id, which `TranscriptionStream::language_input` resolves from a name
+(`stream(language="de-DE")` in loom-py).
+
+**A buffered transducer: Nemotron-Labs-Unified-ASR** ([ADR-110](../adrs/adr-110-the-unified-asr-streams-the-way-nemos-buffered-streaming-does.md)).
+Its streaming mode is NeMo's buffered loop, not a cache: every step runs the whole model on up to
+`left + chunk + right` seconds (5.6 + 0.56 + 0.56 by default) under a chunked attention mask, and decodes the
+chunk. `encoder_step` is the encoder with that mask, its three sizes inputs, so `stream_open`'s `left_seconds`,
+`chunk_seconds` and `right_seconds` pick the latency (0.16 to 2.08 s). The driver is the script's buffer
+arithmetic. The stream ends on NeMo's streamed ids, which are not the one pass's. Every step re-encodes the
+buffer, so it costs the buffer over the chunk: 0.33x real time at the default on the dev-box CPU.
 
 ### Streaming: which other models can, and how
 
@@ -189,17 +298,19 @@ The kinds of streaming, by how close a streamed result is to the one-pass one:
 | Model | Kind | What it needs |
 |---|---|---|
 | zipformer-small-streaming | exact | **built** (ADR-098); publishes with the rc21 republish |
-| nemotron-3.5-asr-streaming-0.6b | reference's streaming mode (cache-aware: chunked attention, K/V and conv caches) | re-export: the encoder step with its caches; today the export is the offline mode, the whole clip at once |
-| kyutai-stt-1b-en-fr | exact (frame-synchronous) | re-export: Mimi encoder with its conv state and ring KV carried; the LM loop is per frame already |
-| moonshine-streaming-tiny / -small | exact encoder, decoder re-run per update | re-export: incremental encoder (windows (16, 4) and (16, 0), 3 frames lookahead on 4 layers) |
-| silero-vad | exact (LSTMCell state) | re-export: the per-frame cell with its state as an input; today one sweep over the clip |
-| wakehubert-tiny | exact (strictly causal, 2.5 s receptive field) | driver only: re-run over the last 2.5 s per chunk, or a state-carrying re-export |
-| nemotron-labs-unified-asr-0.6b | reference's streaming mode (buffered: chunked masks, 5.6 s left context recomputed per chunk) | re-export: the streaming-mode encoder beside the offline one |
-| qwen3-asr-0.6b | reference's streaming mode (every 2 s, all audio so far re-fed; previous transcript minus its last 5 tokens as prefix; first 2 chunks unprefixed) | driver/host only: a prefix input; cost grows with the stream |
-| oruk-loop-153m | generic: Qwen3-ASR's scheme (its teacher) | as qwen3-asr; no reference streaming mode to grade against |
-| parakeet-tdt-0.6b, parakeet-rnnt-0.6b, canary-1b-v2, conformer-ctc-small, citrinet-1024, citrinet-256-ls | generic: NeMo's buffered chunked inference (overlapping windows, merged tokens) | host: the window + merge loop; Canary's long-form merge ([ADR-063](../adrs/adr-063-a-long-clip-is-decoded-the-way-its-reference-decodes-it.md)) is the nearest code |
+| nemotron-3.5-asr-streaming-0.6b | reference's streaming mode (cache-aware: chunked attention, K/V and conv caches) | **built** (ADR-109): the encoder a few 320 ms chunks per call with its caches carried, the RNN-T decode's state carried; the stream ends on one call's ids, the last partial chunk included; publishes on rc21+ |
+| kyutai-stt-1b-en-fr | exact (frame-synchronous) | **built** (ADR-108): the Mimi encoder a few frames per call with moshi's streaming state carried, the RVQ in one graph, an LM step per frame; the stream ends on one call's ids; publishes on rc21+ |
+| moonshine-streaming-tiny / -small | exact encoder, decoder re-run per update | **built** (ADR-107): encoder windows with its receptive field either side, the hypothesis re-decoded every `update_seconds`; the stream ends on one call's ids; publishes on rc21+ |
+| silero-vad | exact (LSTMCell state) | **built** (ADR-106): `infer`'s graphs per push behind one frame of lead, the cell's h and c carried; publishes on rc21+ |
+| wakehubert-tiny | exact (strictly causal, 2.5 s receptive field) | **built** (ADR-120): the one-pass graph over the last 122 frames (2.44 s) per push, as upstream advises; 4.8e-06 from one call; publishes on rc21+ |
+| nemotron-labs-unified-asr-0.6b | reference's streaming mode (buffered: chunked masks, 5.6 s left context recomputed per chunk) | **built** (ADR-110): the encoder over each buffer under the chunked mask, NeMo's buffer arithmetic in the driver; the stream ends on NeMo's streamed ids; publishes on rc21+ |
+| qwen3-asr-0.6b | reference's streaming mode (every 2 s, all audio so far re-fed; previous transcript minus its last 5 tokens as prefix; first 2 chunks unprefixed) | **built** (ADR-121): upstream's loop in the driver, the prefix cut from the answer's re-encoded text (`loom.tokenize`/`detokenize`); only the 8 s encoder window still filling is re-encoded and prefilled; every update upstream's on 13 clips in six languages, 2-60 s; refused past the decoder cache (~4 min); publishes on rc21+ |
+| oruk-loop-153m | generic: Qwen3-ASR's scheme (its teacher) | **built** (ADR-121): the same fragment, graded against its teacher's loop through its kept vocabulary; refused past its 1024-position cache (~45 s) |
+| parakeet-tdt-0.6b, parakeet-rnnt-0.6b | reference's buffered streaming (`speech_to_text_streaming_infer_rnnt.py`: the model over left + chunk + right, 10/2/2 s, the chunk's rows decoded with the label-looping state carried) | **built** (ADR-122): ADR-110's loop, shared, over the one-pass `encoder`; the stream decode reads TDT durations and carries NeMo's `time_jumps`; ends on NeMo's streamed ids at four latencies, 3-60 s; below ~1 s of right context NeMo's own stream collapses (the encoder rows, not the decode); publishes on rc21+ |
+| conformer-ctc-small, citrinet-1024, citrinet-256-ls | reference: NeMo's `FrameBatchASR` (`speech_to_text_buffered_infer_ctc.py`, r2.6: the clip's raw mel 1.6 s at a time into a 4 s buffer normalised over itself, each buffer's middle kept, one CTC merge); the user chose it over NeMo 3.0's `BufferedCTCPipeline` (end-of-utterance heuristics) | **built** (ADR-123): the leaf multi-phase (`ctc` the one pass, `raw_mel`, `ctc_buffer` on the same weights), the loop in the driver; all three end on NeMo's buffered ids at three sizes, 3-60 s; publishes on rc21+ |
+| canary-1b-v2 | reference: `speech_to_text_aed_streaming_infer.py` (AlignAtt or wait-k over a left/chunk/right buffer; AlignAtt reads the decoder's cross-attention) | driver + a decoder output for the cross-attention |
 | whisper-small, moonshine-tiny, granite-speech-4.0-1b, lfm2.5-audio-1.5b-asr, sensevoice-small, paraformer-zh, gigaam-v3-rnnt, hubert-large-ls960-ft, data2vec-audio-base-960h | generic: re-decode a growing or sliding window | host only |
-| marblenet-vad-v2 | generic: sliding window (finite receptive field, with lookahead) | driver only |
+| marblenet-vad-v2 | generic: sliding window (finite receptive field, with lookahead) | **built** (ADR-120): the one-pass graph over windows of 74 frames back and 73 ahead (1.46 s of latency), 2.4e-07 from one call; `lookahead_frames` trades exactness for latency; publishes on rc21+ |
 | pyannote-segmentation-3.0 | generic: rolling 10 s windows (diart-style) | host only |
 
 Not streamable in a useful sense: titanet-large and ecapa-voxlingua107 (one embedding per utterance), and
@@ -222,15 +333,15 @@ the text classifiers distilbert-ner and punctuate-all (whole text in, labels out
 | pocket-tts, pocket-tts-18m / -7m / -2m | exact: AR latents, causal Mimi decoder (`generate_audio_stream`) | **per frame: built** (ADR-101; a sentence chunk per piece with `piece_frames = 0`, ADR-100), after a re-export |
 | qwen3-tts-12hz-0.6b + qwen3-tts-tokenizer-12hz | exact: AR frames, causal codec | **built** (ADR-102): the talker hands back a frame per pull, the codec decodes pushes with its state carried; after a re-export of both |
 | audio8-tts-realistic-0.6b + audio8-tts-codec | exact by construction: AR frames; codec all causal (convs, transposed convs, window-128 transformer) | **built** (ADR-102): the talker hands back a frame per pull, the codec decodes pushes with its state carried; after a re-export of both. Upstream's own code has no streaming entry point |
-| voxcpm2 | exact: `generate_streaming`, the AudioVAE's `streaming_decode` carries causal-conv state per patch | re-export: the VAE decoder step with its state |
+| voxcpm2 | exact: `generate_streaming`, the AudioVAE's `streaming_decode` carries causal-conv state per patch | **per patch: built** (ADR-111): `vae_step` with its 26 conv states carried, pieces of 1, 2, 4, then 8 patches; 7.0e-07 from one pass; never retries a badcase, as upstream's stream does not; publishes on rc21+ |
 | moss-tts-local-transformer-v1.5 + moss-audio-tokenizer-v2 | exact: causal-transformer codec with streaming encode/decode (ring KV per layer) | **built** (ADR-103): the codec's six transformer stages each over a ring KV cache of its own, the talker a frame per pull; after a re-export of both |
-| voxtral-4b-tts-2603 | exact: chunked codec equals one call | driver: emit each `codec_chunk` as it is made |
-| soprano-1.1-80m | exact: `infer_stream` re-runs the decoder over hidden states with a receptive-field margin ("lossless") | **per sentence: built** (ADR-100), after a re-export. Within a sentence: driver only, the decoder phase takes any length already |
-| lfm2.5-audio-1.5b-tts | exact up to one ISTFT hop: detokenizer is LFM2 with a causal window of 30, then a 'same' ISTFT | driver: chunked detokenize with a hop of lookahead |
-| fun-cosyvoice3-0.5b | reference's streaming mode ("bi-streaming": chunk-aware flow mask, HiFT cache) | re-export: the streaming flow and HiFT; the export rewrote only the cache-less call |
-| chatterbox | generic: S3Gen's flow has a `finalize` lookahead hook, but the `S3GenStreamer` its docstring names is not shipped | driver: chunked flow + vocoder with overlap |
+| voxtral-4b-tts-2603 | exact: chunked codec equals one call | **per frame: built** (ADR-116): the one pass's chunked causal decode started at the first new frame, 32 frames of context; pieces of 1, 2, 4, then 8 frames; 4.7e-07 from `infer`; publishes on rc21+ |
+| soprano-1.1-80m | exact: `infer_stream` re-runs the decoder over hidden states with a receptive-field margin ("lossless") | **within a sentence: built** (ADR-114): the decoder over windows of rows with its receptive field either side (3 rows before, 4 after), pieces of 1, 2, 4, 8, then 16 rows; bit-identical to `infer`; first 64 ms after 0.32 s on the dev box; publishes on rc21+ (a sentence per piece: ADR-100) |
+| lfm2.5-audio-1.5b-tts | exact up to one ISTFT hop: detokenizer is LFM2 with a causal window of 30, then a 'same' ISTFT | **per frame: built** (ADR-115): the detokenizer over windows from its 97-row receptive field back, 480 samples held for the next frame's overlap; pieces of 1, 2, 4, then 8 frames; 1.6e-06 from `infer`; publishes on rc21+ |
+| fun-cosyvoice3-0.5b | reference's streaming mode: the flow re-run per hop under a chunk mask, HiFT over all the mel with the last 8 frames withheld | **per hop: built** (ADR-112): the estimator takes chunk ids, the stream joins to `infer` `streaming = 1` (mel 9.1e-4), not to the full-attention default (~5 apart); publishes on rc21+ |
+| chatterbox | generic: S3Gen keeps CosyVoice2's `finalize` look-ahead hook (broken as shipped: the mask is not trimmed), but no loop; the `S3GenStreamer` its docstring names is not shipped; flow attends over everything | **per hop: built** (ADR-117): CosyVoice2's re-run loop, hops of 25, 50, then 100 tokens with 3 of look-ahead; HiFT re-run over all the mel, its last 20 frames held; the mel 1.3e-05 from the same loop in PyTorch and a mean 0.085 from `infer` (another noise draw: 0.378); publishes on rc21+ |
 | dia-1.6b, musicgen-small | generic: AR codes, non-causal codec (DAC, EnCodec 32 kHz `use_causal_conv: false`) | **built** (dia ADR-103, musicgen-small ADR-104): the talker hands back a frame once every delayed channel has reached it; DAC decodes windows with 16 frames of context each side, which its receptive field makes one call's result to f32 rounding; EnCodec windows its convolutions (3 frames before the LSTM, 1 after) and carries the LSTM's h and c |
-| speecht5-tts | generic: AR mel frames, HiFi-GAN over a window | driver: vocode overlapping mel windows |
+| speecht5-tts | generic: AR mel frames, HiFi-GAN over a window | **per few frames: built** (ADR-119): the postnet + HiFi-GAN over windows holding their 34-frame receptive field either side; pieces of 2, 4, ... then 256 frames; 9.7e-05 from `infer` on a 21 s text; publishes on rc21+ |
 | kokoro-82m, vits-piper-en-gb-miro, matcha-tts-ljspeech, styletts2-ljspeech, f5-tts-v1-base, supertonic-2, sanotts, vocetta2-276k, vocetta2-500k, vocetta2-1m, vaniq-edge, auroratts-100k | generic: non-AR, the whole utterance at once; sentence by sentence (Kokoro's own `KPipeline` yields per chunk) | host only: **built** in loom-py (`text2speech.stream`, `exact=False`): the text split, each sentence's audio yielded |
 | dac-44khz, encodec-32khz, snac-24khz (codecs alone) | generic: non-causal decoders (SNAC also injects noise) | **built**: dac-44khz (ADR-103, windows of its one-pass graph), encodec-32khz and snac-24khz (ADR-104: windows round EnCodec's carried LSTM; SNAC's windows with its noise drawn per frame, 3 coarse frames each side) |
 
@@ -251,7 +362,11 @@ ADR-099):
    re-export even where no weight changes: the driver is in the GGUF.
 2. **A door per direction:** built. `TranscriptionStream` is audio in, `GenerationStream` tokens out and
    `SpeechStream` audio out; a codec pair is a text-to-codes `SpeechStream` composed with a `CodecStream`
-   by the host (ADR-102).
+   by the host (ADR-102); a frame classifier or embedder answers through `FrameStream` (ADR-106); a
+   re-decoding recognizer keeps its `hypothesis` in the state (ADR-107); a frame-synchronous one appends a final
+   id per frame (Kyutai STT, ADR-108), as a cache-aware transducer does per chunk (Nemotron 3.5 ASR, ADR-109) and a buffered one per buffer
+   (the unified ASR, ADR-110), and a speech LM re-decodes all its audio with the last answer as the reply's start, re-encoding
+   only the encoder window still filling (Qwen3-ASR, ADR-121).
 3. **Per-call context in the stream state** for the decode loops that have it (Whisper's and T5's
    encoder output, a speech LM's built prompt), so their `PrefillDecodeLoop` can be cut per token too.
 4. **A chunked front end per family**, as Zipformer's windowed fbank: mel phases still run over the
@@ -275,8 +390,8 @@ fixture set is kept for exactly this reason; `v5` is the contract-declaring set.
 | | |
 |---|---|
 | Authority | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) |
-| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md) (per-module ring caches; MOSS-TTS, Dia), [ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md) (a carried LSTM, per-frame noise; MusicGen, EnCodec, SNAC), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md), [Retro-104](../retros/retro-104-a-state-value-that-dropped-its-named-keys.md) (a stream's state value dropped its named keys) |
+| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md) (per-module ring caches; MOSS-TTS, Dia), [ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md) (a carried LSTM, per-frame noise; MusicGen, EnCodec, SNAC), [ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md) (frame rows; Silero VAD), [ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md) (a re-decoding ASR; Moonshine streaming), [ADR-108](../adrs/adr-108-kyutai-stt-streams-its-encoder-with-moshis-state-carried.md) (Kyutai STT's encoder state carried), [ADR-109](../adrs/adr-109-nemotron-asr-streams-its-cache-aware-encoder-a-chunk-at-a-time.md) (Nemotron 3.5 ASR's cache-aware encoder), [ADR-110](../adrs/adr-110-the-unified-asr-streams-the-way-nemos-buffered-streaming-does.md) (the unified ASR's buffered streaming), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md), [ADR-111](../adrs/adr-111-voxcpm2-streams-a-patch-at-a-time-through-a-state-carrying-vae-step.md) (VoxCPM2 a patch at a time), [ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md) (CosyVoice3 a hop at a time), [ADR-114](../adrs/adr-114-soprano-streams-within-a-sentence-by-decoding-windows-of-hidden-rows.md) (Soprano within a sentence), [ADR-115](../adrs/adr-115-lfm25-audio-tts-streams-a-frame-at-a-time-by-detokenizing-windows.md) (LFM2.5-Audio a frame at a time), [ADR-116](../adrs/adr-116-voxtral-tts-streams-a-frame-at-a-time-through-its-chunked-causal-codec.md) (Voxtral-4B-TTS a frame at a time), [ADR-117](../adrs/adr-117-chatterbox-streams-a-hop-at-a-time-by-re-running-its-full-attention-flow.md) (Chatterbox a hop at a time), [ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md) (its guidance as one batch), [ADR-119](../adrs/adr-119-speecht5-streams-mel-frames-by-vocoding-windows.md) (SpeechT5 a few mel frames at a time), [ADR-120](../adrs/adr-120-a-frame-model-with-a-finite-reach-streams-by-windows-over-its-one-pass-graph.md) (WakeHuBERT and MarbleNet by windows over the one-pass graph), [ADR-121](../adrs/adr-121-qwen3-asr-streams-the-way-its-reference-does-re-encoding-only-what-changed.md) (Qwen3-ASR's re-feed loop, only changed windows re-encoded), [ADR-122](../adrs/adr-122-parakeet-streams-the-way-nemos-buffered-script-does.md) (Parakeet's buffered streaming, the loop shared with the unified ASR), [ADR-123](../adrs/adr-123-a-nemo-ctc-model-streams-the-way-framebatchasr-does.md) (the NeMo CTC models as FrameBatchASR runs them) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md), [Retro-104](../retros/retro-104-a-state-value-that-dropped-its-named-keys.md) (a stream's state value dropped its named keys), [Retro-105](../retros/retro-105-a-graph-laid-out-by-the-graph-before-it.md) (a graph laid out by the graph before it) |
 | Active tasks | [Backlog → Host API](../backlog/active-index.md#host-api) |
 
 ## 4. The Record

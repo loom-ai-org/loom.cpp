@@ -70,7 +70,8 @@ there too.
   three: the RTX 5090's coopmat2, its KHR coopmat (`GGML_VK_DISABLE_COOPMAT2=1`), and the plain fp16
   shaders (Intel Arc iGPU, Radeon Vega 3). **Not run:** Metal's tensor-API fallback, since no M5-class
   device is available; a hub item tracks it.
-* The CPU and CUDA ignore the tag for F32, so their numbers and outputs are unchanged.
+* The CPU ignores the tag for F32, so its numbers and outputs are unchanged. (So does stock CUDA, but it
+  was never exact either; see the 2026-11-12 amendment.)
   `test_graph_builder_shapes` checks the tag itself (and goes red with the pass removed), since no CI
   machine has a GPU.
 * **Amendment 2026-10-09: an F32 x F32 `CONV_2D` asks too.** Vulkan's conv2d coopmat2 and KHR-coopmat
@@ -84,3 +85,13 @@ there too.
   conv_2d in F32 already. Cost on the 5090 under Vulkan: Supertonic-2 39.8 → 44.8 ms, Citrinet-1024
   14.1 → 15.9 ms, F5-TTS 2558 → 2598 ms, whisper-small and Parakeet-TDT unchanged. Devices without
   a coopmat conv path (Vega 3, Arc iGPU) already ran the scalar shader and are bit-identical.
+* **Amendment 2026-11-12: CUDA honours it too, for TF32.** "CUDA computes in F32" was wrong. ggml-cuda
+  creates every cuBLAS handle with `CUBLAS_TF32_TENSOR_OP_MATH`, and MMF's F32 tiles are TF32 `mma`, so a
+  product with more than 8 columns multiplied with a 10-bit mantissa. On an RTX 5090 that moved
+  CosyVoice3's pinned LM draws at step 7 and put its 10-step ODE mel 0.40 from the reference. `ggml-0063`
+  makes a tagged product use `CUBLAS_DEFAULT_MATH` and skip MMF ([UPSTREAM.md](../../cmake/patches/UPSTREAM.md)
+  PR 58). The decision is per product, read from the tag at run time, as on Vulkan and Metal. Since this
+  pass tags every F32 x F32 product, loom uses no TF32 at all. Cost on the 5090: CosyVoice3's flow +34%
+  on the same tokens, the sentence about 9%. An export that wants TF32's rate back has the same route
+  as for fp16 on Vulkan: weights in a type the tag does not cover.
+

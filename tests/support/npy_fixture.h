@@ -41,6 +41,10 @@ inline std::vector<float> read_npy_f32(const std::string& path, std::vector<int6
     // transposed view -- `astype` keeps the layout -- so the fix belongs in the generator
     // (`np.ascontiguousarray`), and this check is what makes forgetting it loud.
     LOOM_CHECK(header.find("'fortran_order': True") == std::string::npos);
+    // **So is anything but little-endian float32.** An int32 file's bytes read as floats are denormals
+    // near zero, the right count of them: CosyVoice3's stream gate fed its LM text ids of 1e-43 that way,
+    // and the first sign was a flow grid four tokens short, 30 lines of driver later (2026-11-12).
+    LOOM_CHECK(header.find("'descr': '<f4'") != std::string::npos);
     const size_t shape_pos = header.find("'shape':");
     const size_t paren_open = header.find('(', shape_pos);
     const size_t paren_close = header.find(')', paren_open);

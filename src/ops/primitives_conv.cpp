@@ -271,9 +271,18 @@ Outputs conv_1d_grouped(PrimitiveContext& pc, ggml_tensor* kernel, ggml_tensor* 
     const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
     const int64_t K = kernel->ne[0], N = data->ne[2];
     const int64_t OL = (data->ne[0] + 2 * p0 - d0 * (K - 1) - 1) / s0 + 1;
+    //
+    // The bound is the CPU's. On a device the per-group loop is the slow side at any size: CosyVoice3's DiT
+    // has two K = 31 convolutions at groups = 16 over 1024 channels, and on an RTX 5090 they ran as 32
+    // direct CONV_2Ds and 30 CONCATs per estimator call, ~15% of the flow (2026-11-12) -- where a 79 MB
+    // im2col and one batched product is a few hundred microseconds. A device primary takes this path up
+    // to 64M im2col elements (256 MB): the DiT's guided batch of two is 39M (ADR-113).
+    const bool host_primary = pc.backends.primary == nullptr ||
+        ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(pc.backends.primary));
+    const int64_t im2col_limit = host_primary ? (int64_t{1} << 20) : (int64_t{1} << 26);
     if (!folded && !conv_kernel_is_packed(kernel) &&
         (kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16) && data->type == GGML_TYPE_F32 &&
-        data->ne[3] == 1 && ic * K * OL * N <= (int64_t{1} << 20)) {
+        data->ne[3] == 1 && ic * K * OL * N <= im2col_limit) {
         // The kernel as im2col's shape carrier: [K, IC, OC/G] has exactly its element count.
         ggml_tensor* carrier = ggml_reshape_3d(pc.ctx, kernel, K, ic, oc_per_group);
         ggml_tensor* im2col = ggml_im2col(pc.ctx, carrier, data, s0, 0, p0, 0, d0, 0, /*is_2D=*/false,

@@ -39,6 +39,13 @@ set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 # pick this up -- ggml's own `option(GGML_LLAMAFILE ...)` would otherwise keep the OFF already in its
 # cache and nothing would say so -- and the LOOM_ option is so that A/B-ing a GEMM change is a
 # `-D` flag rather than an edit to this file.
+# CUDA graphs, which a standalone ggml defaults OFF (`GGML_CUDA_GRAPHS_DEFAULT`) and llama.cpp turns on. A
+# decode loop reuses its graph within a KV bucket (P4.0.15), so ggml-cuda can capture a step once and
+# replay it: on an RTX 5090, 216 of CosyVoice3's 224 LM steps replayed a captured graph, and the LM went
+# 2.8 -> 2.5 ms a token (2026-11-12). Inert without GGML_CUDA; FORCE for the same reason as below.
+option(LOOM_CUDA_GRAPHS "Build ggml-cuda with CUDA graph capture and replay" ON)
+set(GGML_CUDA_GRAPHS ${LOOM_CUDA_GRAPHS} CACHE BOOL "" FORCE)
+
 option(LOOM_TINYBLAS "Build ggml's tinyBLAS (llamafile) GEMM path into the CPU backend" ON)
 set(GGML_LLAMAFILE ${LOOM_TINYBLAS} CACHE BOOL "" FORCE)
 

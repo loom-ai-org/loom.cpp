@@ -73,6 +73,7 @@
 #include "loom/core/text_classify.h"
 #include "loom/core/audio_classify.h"
 #include "loom/core/transcribe.h"
+#include "loom/core/frame_stream.h"
 #include "loom/core/speech_stream.h"
 #include "loom/core/transcribe_stream.h"
 

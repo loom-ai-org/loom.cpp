@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-09
+last_updated: 2026-11-14
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -241,10 +241,15 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 * [ ] **`log_softmax` lowers as `log(softmax(x))`** (coremltools' torch frontend), which is -inf below
   about -103 in f32. Canary's head stops before it; the CTC heads still carry it. Harmless for an argmax,
   wrong as a tensor. A stable form needs a row max the engine has no primitive for.
+* [ ] **Nemotron 3.5 ASR at Q8_0: a one-chunk stream call drifts.** `encoder_step` on 4 rows is 0.376 from the F32
+  encoder where the one call and 2+ chunks per call are 0.148 (f5_tts_ref, dev-box AVX2); ids still matched on
+  two clips. Find the op that is less accurate at 4 rows before a Q8_0 file is published. *Context:
+  [ADR-109](../adrs/adr-109-nemotron-asr-streams-its-cache-aware-encoder-a-chunk-at-a-time.md)*
 * [ ] **Kyutai STT and LFM2.5-Audio are published at F32** (rc14, 2026-10-02): at F32 Kyutai runs
   about 5x slower than real time on the 2-core box and LFM2.5's two files are 5.2 and 5.5 GB. Measure
   Q8_0 against each gate (`test_e2e_kyutai_stt_lua_driver`, `test_e2e_lfm25_audio_{asr,tts}_lua_driver`,
-  whose reference scripts are in `scripts/`) and republish if the transcripts and codes hold.
+  whose reference scripts are in `scripts/`) and republish if the transcripts and codes hold. Kyutai Q8_0 on jfk
+  (2026-11-11, ADR-108): the same text as F32, one pass 0.70x real time (RTF 1.44) against F32's 0.26x.
 * [ ] **LFM2.5-Audio's interleaved speech-to-speech door** (`generate_interleaved`, text and audio in a
   fixed 6:12 pattern, multi-turn chat) -- not requested; the TTS door's phases are all it needs, plus
   an audio-in prompt segment (the ASR door's encoder) and the interleave schedule in the driver.
@@ -375,6 +380,14 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — correctness
 
+* [ ] **The hybrid path still lays a graph out by the graph before it.** `GraphBuilder::allocate_scheduled`
+  hands `ggml_backend_sched_alloc_graph` the graph, and the scheduler's gallocr re-plans only when it does not
+  fit, as the CPU path did until [Retro-105](../retros/retro-105-a-graph-laid-out-by-the-graph-before-it.md).
+  Not seen to bite (the conv fusion that read the layout is CPU-only, and CosyVoice3's CUDA stream
+  interleaved bit-identically), but a layout-dependent kernel on a device would. The fix is a
+  `ggml_backend_sched_reserve` per rebuild, held back because P4.46's re-split retry for the vc4 pool sits on
+  that path and needs a Pi to check.
+
 * [ ] **`RANGE_1D` with a negative step returns -1 elements, silently.** `op_range_1d` forces `end > start` so `ggml_arange` (which asserts it and has no negative steps) cannot abort, so `arange(T - 1, -T, -1)` becomes `arange(start, start + 1, -1)`; the first error is a downstream RESHAPE. Lower a negative step as `start + step * arange(0, n)` with `n = ceil((end - start) / step)`, and throw on an empty range rather than inventing one element. Nemotron ASR's export avoids it so its file runs on released wheels. *Context: [Retro-079](../retros/retro-079-the-references-default-path-was-the-broken-one.md)*
 * [ ] **Who still depends on the layout-"healing" heuristics?** The guards make size-guessing
   *unreachable for already-correct graphs*; they do not remove it, and `op_repeat`'s two branches are
@@ -406,6 +419,22 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   shape of bug one op over.*
 
 ## Engine — performance
+
+* [ ] **Chatterbox's remaining CPU gap to PyTorch.** Workstation CPU (Core Ultra 9 285K, 8 performance + 16
+  efficiency cores), 8 s of audio: upstream PyTorch 12.5 s; loom 16.25 s at 16 threads and 20.4 s at its default
+  24, after [ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md) batched both
+  guidance pairs (T3 is now ahead of PyTorch per token). Two parts, measured separately:
+  * *The default thread count on a hybrid CPU* (about 4 s). `default_cpu_thread_count()` is the physical core
+    count, 24 here, and every node's barrier then waits on the slow cores: the batched T3 step is 61 ms at 24
+    threads and 44 at 16. The estimator goes the other way (4.1 s at 24, 4.9 at 16). Measure across the zoo before
+    choosing a rule (performance cores only? a count per graph?); read
+    [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) first.
+  * *The estimator* (about 1.5-2.3 s). The flow's 10 guided steps take 4.0 s at 24 threads where upstream's take
+    2.6 s, the same batch of two: a compute-bound U-Net (convolutions, 12 transformer blocks over ~700 frames),
+    so ggml's F32 GEMM and conv paths on these shapes. Profile per op with one thread before guessing.
+
+  Kit on the workstation: `/mnt/datasets/loom-chatterbox-prof/` (the English checkpoint, `torch_baseline.py`,
+  `timer_patch.py` for per-module wall times in the bridge, `mm_bench.cpp`); a re-export takes ~100 s.
 
 * [ ] **P4.35/P4.36 follow-ups.** P4.35-P4.39 are merged (#89-#93, 2026-10-23), and their record is
   [Epic-05](../epics/epic-05-edge-performance.md#p435-p439-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22), ADR-082 and ADR-083. Two things are still open. (1) A job owning
@@ -950,11 +979,70 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   ([ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md): a module may declare a ring KV
   cache of its own; DAC decoded in windows), and MusicGen with EnCodec, and SNAC alone
   ([ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md): EnCodec's LSTM
-  carried across pushes by `run_recurrent`'s `carry`, its convolutions windowed; SNAC's noise drawn per frame).
-  Next: the other audio-out rows (VoxCPM2, Voxtral, LFM2.5-Audio, CosyVoice3, Chatterbox, SpeechT5), the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  carried across pushes by `run_recurrent`'s `carry`, its convolutions windowed; SNAC's noise drawn per frame),
+  and Silero VAD through a fifth door, `FrameStream`, audio in and rows out
+  ([ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md): 1.9e-06 from one call),
+  and Moonshine streaming tiny and small, which re-decode
+  ([ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md): the hypothesis in the
+  state, encoder windows; the stream ends on one call's ids; small is 0.81x real time on the dev-box CPU),
+  and Kyutai STT, frame-synchronous
+  ([ADR-108](../adrs/adr-108-kyutai-stt-streams-its-encoder-with-moshis-state-carried.md): moshi's encoder state
+  carried on the device, the RVQ in one graph; Q8_0 0.68x real time on the dev-box CPU, as fast as its one pass),
+  and Nemotron 3.5 ASR, cache-aware
+  ([ADR-109](../adrs/adr-109-nemotron-asr-streams-its-cache-aware-encoder-a-chunk-at-a-time.md): the encoder a few
+  320 ms chunks per call with its caches carried; the stream ends on one call's ids; a stream's language by name),
+  and the unified ASR, buffered
+  ([ADR-110](../adrs/adr-110-the-unified-asr-streams-the-way-nemos-buffered-streaming-does.md): NeMo's streaming
+  loop, its latency a stream option; ends on NeMo's streamed ids; 0.33x real time at the default on the dev-box CPU),
+  and VoxCPM2, a patch at a time
+  ([ADR-111](../adrs/adr-111-voxcpm2-streams-a-patch-at-a-time-through-a-state-carrying-vae-step.md): the AudioVAE's
+  conv state carried; first 160 ms after 3.4 s where the one pass takes 49 s on the dev-box CPU),
+  and CosyVoice3, a hop of tokens at a time
+  ([ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md):
+  upstream's streaming mode, the flow re-run per hop under the DiT's chunk mask; so it joins to `infer` with
+  `streaming = 1`, not the default; first 1.36 s after 46.5 s where the one pass takes 141 s on the dev-box CPU),
+  and Soprano within a sentence
+  ([ADR-114](../adrs/adr-114-soprano-streams-within-a-sentence-by-decoding-windows-of-hidden-rows.md): the decoder
+  over windows of rows with its receptive field either side; bit-identical to `infer`; first 64 ms after 0.32 s),
+  and LFM2.5-Audio's TTS a frame at a time
+  ([ADR-115](../adrs/adr-115-lfm25-audio-tts-streams-a-frame-at-a-time-by-detokenizing-windows.md): the detokenizer
+  over windows from its receptive field back; first 60 ms after 2.1 s where the one pass takes 41 s on the dev-box CPU),
+  and Voxtral-4B-TTS a frame at a time
+  ([ADR-116](../adrs/adr-116-voxtral-tts-streams-a-frame-at-a-time-through-its-chunked-causal-codec.md): the one
+  pass's chunked causal codec decode, started at the first new frame; first 80 ms after 4.4 s where the one pass
+  takes 38 s on the workstation's CPU),
+  and Chatterbox a hop at a time
+  ([ADR-117](../adrs/adr-117-chatterbox-streams-a-hop-at-a-time-by-re-running-its-full-attention-flow.md):
+  CosyVoice2's re-run loop over S3Gen's `finalize` hook, HiFT re-run with 20 frames held; its flow attends over
+  everything, so the join is not `infer`'s audio but nearer it than another noise draw; first 0.6 s after 37 s
+  where the one pass takes 126 s on the dev-box CPU; RTX 5090: 49/49, first piece after 0.5 s, the stream 3.0x real time; both guidance pairs one batch of two since
+  [ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md)),
+  and SpeechT5 a few mel frames at a time
+  ([ADR-119](../adrs/adr-119-speecht5-streams-mel-frames-by-vocoding-windows.md): the postnet + HiFi-GAN over
+  windows of its 34-frame receptive field either side; first 32 ms after 1.7 s where the one pass takes 22.6 s
+  on the dev-box CPU; every audio-out row of the survey is now built),
+  and WakeHuBERT and MarbleNet a frame at a time
+  ([ADR-120](../adrs/adr-120-a-frame-model-with-a-finite-reach-streams-by-windows-over-its-one-pass-graph.md): the
+  one-pass graph over windows holding each frame's measured reach; `FrameStream` takes `stream_open` options,
+  MarbleNet's `lookahead_frames`). Open there: a state-carrying WakeHuBERT step if a device needs 20 ms pushes
+  cheaper than recomputing 2.4 s of context (2.0x real time on the dev box),
+  and Qwen3-ASR and oruk-loop the way `streaming_transcribe` re-feeds everything
+  ([ADR-121](../adrs/adr-121-qwen3-asr-streams-the-way-its-reference-does-re-encoding-only-what-changed.md):
+  the prefix cut from text through `loom.tokenize`/`detokenize`; only the 8 s encoder window still filling
+  re-encoded, the decoder's keys over the rest kept; 0.37x real time on 30 s on the dev-box CPU where re-feeding
+  is 0.22x; the prefix still grows, as upstream's).
+  Parakeet TDT and RNN-T stream as NeMo's buffered script does
+  ([ADR-122](../adrs/adr-122-parakeet-streams-the-way-nemos-buffered-script-does.md): ADR-110's loop shared, TDT's
+  jump carried; NeMo's ids at four latencies).
+  Conformer-CTC and both Citrinets stream as NeMo's `FrameBatchASR` does
+  ([ADR-123](../adrs/adr-123-a-nemo-ctc-model-streams-the-way-framebatchasr-does.md): the leaf multi-phase, its
+  driver's mel checked step by step).
+  Next: Canary (AlignAtt), the re-decoding rows, pyannote, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
-  No GPU has run either door yet; the per-stream cache mode is what `Auto` picks there.
+  CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,
+  after the native RSQRT, ggml-0063 (no TF32 for a tagged product) and ggml-0064 (a prefix-stable cumsum). Chatterbox's is the second
+  (49/49, 2026-11-13); no other stream has been gated on one (Voxtral's ran there through `loom_cli`); the per-stream cache mode is what `Auto` picks there.
   The user asked that every model amenable to streaming gets it, name or no name (2026-11-08).
 
 * [ ] **lfm2-350m-modular re-feeds the whole sequence every token.** Its per-layer export carries no KV

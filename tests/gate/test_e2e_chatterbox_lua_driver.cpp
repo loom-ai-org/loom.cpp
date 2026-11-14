@@ -21,6 +21,7 @@
 //
 // Fixtures:
 //   LOOM_CHATTERBOX_GGUF     chatterbox.gguf  -- `loom-export ~/Dev/models/chatterbox -o chatterbox.gguf`
+//   LOOM_TEST_DEVICE=gpu     run it on the GPU (the CPU otherwise)
 //   LOOM_CHATTERBOX_REF_DIR  chatterbox_ref/  -- text_ids.npy, noise.npy, nsf_phase.npy, nsf_noise.npy,
 //                                                wave.npy and meta.json from
 //                                                scripts/chatterbox_reference.py
@@ -28,6 +29,7 @@
 #include "test_util.h"
 #include "fixtures.h"
 #include "npy_fixture.h"
+#include "cpu_backend.h"
 
 #include "loom/loom.h"
 
@@ -77,7 +79,8 @@ int main() {
     const auto ref_wave = loom_test::read_npy_f32(ref_dir + "/wave.npy", shape);
     LOOM_CHECK(ref_ids.size() > 2 && !noise.empty() && nsf_phase.size() == 9 && !ref_wave.empty());
 
-    loom::Device device = loom::Device::open("cpu");
+    loom::Device device = loom::Device::open(loom_test::test_device_name());
+    std::fprintf(stderr, "device: %s\n", device.name().c_str());
     auto model = loom::GgufModel::load(gguf_env, device.backends().primary);
     LOOM_CHECK(model != nullptr);
 
