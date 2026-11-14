@@ -1,5 +1,6 @@
 #include "loom/core/lua_bridge.h"
 
+#include "loom/core/bpe_vocab.h"
 #include "loom/core/duration_aligner.h"
 #include "loom/core/graph_builder.h"
 #include "loom/core/conv_state_cache.h"
@@ -2535,6 +2536,7 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"argmax_row_range", &LoomLuaBridge::l_argmax_row_range},
         {"argmax_rows", &LoomLuaBridge::l_argmax_rows},
         {"sample_row", &LoomLuaBridge::l_sample_row},     {"seed_rng", &LoomLuaBridge::l_seed_rng},
+        {"tokenize", &LoomLuaBridge::l_tokenize},         {"detokenize", &LoomLuaBridge::l_detokenize},
         {"gaussian_array", &LoomLuaBridge::l_gaussian_array},
         {"uniform_array", &LoomLuaBridge::l_uniform_array},
         {"expand_by_duration", &LoomLuaBridge::l_expand_by_duration},
@@ -2559,6 +2561,47 @@ LoomLuaBridge::~LoomLuaBridge() {
 void LoomLuaBridge::register_module(const std::string& name, GgufModel& model, GraphTopology topo,
                                      KvCache* kv_cache, ConvStateCache* conv_state) {
     modules_[name] = Module{&model, std::move(topo), kv_cache, conv_state, backends_, nullptr, nullptr};
+    if (!text_model_) text_model_ = &model;
+}
+
+const BpeVocab& LoomLuaBridge::text_vocab() {
+    if (!text_vocab_) {
+        if (!text_model_) throw Error("no model is registered, so there is no vocabulary to use");
+        text_vocab_ = BpeVocab::load(*text_model_);
+        if (!text_vocab_) {
+            throw Error("this file's vocabulary is not byte-level BPE (tokenizer.ggml.model), which is the only "
+                        "kind a driver can tokenize with yet");
+        }
+    }
+    return *text_vocab_;
+}
+
+int LoomLuaBridge::l_tokenize(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        size_t n = 0;
+        const char* text = luaL_checklstring(L, 1, &n);
+        const std::vector<int32_t> ids = self->text_vocab().encode(std::string(text, n));
+        push_number_array(L, std::vector<double>(ids.begin(), ids.end()));
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.tokenize: %s", e.what());
+    }
+}
+
+int LoomLuaBridge::l_detokenize(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::vector<double> raw = read_number_array(L, 1);
+        std::vector<int32_t> ids;
+        ids.reserve(raw.size());
+        for (double v : raw) ids.push_back(static_cast<int32_t>(v));
+        const std::string text = self->text_vocab().decode(ids);
+        lua_pushlstring(L, text.data(), text.size());
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.detokenize: %s", e.what());
+    }
 }
 
 std::vector<LoomLuaBridge::ModuleDeviceReport> LoomLuaBridge::device_report() const {

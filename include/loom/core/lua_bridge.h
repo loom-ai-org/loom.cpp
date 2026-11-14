@@ -21,6 +21,7 @@ namespace loom {
 
 class KvCache;
 class ConvStateCache;
+class BpeVocab;
 class StreamState;
 class GraphBuilder;
 class OutputStore;
@@ -238,6 +239,9 @@ private:
     // stream matters for an exact match. Persists across calls within one script invocation until
     // re-seeded, same "persistent state" shape as a registered KvCache.
     std::mt19937 rng_;
+    // `loom.tokenize`'s vocabulary: the first registered module's model, read on first use.
+    const GgufModel* text_model_ = nullptr;
+    std::unique_ptr<BpeVocab> text_vocab_;
     std::normal_distribution<float> normal_dist_{0.0f, 1.0f};
     std::uniform_real_distribution<float> uniform_dist_{0.0f, 1.0f};
 
@@ -354,6 +358,17 @@ private:
     // the definition says why that differs from the argmax pair.
     static int l_sample_row(lua_State* L);
     static int l_seed_rng(lua_State* L);
+    // `loom.tokenize(text) -> ids` and `loom.detokenize(ids) -> string`: the model's OWN vocabulary, for a
+    // driver whose reference holds text rather than ids (ADR-121: Qwen3-ASR's stream re-encodes its last
+    // answer and cuts tokens off it, so a name the model spelled non-canonically comes back canonical).
+    // Per-TASK machinery -- a tokenizer is the engine's, as CTC decode is -- and it reads no model config:
+    // the vocabulary is the one in the file whose modules this bridge runs, loaded on first use, so a
+    // driver that never asks pays nothing. `detokenize` returns the vocabulary's bytes as they are, an
+    // incomplete UTF-8 sequence included, so the driver can see where a character was cut. Byte-level BPE
+    // only for now; any other vocabulary is refused by name.
+    static int l_tokenize(lua_State* L);
+    static int l_detokenize(lua_State* L);
+    const BpeVocab& text_vocab();
     static int l_gaussian_array(lua_State* L);
     static int l_uniform_array(lua_State* L);
     // `loom.expand_by_duration(rows_flat, T, C, durations)`: repeats row `t` of a (T, C) row-major array
