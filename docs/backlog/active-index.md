@@ -1040,6 +1040,8 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   Canary streams under both of NeMo's policies, wait-k and AlignAtt
   ([ADR-124](../adrs/adr-124-canary-streams-the-way-nemos-aed-streaming-script-does.md): the decoder's layer -2
   cross-attention a second output; every step's kept context NeMo's). Every NeMo row of the survey is built.
+  On an RTX 5090 every NeMo stream passes its gate and runs 29-309x real time (Canary's 60 s AlignAtt 11.5x -> 52x)
+  ([ADR-125](../adrs/adr-125-a-buffered-stream-runs-on-the-gpu-without-host-round-trips.md)).
   Next: the re-decoding rows, pyannote, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).

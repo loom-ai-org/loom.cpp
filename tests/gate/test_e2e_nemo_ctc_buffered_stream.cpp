@@ -153,10 +153,12 @@ int main() {
     std::sort(cases.begin(), cases.end(), [](const Case& a, const Case& b) { return a.dir < b.dir; });
     LOOM_CHECK(!cases.empty());
 
-    ggml_backend_ptr backend(loom_test::cpu_backend());
-    auto model = loom::GgufModel::load(gguf, backend.get());
+    // The CPU, or the GPU under LOOM_TEST_DEVICE=gpu (with the CPU behind it).
+    loom::Device device = loom::Device::open(loom_test::test_device_name());
+    std::fprintf(stderr, "device: %s\n", device.name().c_str());
+    auto model = loom::GgufModel::load(gguf, device.backends().primary);
     LOOM_CHECK(model != nullptr);
-    loom::Session session(*model, backend.get());
+    loom::Session session(*model, device.backends());
     loom::LoomLuaBridge& bridge = session.bridge();
     bridge.load_script(kProbe);
     LOOM_CHECK(loom::audio::TranscriptionStream::supported(bridge));
@@ -337,9 +339,9 @@ int main() {
 
     // 6. The file exported before the door: the one pass unchanged, the door refused.
     if (const char* old_gguf = loom_test::fixture_env("LOOM_NEMO_CTC_STREAM_OLD_GGUF")) {
-        auto old_model = loom::GgufModel::load(old_gguf, backend.get());
+        auto old_model = loom::GgufModel::load(old_gguf, device.backends().primary);
         LOOM_CHECK(old_model != nullptr);
-        loom::Session old_session(*old_model, backend.get());
+        loom::Session old_session(*old_model, device.backends());
         LOOM_CHECK(loom::audio::transcribe(old_session.bridge(), *old_model, first_wav, {}).text ==
                    loom::audio::transcribe(bridge, *model, first_wav, {}).text);
         LOOM_CHECK(!loom::audio::TranscriptionStream::supported(old_session.bridge()));

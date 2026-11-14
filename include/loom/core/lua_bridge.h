@@ -398,6 +398,13 @@ private:
     static int l_state(lua_State* L);
     static int l_set_state(lua_State* L);
     static int l_keep_state(lua_State* L);
+    // `loom.append_state(name, values)`, `loom.state_slice(name, offset, count)`, `loom.drop_state(name, n)`
+    // and `loom.state_size(name)`: an array entry grown, read, trimmed and measured without the whole of
+    // it crossing into Lua (a buffered stream's audio). The same criterion as the three above.
+    static int l_append_state(lua_State* L);
+    static int l_state_slice(lua_State* L);
+    static int l_drop_state(lua_State* L);
+    static int l_state_size(lua_State* L);
     static StreamState& active_state(LoomLuaBridge* self, const char* fname);
 };
 
