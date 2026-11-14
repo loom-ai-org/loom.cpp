@@ -1034,8 +1034,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   Parakeet TDT and RNN-T stream as NeMo's buffered script does
   ([ADR-122](../adrs/adr-122-parakeet-streams-the-way-nemos-buffered-script-does.md): ADR-110's loop shared, TDT's
   jump carried; NeMo's ids at four latencies).
-  Next: the NeMo CTC rows (reference to choose: `BufferedCTCPipeline` or `FrameBatchASR`), Canary (AlignAtt),
-  the re-decoding rows, pyannote, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  Conformer-CTC and both Citrinets stream as NeMo's `FrameBatchASR` does
+  ([ADR-123](../adrs/adr-123-a-nemo-ctc-model-streams-the-way-framebatchasr-does.md): the leaf multi-phase, its
+  driver's mel checked step by step).
+  Next: Canary (AlignAtt), the re-decoding rows, pyannote, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,
