@@ -1031,7 +1031,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   the prefix cut from text through `loom.tokenize`/`detokenize`; only the 8 s encoder window still filling
   re-encoded, the decoder's keys over the rest kept; 0.37x real time on 30 s on the dev-box CPU where re-feeding
   is 0.22x; the prefix still grows, as upstream's).
-  Next: the other ASR rows (NeMo buffered, the re-decoding rows, pyannote), and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  Parakeet TDT and RNN-T stream as NeMo's buffered script does
+  ([ADR-122](../adrs/adr-122-parakeet-streams-the-way-nemos-buffered-script-does.md): ADR-110's loop shared, TDT's
+  jump carried; NeMo's ids at four latencies).
+  Next: the NeMo CTC rows (reference to choose: `BufferedCTCPipeline` or `FrameBatchASR`), Canary (AlignAtt),
+  the re-decoding rows, pyannote, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,
