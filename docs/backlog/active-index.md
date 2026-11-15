@@ -942,9 +942,9 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   parked or per-stream, `GenerationStream`, loom-py `text2text.stream()`); they need a re-export to carry
   the stream functions. Audio out is built a sentence at a time
   ([ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md): `SpeechStream`, exact
-  for Pocket-TTS x4 and Soprano after a re-export, loom-py cuts every other TTS by sentence). Next: Pocket-TTS
-  per frame (the Mimi decoder as a step carrying its state), the other audio-out rows, the codec pairs, the
-  other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  for Pocket-TTS x4 and Soprano after a re-export, loom-py cuts every other TTS by sentence), and Pocket-TTS
+  a frame at a time (ADR-101: first audio after 0.20 s). Next: the other audio-out rows, the codec pairs,
+  the other ASR rows, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   No GPU has run either door yet; the per-stream cache mode is what `Auto` picks there.
