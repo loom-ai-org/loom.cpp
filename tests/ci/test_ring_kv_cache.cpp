@@ -7,6 +7,8 @@
 
 #include "loom/loom.h"
 
+#include <cmath>
+#include <cstdio>
 #include <string>
 #include <variant>
 #include <vector>
@@ -43,6 +45,37 @@ int main() {
         bool refused = false;
         try {
             session.bridge().call("prefill", {{"n", 3.0}, {"at", 2.0}});
+        } catch (const loom::Error&) {
+            refused = true;
+        }
+        LOOM_CHECK(refused);
+    }
+    // A module with a cache of its own geometry (ADR-103): a 6-cell ring for a window of 3, so calls of up
+    // to 3 tokens may wrap. Uneven calls past the capacity, each row the mean of exactly its window -- which
+    // takes the cells the call overwrote being outside it, and the mask finding each cell's position.
+    {
+        loom::Session session(*model, device.backends());
+        const std::vector<double> pushes = {2, 3, 1, 3, 3, 2, 3, 1};
+        const auto out = std::get<std::vector<double>>(session.bridge().call("windowed", {{"pushes", pushes}}));
+        LOOM_CHECK(out.size() == 18);
+        for (int p = 0; p < static_cast<int>(out.size()); ++p) {
+            const int lo = p < 2 ? 0 : p - 2;
+            double want = 0.0;
+            for (int j = lo; j <= p; ++j) want += j + 1;
+            want /= (p - lo + 1);
+            if (std::abs(out[static_cast<size_t>(p)] - want) > 1e-5) std::fprintf(stderr, "row %d: %g, want %g\n", p, out[static_cast<size_t>(p)], want);
+            LOOM_CHECK_NEAR(out[static_cast<size_t>(p)], want, 1e-5);
+        }
+        // The shared cache is untouched by it: still the 4-cell, one-token-past-capacity ring.
+        const auto stepped = std::get<std::vector<double>>(session.bridge().call("stepwise", {{"steps", 6.0}}));
+        LOOM_CHECK(stepped.size() == 6 && std::abs(stepped[5] - 4.5) < 1e-5);
+    }
+    // ... and a call longer than the room past the window is refused.
+    {
+        loom::Session session(*model, device.backends());
+        bool refused = false;
+        try {
+            session.bridge().call("windowed", {{"pushes", std::vector<double>{3, 3, 4}}});
         } catch (const loom::Error&) {
             refused = true;
         }

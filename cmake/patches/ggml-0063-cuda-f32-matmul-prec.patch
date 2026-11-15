@@ -1,0 +1,35 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -1420,6 +1420,19 @@
+     cudaStream_t main_stream = ctx.stream();
+     cublasHandle_t cublas_h = ctx.cublas_handle();
+ 
++    // loom (ggml-0063): an F32 product that asked for GGML_PREC_F32 runs without TF32. Every handle is created with
++    // CUBLAS_TF32_TENSOR_OP_MATH (common.cuh), which gives F32 SGEMM/GemmEx a 10-bit mantissa whatever the
++    // precision says; solve_tri.cu switches the mode for its own call the same way. Default-precision
++    // products keep TF32.
++    struct tf32_restore {
++        cublasHandle_t h;
++        bool active;
++        ~tf32_restore() { if (active) { CUBLAS_CHECK(cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH)); } }
++    } restore{cublas_h, compute_type == GGML_TYPE_F32 && (ggml_prec) ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32};
++    if (restore.active) {
++        CUBLAS_CHECK(cublasSetMathMode(cublas_h, CUBLAS_DEFAULT_MATH));
++    }
++
+     const size_t src0_ts = ggml_type_size(src0->type);
+     GGML_ASSERT(nb00 == src0_ts);
+     int64_t s01 = nb01 / src0_ts;
+@@ -1932,7 +1945,10 @@
+         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
+         return;
+     }
+-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
++    // loom (ggml-0063): MMF's F32 tiles multiply in TF32 (mma ... .tf32.tf32.f32), so an F32 product that asked for
++    // GGML_PREC_F32 goes on to cuBLAS, which honours it (ggml_cuda_mul_mat_cublas_impl).
++    const bool prec_f32 = src0->type == GGML_TYPE_F32 && (ggml_prec) ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32;
++    if (!prec_f32 && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+         return;
+     }

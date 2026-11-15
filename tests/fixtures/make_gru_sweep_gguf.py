@@ -10,6 +10,10 @@ with the node list loom-exporter's `recurrent._gru_cell_topology` emits: torch.n
 
 Also one cell the sweep must REFUSE: two outputs and no `c_prev`, which would drop a cell state.
 
+And `carry` (ADR-104): an LSTM cell (`c_prev` in, `h_new` and `c_new` out, torch.nn.LSTM's gate blocks
+`[i, f, g, o]`) and the GRU swept over a sequence in two calls that share one carry table, which must be
+the one call over the whole of it -- the second call starting from the state the first one left.
+
 Requires: pip install gguf numpy
 """
 import json
@@ -35,6 +39,45 @@ end
 function bidirectional(inputs)
     loom.run_bi_recurrent_and_retain('gru_fwd', 'gru_bwd', inputs.sequence, {SEQ}, {INPUT}, {HIDDEN})
     return loom.get_output('gru_fwd', 1)
+end
+
+local function rows(seq, from, to)
+    local out = {{}}
+    for i = from * {INPUT} + 1, to * {INPUT} do out[#out + 1] = seq[i] end
+    return out
+end
+
+local function split(module, seq, at)
+    -- Two calls, one carry: the second starts where the first stopped. Returns both outputs and the
+    -- final state, which must be the last row's h.
+    local carry = {{}}
+    local a = loom.run_recurrent(module, rows(seq, 0, at), at, {INPUT}, {HIDDEN}, false, carry)
+    local b = loom.run_recurrent(module, rows(seq, at, {SEQ}), {SEQ} - at, {INPUT}, {HIDDEN}, false, carry)
+    for _, v in ipairs(b) do a[#a + 1] = v end
+    for _, v in ipairs(carry.h) do a[#a + 1] = v end
+    return a
+end
+
+function lstm_forward(inputs)
+    local out = loom.run_recurrent('lstm_fwd', inputs.sequence, {SEQ}, {INPUT}, {HIDDEN}, false)
+    return out
+end
+
+function lstm_split(inputs) return split('lstm_fwd', inputs.sequence, 2) end
+function gru_split(inputs) return split('gru_fwd', inputs.sequence, 4) end
+
+function lstm_split_c(inputs)
+    -- The cell state is carried too: dropping it between the calls must change the answer.
+    local carry = {{}}
+    loom.run_recurrent('lstm_fwd', rows(inputs.sequence, 0, 2), 2, {INPUT}, {HIDDEN}, false, carry)
+    local dropped = {{h = carry.h}}
+    local b = loom.run_recurrent('lstm_fwd', rows(inputs.sequence, 2, {SEQ}), {SEQ} - 2, {INPUT}, {HIDDEN}, false, dropped)
+    return b
+end
+
+function bad_carry(inputs)
+    loom.run_recurrent('lstm_fwd', inputs.sequence, {SEQ}, {INPUT}, {HIDDEN}, false, {{h = {{1, 2}}}})
+    return {{0}}
 end
 
 function two_outputs_no_c(inputs)
@@ -77,6 +120,50 @@ def cell(prefix: str) -> dict:
     }
 
 
+def lstm_cell(prefix: str) -> dict:
+    h, f32 = HIDDEN, 4
+    gates = [{"op": "VIEW", "inputs": ["g"], "outputs": [n], "attrs": {"shape": [h], "offset": k * h * f32}}
+             for k, n in enumerate(("g_i", "g_f", "g_g", "g_o"))]
+    return {
+        "version": 1,
+        "inputs": [{"name": "layer_input", "dtype": "f32", "shape": [str(INPUT)]},
+                   {"name": "h_prev", "dtype": "f32", "shape": [str(h)]},
+                   {"name": "c_prev", "dtype": "f32", "shape": [str(h)]}],
+        "outputs": ["h_new", "c_new"],
+        "nodes": [
+            {"op": "MUL_MAT", "inputs": [f"{prefix}weight_ih", "layer_input"], "outputs": ["gx_w"]},
+            {"op": "MUL_MAT", "inputs": [f"{prefix}weight_hh", "h_prev"], "outputs": ["gh_w"]},
+            {"op": "ADD", "inputs": ["gx_w", "gh_w"], "outputs": ["g_w"]},
+            {"op": "ADD", "inputs": ["g_w", f"{prefix}bias"], "outputs": ["g"]},
+            *gates,
+            {"op": "SIGMOID", "inputs": ["g_i"], "outputs": ["i"]},
+            {"op": "SIGMOID", "inputs": ["g_f"], "outputs": ["f"]},
+            {"op": "TANH", "inputs": ["g_g"], "outputs": ["gg"]},
+            {"op": "SIGMOID", "inputs": ["g_o"], "outputs": ["o"]},
+            {"op": "MUL", "inputs": ["f", "c_prev"], "outputs": ["f_c"]},
+            {"op": "MUL", "inputs": ["i", "gg"], "outputs": ["i_g"]},
+            {"op": "ADD", "inputs": ["f_c", "i_g"], "outputs": ["c_new"]},
+            {"op": "TANH", "inputs": ["c_new"], "outputs": ["c_tanh"]},
+            {"op": "MUL", "inputs": ["o", "c_tanh"], "outputs": ["h_new"]},
+        ],
+    }
+
+
+def lstm_reference(seq: np.ndarray, w: dict) -> np.ndarray:
+    """torch.nn.LSTM's documented step, in float64."""
+    def sig(v):
+        return 1.0 / (1.0 + np.exp(-v))
+    h, c = np.zeros(HIDDEN), np.zeros(HIDDEN)
+    out = np.zeros((SEQ, HIDDEN))
+    for t in range(SEQ):
+        g = w["weight_ih"] @ seq[t] + w["weight_hh"] @ h + w["bias"]
+        i, f, gg, o = (g[k * HIDDEN:(k + 1) * HIDDEN] for k in range(4))
+        c = sig(f) * c + sig(i) * np.tanh(gg)
+        h = sig(o) * np.tanh(c)
+        out[t] = h
+    return out
+
+
 def reference(seq: np.ndarray, w: dict, reverse: bool) -> np.ndarray:
     """torch.nn.GRU's documented step, in float64."""
     def sig(v):
@@ -108,8 +195,14 @@ def main() -> None:
         w = {k: v.astype(np.float32) for k, v in w.items()}
         per_dir[d] = {k: v.astype(np.float64) for k, v in w.items()}
         weights.update({f"{d}.{k}": v for k, v in w.items()})
+    lstm = {"weight_ih": rng.normal(scale=0.6, size=(4 * HIDDEN, INPUT)),
+            "weight_hh": rng.normal(scale=0.6, size=(4 * HIDDEN, HIDDEN)),
+            "bias": rng.normal(scale=0.3, size=4 * HIDDEN)}
+    lstm = {k: v.astype(np.float32) for k, v in lstm.items()}
+    weights.update({f"lstm.{k}": v for k, v in lstm.items()})
     seq = rng.normal(size=(SEQ, INPUT)).astype(np.float32).astype(np.float64)
     fwd, bwd = reference(seq, per_dir["fwd"], False), reference(seq, per_dir["bwd"], True)
+    lstm_out = lstm_reference(seq, {k: v.astype(np.float64) for k, v in lstm.items()})
 
     bad = cell("fwd.")
     bad["outputs"] = ["h_new", "n"]
@@ -119,10 +212,12 @@ def main() -> None:
     w.add_string("model.graph_topology.gru_fwd", json.dumps(cell("fwd.")))
     w.add_string("model.graph_topology.gru_bwd", json.dumps(cell("bwd.")))
     w.add_string("model.graph_topology.bad", json.dumps(bad))
+    w.add_string("model.graph_topology.lstm_fwd", json.dumps(lstm_cell("lstm.")))
     w.add_string("model.driver_script", DRIVER)
     w.add_string("test.sequence", json.dumps(seq.reshape(-1).tolist()))
     w.add_string("test.forward", json.dumps(fwd.reshape(-1).tolist()))
     w.add_string("test.backward", json.dumps(bwd.reshape(-1).tolist()))
+    w.add_string("test.lstm_forward", json.dumps(lstm_out.reshape(-1).tolist()))
     w.add_string("test.bidirectional", json.dumps(np.concatenate([fwd, bwd], 1).reshape(-1).tolist()))
     for name, array in weights.items():
         w.add_tensor(name, array)

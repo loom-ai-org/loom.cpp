@@ -3,6 +3,7 @@
 #include "loom/core/backend.h"
 #include "loom/core/gguf_model.h"
 #include "loom/core/graph_topology.h"
+#include "loom/core/stream_state.h"
 
 #include <ggml-cpp.h>
 
@@ -20,6 +21,8 @@ namespace loom {
 
 class KvCache;
 class ConvStateCache;
+class BpeVocab;
+class StreamState;
 class GraphBuilder;
 class OutputStore;
 
@@ -140,6 +143,21 @@ public:
 
     Value call(const std::string& fn_name, const std::unordered_map<std::string, Value>& args);
 
+    // The same call with `state` reachable from the driver for its duration: `loom.state`,
+    // `loom.set_state`, `loom.keep_state` and `{state = name}` input references all address it
+    // (stream_state.h, ADR-098). How a host runs a stream's `stream_open` / `stream_feed` /
+    // `stream_finish`: the driver functions hold nothing between calls, the host's `StreamState` does,
+    // so streams on one bridge do not see each other. The plain `call` above hands each call a fresh
+    // state of its own, which is what lets a one-pass `infer` run the stream functions inside one call.
+    Value call(const std::string& fn_name, const std::unordered_map<std::string, Value>& args,
+               StreamState& state);
+
+    // How streams keep their rows of the model's KV and conv-state caches apart (ADR-099): parked
+    // while another stream runs, or a cache per stream. `Auto` decides per cache by its backend.
+    // Changing it while streams are open leaves their rows where they are, so set it before opening.
+    void set_stream_caches(StreamCaches mode) { stream_caches_ = mode; }
+    StreamCaches stream_caches() const { return stream_caches_; }
+
     // Reseeds the shared RNG from C++, the same door `loom.seed_rng` gives a driver script -- so a HOST
     // can make a sampled generation reproducible without the driver having to expose a seed argument
     // (P4.24). Same stream, so the draw-ORDER caveat `rng_` documents applies to both callers.
@@ -197,12 +215,20 @@ private:
     // everything it needs is already on the Module, and building one eagerly would allocate a compute
     // buffer for every registered topology of a many-module model whether or not the driver ever runs it.
     GraphBuilder& module_builder(Module& mod);
+    // The cache a module's next run uses: the active stream's own, or the model's after leasing it to
+    // that stream (ADR-099). The model's itself outside any call.
+    template <typename Cache> Cache* stream_cache(Cache* shared);
 
     lua_State* L_;
     Backends backends_;
     std::unordered_map<std::string, Module> modules_;
     // hold_compute_buffers' setting, applied to each builder as module_builder() creates it.
     bool hold_compute_buffers_ = false;
+
+    // The stream state the current `call` runs against; null outside a call. Set and restored by `call`
+    // itself, so a binding that finds it null is being run outside any driver call.
+    StreamState* active_state_ = nullptr;
+    StreamCaches stream_caches_ = StreamCaches::Auto;
 
     // Backs loom.seed_rng/loom.gaussian_array/loom.uniform_array -- the SAME engine/distribution shapes
     // (std::mt19937 + std::normal_distribution<float>(0,1) + std::uniform_real_distribution<float>(0,1))
@@ -213,6 +239,9 @@ private:
     // stream matters for an exact match. Persists across calls within one script invocation until
     // re-seeded, same "persistent state" shape as a registered KvCache.
     std::mt19937 rng_;
+    // `loom.tokenize`'s vocabulary: the first registered module's model, read on first use.
+    const GgufModel* text_model_ = nullptr;
+    std::unique_ptr<BpeVocab> text_vocab_;
     std::normal_distribution<float> normal_dist_{0.0f, 1.0f};
     std::uniform_real_distribution<float> uniform_dist_{0.0f, 1.0f};
 
@@ -292,7 +321,8 @@ private:
     static void cell_sweep(LoomLuaBridge* self, const std::string& module_name,
                             const SequenceSource& src, uint32_t seq_len, uint32_t input_dim,
                             uint32_t hidden_dim, bool reverse, const char* fname,
-                            const std::function<void(uint32_t, const std::vector<float>&)>& emit);
+                            const std::function<void(uint32_t, const std::vector<float>&)>& emit,
+                            std::vector<float>& h, std::vector<float>& c);
     // `mod`'s store, holding exactly one `[ne0, ne1]` f32 slot and returning it. Shaped from a
     // no-alloc template because `reshape` reads only type and `ne` -- a retained SEQUENCE is not any
     // single build's output, so nothing else declares its geometry.
@@ -328,6 +358,17 @@ private:
     // the definition says why that differs from the argmax pair.
     static int l_sample_row(lua_State* L);
     static int l_seed_rng(lua_State* L);
+    // `loom.tokenize(text) -> ids` and `loom.detokenize(ids) -> string`: the model's OWN vocabulary, for a
+    // driver whose reference holds text rather than ids (ADR-121: Qwen3-ASR's stream re-encodes its last
+    // answer and cuts tokens off it, so a name the model spelled non-canonically comes back canonical).
+    // Per-TASK machinery -- a tokenizer is the engine's, as CTC decode is -- and it reads no model config:
+    // the vocabulary is the one in the file whose modules this bridge runs, loaded on first use, so a
+    // driver that never asks pays nothing. `detokenize` returns the vocabulary's bytes as they are, an
+    // incomplete UTF-8 sequence included, so the driver can see where a character was cut. Byte-level BPE
+    // only for now; any other vocabulary is refused by name.
+    static int l_tokenize(lua_State* L);
+    static int l_detokenize(lua_State* L);
+    const BpeVocab& text_vocab();
     static int l_gaussian_array(lua_State* L);
     static int l_uniform_array(lua_State* L);
     // `loom.expand_by_duration(rows_flat, T, C, durations)`: repeats row `t` of a (T, C) row-major array
@@ -349,6 +390,22 @@ private:
     // graph input can reach -- the only other writer is an ATTENTION node, which writes what it just
     // projected. First needed by Pocket-TTS, whose voices ship as KV caches; ADR-043.
     static int l_seed_kv(lua_State* L);
+    // `loom.state(name)`, `loom.set_state(name, value)` and `loom.keep_state(name, module)`: the
+    // current call's stream state (stream_state.h, ADR-098). MEET the binding criterion: they read no
+    // model config, every name is an argument, and what they hold is engine-owned state between calls,
+    // which no topology can declare -- the same reason `OutputStore` exists. Any streaming family uses
+    // them unchanged; the first is Zipformer streaming.
+    static int l_state(lua_State* L);
+    static int l_set_state(lua_State* L);
+    static int l_keep_state(lua_State* L);
+    // `loom.append_state(name, values)`, `loom.state_slice(name, offset, count)`, `loom.drop_state(name, n)`
+    // and `loom.state_size(name)`: an array entry grown, read, trimmed and measured without the whole of
+    // it crossing into Lua (a buffered stream's audio). The same criterion as the three above.
+    static int l_append_state(lua_State* L);
+    static int l_state_slice(lua_State* L);
+    static int l_drop_state(lua_State* L);
+    static int l_state_size(lua_State* L);
+    static StreamState& active_state(LoomLuaBridge* self, const char* fname);
 };
 
 } // namespace loom

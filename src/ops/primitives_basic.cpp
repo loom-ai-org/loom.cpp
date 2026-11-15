@@ -509,7 +509,18 @@ void rsqrt_custom_op(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, v
 
 Outputs op_rsqrt(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("RSQRT", in, 1);
-    return {ggml_map_custom1(pc.ctx, ensure_packed(pc.ctx, in[0]), rsqrt_custom_op, GGML_N_TASKS_MAX, nullptr)};
+    ggml_tensor* x = ensure_packed(pc.ctx, in[0]);
+    // In ggml's own ops, as `op_pow` spells `x ** -0.5` (P4.52): `1 / sqrt(x)` with the 1 made from the sqrt
+    // itself. The custom op exists only on the CPU, so on a device every RSQRT was a fallback node: a sync
+    // and two copies. Every RMSNorm in a Qwen2/Llama-style LM has one. CosyVoice3's LM on an RTX 5090 spent
+    // 82% of its time in them (49 per token, ~1 ms each: 79 ms a token, 2026-11-12). It is the custom op's
+    // own arithmetic (a rounded sqrt, then a rounded division), so the CPU result is bit-identical, except at
+    // x = +inf (NaN against 0), as for POW. The custom op stays for an input that is not F32.
+    if (x->type != GGML_TYPE_F32) {
+        return {ggml_map_custom1(pc.ctx, x, rsqrt_custom_op, GGML_N_TASKS_MAX, nullptr)};
+    }
+    ggml_tensor* d = ggml_sqrt(pc.ctx, x);
+    return {ggml_div(pc.ctx, ggml_scale_bias(pc.ctx, d, 0.0f, 1.0f), d)};
 }
 
 Outputs op_log(PrimitiveContext& pc, const Inputs& in, const Json&) {
@@ -727,6 +738,13 @@ Outputs op_pad_1d_reflect(PrimitiveContext& pc, const Inputs& in, const Json& at
     const int lp0 = static_cast<int>(resolve_attr_int(attrs, "lp0", pc.symbols));
     const int rp0 = static_cast<int>(resolve_attr_int(attrs, "rp0", pc.symbols));
     ggml_tensor* a = ensure_packed(pc.ctx, in[0]);
+    // A reflection needs more elements than it pads: ggml asserts it and ABORTS the process, which is what a
+    // codec handed too few frames did (EnCodec's kernel-7 convolutions on under 4 frames, ADR-104).
+    if (lp0 >= a->ne[0] || rp0 >= a->ne[0]) {
+        throw SchemaError("PAD_1D_REFLECT: reflecting " + std::to_string(lp0) + " left and " + std::to_string(rp0) +
+                          " right needs more than that many elements, got " + std::to_string(a->ne[0]) +
+                          " -- the input is too short for this graph");
+    }
     ggml_tensor* native = ggml_pad_reflect_1d(pc.ctx, a, lp0, rp0);
     // Ask, then choose (primitive_registry.h's `backend_can_run`). Of the backends ggml ships, only
     // Vulkan, OpenCL, OpenVINO and Hexagon lack this op -- CUDA, Metal, SYCL and CANN all have it -- so
