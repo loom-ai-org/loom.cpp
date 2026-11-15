@@ -107,11 +107,15 @@ Option **2**, the user's choice.
   |---|---|---|
   | 1 | 3.9x | 0.25 |
   | 2 (the engine's default, physical cores) | 2.5x | 0.40 |
-  | 4 (the test helper's ggml default) | 0.8x | 1.21 |
+  | 4 (ggml's own default) | 0.8x | 1.21 |
 
   The BiLSTM is ~2,300 tiny per-step graphs per chunk, so threads add barrier cost and no work.
+  The default stays the engine's: one model's best count is not a policy.
   Two engine processes oversubscribing the cores were 40x slower still: a 0.25 s pass took 10.8 s
   beside a 4-thread stream.
+* **The tests' CPU backend now takes the engine's thread count.** `tests/support/cpu_backend.h` had
+  kept ggml's 4, so the gate ran this stream 3x slower than `loom_cli` did. With the engine's count it
+  runs as the engine does: this gate takes 297 s alone, down from 943 s.
 * **`FrameUpdate::values` is float32**, so a host sees diart's scores to float32. Thresholding at 0.6
   could differ only for a score within float32 rounding of 0.6.
 * Publishes with the rc21+ engine, after a re-export.
