@@ -38,7 +38,7 @@ void print_usage(const char* argv0) {
                   "usage: %s --model <path.gguf> --prompt \"<text or token ids>\" [--n-predict N]\n"
                   "       %s --model <asr.gguf> --wav <path.wav> [--language en] "
                   "[--task transcribe|translate] [--target-language xx] [--timestamps] "
-                  "[--no-condition-on-previous] [--stream MS [--input name=v ...]]\n"
+                  "[--no-condition-on-previous] [--stream MS [--vad <vad.gguf>] [--input name=v ...]]\n"
                   "       %s --model <lm.gguf> --prompt \"<text>\" --stream N "
                   "[--stream-caches auto|park|per-stream]\n"
                   "       %s --model <tts.gguf> --prompt \"<text>\" --out out.wav --stream 1 "
@@ -742,7 +742,8 @@ void run_text_stream(loom::Session& session, const loom::GgufModel& model, const
 void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string& wav_path,
              const std::string& language_name, const std::string& task_name,
              const std::string& target_language_name, bool timestamps,
-             bool condition_on_previous, uint32_t stream_ms, const DriverInputs& extra_inputs) {
+             bool condition_on_previous, uint32_t stream_ms, const DriverInputs& extra_inputs,
+             const std::string& vad_path) {
     // EVERYTHING BELOW THE ARGUMENT PARSING IS THE ENGINE'S NOW (loom/core/transcribe.h). This function
     // used to hold the whole long-form loop -- windowing, segment splitting, the timestamp-aware seek,
     // prev_tokens conditioning -- and loom-py could not reach any of it, so its users got fixed cuts
@@ -760,6 +761,53 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     // which would have thrown inside the driver for any speech model carrying ShortConv blocks.
     loom::Session session(model, backends);
 
+    if (!vad_path.empty() && stream_ms == 0) throw loom::Error("--vad cuts a --stream into lines; it needs --stream MS");
+    if (stream_ms > 0 && !vad_path.empty()) {
+        // VAD lines (ADR-127): any recogniser, its one pass re-run over the line still being spoken.
+        auto vad = loom::GgufModel::load(vad_path, backends);
+        loom::Session vad_session(*vad, backends);
+        loom::audio::LineOptions options;
+        options.transcribe.language = language_name;
+        options.transcribe.task = task_name;
+        options.transcribe.target_language = target_language_name;
+        for (const DriverInput& in : extra_inputs) {
+            if (in.values.size() != 1 || in.array) throw loom::Error("--input " + in.name + ": a line option is one number");
+            const double v = in.values[0];
+            if (in.name == "update_seconds") options.update_seconds = v;
+            else if (in.name == "threshold") options.threshold = static_cast<float>(v);
+            else if (in.name == "window_seconds") options.window_seconds = static_cast<float>(v);
+            else if (in.name == "max_line_seconds") options.max_line_seconds = static_cast<float>(v);
+            else if (in.name == "look_behind") options.look_behind = static_cast<size_t>(v);
+            else if (in.name == "max_tokens_per_second") options.max_tokens_per_second = static_cast<float>(v);
+            else if (in.name == "decode_incomplete") options.decode_incomplete = v != 0.0;
+            else throw loom::Error("--input " + in.name + ": not a line option (update_seconds, threshold, "
+                                   "window_seconds, max_line_seconds, look_behind, max_tokens_per_second, "
+                                   "decode_incomplete)");
+        }
+        loom::audio::LineStream stream(session.bridge(), model, vad_session.bridge(), *vad, options);
+        const uint32_t rate = stream.sample_rate();
+        const size_t piece = std::max<size_t>(1, static_cast<size_t>(rate) * stream_ms / 1000);
+        const auto print = [&](const loom::audio::LineUpdate& u) {
+            for (size_t k : u.touched) {
+                const loom::audio::Line& line = stream.lines()[k];
+                std::printf("[%s] line %zu %s %s: %s\n", format_time(static_cast<double>(u.samples) / rate).c_str(), k,
+                            format_time(static_cast<double>(line.start) / rate).c_str(),
+                            line.complete ? "(final)" : "(open)", line.text.c_str());
+            }
+            std::fflush(stdout);
+        };
+        const auto t0 = std::chrono::steady_clock::now();
+        for (size_t at = 0; at < waveform.size(); at += piece)
+            print(stream.push(waveform.data() + at, std::min(piece, waveform.size() - at)));
+        print(stream.finish());
+        const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const double audio = static_cast<double>(waveform.size()) / rate;
+        std::printf("transcript: %s\n", stream.text().c_str());
+        std::fprintf(stderr, "(streamed %.2f s in %u ms pieces, %zu lines: %.2fx real time, RTF %.3f)\n", audio,
+                     stream_ms, stream.lines().size(), wall > 0 ? audio / wall : 0.0, audio > 0 ? wall / audio : 0.0);
+        print_device_report(session.bridge());
+        return;
+    }
     if (stream_ms > 0) {
         // The live door, fed from a file: the clip pushed in pieces of `stream_ms` as fast as they
         // decode, each piece's new text printed when it lands. The options below select a decode the
@@ -827,6 +875,7 @@ int main(int argc, char** argv) {
     bool timestamps = false;
     bool condition_on_previous = true;
     uint32_t stream_ms = 0;
+    std::string vad_path;
     loom::StreamCaches stream_caches = loom::StreamCaches::Auto;
     std::string system_text;
     bool has_prompt = false;
@@ -931,6 +980,8 @@ int main(int argc, char** argv) {
             has_n_predict = true;
         } else if (arg == "--codec" && i + 1 < argc) {
             codec_path = argv[++i];
+        } else if (arg == "--vad" && i + 1 < argc) {
+            vad_path = argv[++i];
         } else if (arg == "--codes-out" && i + 1 < argc) {
             codes_out = argv[++i];
         } else if (arg == "--out" && i + 1 < argc) {
@@ -1605,7 +1656,7 @@ int main(int argc, char** argv) {
 
         if (has_wav) {
             run_asr(*model, backends, wav_path, language_name, task_name, target_language_name, timestamps,
-                    condition_on_previous, stream_ms, extra_inputs);
+                    condition_on_previous, stream_ms, extra_inputs, vad_path);
         }
     } catch (const loom::Error& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
