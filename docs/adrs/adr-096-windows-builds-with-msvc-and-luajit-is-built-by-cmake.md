@@ -80,6 +80,8 @@ The rest, each where it belongs:
   | Matcha | 13.26 / 13.03 | 6.20 / 6.88 | 2.14x / 1.89x |
 
   Q8_0_PC gains little on the GPU: 1.10x on Citrinet, and it is slower than F32 on the other three.
+  These CPU rows are before [ADR-105](adr-105-x86-without-avx2-sse-paths-and-runfast.md) (ggml-0060/0061),
+  which took them to 0.042 / 0.040, 0.170 / 0.334, 0.304 / 0.306 and 3.78 / 4.60.
 * **The first Vulkan run of a model compiles its shaders, and a SYSTEM process does that every launch.**
   ggml-vulkan creates each pipeline on first use and keeps no `VkPipelineCache`. Intel's Windows driver caches
   compiled pipelines per user on disk (`%USERPROFILE%\AppData\LocalLow\Intel\ShaderCache`), but writes
@@ -92,10 +94,9 @@ The rest, each where it belongs:
   than 1.5%. Persisting a `VkPipelineCache` ourselves is a hub item.
 * **MSVC's x86 ladder is nine rungs, not fourteen** (no zen4, sapphirerapids, ivybridge, piledriver,
   cooperlake). It starts at the same `x64` baseline.
-* **loom's own x86 kernels are AVX2-only.** On SSE4.2 the conv1d direct tile is scalar
-  (`GGML_CONV1D_LANES 1`) and depends on auto-vectorisation, which MSVC does less of than GCC. Measured on
-  Linux, a build limited to the SSE4.2 variant costs 1.5x (Zipformer) to 2.5x (VITS). A clang-cl build (Option
-  2) is the open speed item.
+* **loom's own x86 kernels were AVX2-only**, and MSVC defined none of the SSE macros ggml's SIMD paths
+  need, so the `sse42` DLL ran mostly scalar. Fixed in [ADR-105](adr-105-x86-without-avx2-sse-paths-and-runfast.md),
+  which took the clang-cl option's place.
 * **Seeded output is not portable across C++ standard libraries.** The Lua bridge draws through
   `std::normal_distribution` / `std::uniform_real_distribution`, whose algorithms the standard leaves
   to the implementation. The same seed gives a different VITS duration on Windows than on Linux, and the

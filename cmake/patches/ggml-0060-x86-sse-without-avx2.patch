@@ -1,0 +1,140 @@
+diff --git a/src/ggml-cpu/ggml-cpu-impl.h b/src/ggml-cpu/ggml-cpu-impl.h
+index 5dd9ec8e..57d3b967 100644
+--- a/src/ggml-cpu/ggml-cpu-impl.h
++++ b/src/ggml-cpu/ggml-cpu-impl.h
+@@ -62,6 +62,31 @@ struct ggml_compute_params {
+ #endif
+ #endif
+ 
++// Nor does MSVC define them under /arch:SSE4.2 -- not even __SSE__ (checked, MSVC 19.44) -- so the sse42 variant
++// (GGML_SSE42 is the only definition CMake gives it there) compiled every GGML_SIMD path as scalar C. clang-cl
++// defines its own. loom ggml-0060; on a Celeron N4100 this alone took Zipformer small F32 from RTF 0.503 to
++// 0.179, VITS 0.597 -> 0.322, Matcha 6.01 -> 3.82, with identical transcripts.
++#if defined(_MSC_VER) && !defined(__clang__) && defined(GGML_SSE42)
++#ifndef __SSE__
++#define __SSE__
++#endif
++#ifndef __SSE2__
++#define __SSE2__
++#endif
++#ifndef __SSE3__
++#define __SSE3__
++#endif
++#ifndef __SSSE3__
++#define __SSSE3__
++#endif
++#ifndef __SSE4_1__
++#define __SSE4_1__
++#endif
++#ifndef __SSE4_2__
++#define __SSE4_2__
++#endif
++#endif
++
+ #if defined(__s390x__) && defined(__VEC__)
+ #ifndef __VXE__
+ #define __VXE__
+diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
+index f641a18f..267f1cfc 100644
+--- a/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -5148,6 +5148,16 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             (const float *)B, ldb,
+             (float *)C, ldc};
+         return tb.matmul(m, n);
++#elif defined(__SSE__) && (defined(__x86_64__) || defined(_M_X64))
++        // loom ggml-0060: x86 without AVX (SSE4.2 Atoms and Celerons). Every helper this needs was already
++        // here for __m128 -- madd is multiply then add, there being no FMA -- only this arm was missing, so
++        // their F32 matmuls and im2col convolutions fell back to one ggml_vec_dot_f32 per output. Celeron
++        // N4100, MSVC, on top of the SSE macros: Zipformer small F32 RTF 0.199 -> 0.171, VITS 0.322 -> 0.302.
++        tinyBLAS<4, __m128, __m128, float, float, float> tb{ params,
++            k, (const float *)A, lda,
++            (const float *)B, ldb,
++            (float *)C, ldc};
++        return tb.matmul(m, n);
+ #elif defined(__ARM_NEON)
+         if (n < 4)
+             return false;
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 65a37905..69303e53 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -7925,6 +7925,18 @@ static int64_t ggml_conv_1d_direct_budget(void) {
+ #  define GGML_CONV1D_OCB 4
+ #  define GGML_CONV1D_VEC 2
+ #  define GGML_CONV1D_LANES 8
++#elif defined(__SSE2__) || defined(_M_X64)
++// x86 without AVX2+FMA (SSE4.2 Atoms and Celerons, the x64 baseline, AVX-only Sandy Bridge): 4-wide, multiply
++// then add -- per element the scalar tile's own arithmetic, there being no FMA to contract into. Output is NOT
++// bit-identical to the scalar tile all the same (VITS 104-120 dB SNR): P doubles from 4 to 8 positions, and
++// ggml_conv_1d_direct_ok's shape rules are written in P, so some convolutions change path. 8 accumulators +
++// 2 loads + 1 broadcast fit x64's 16 XMM registers. `_M_X64` because MSVC defines none of GCC's __SSE*__
++// macros, not even under /arch:SSE4.2. loom ggml-0060; Celeron N4100, MSVC, F32 RTF against the scalar tile:
++// VITS 0.919 -> 0.597, Matcha 12.95 -> 6.01, Citrinet 0.170 -> 0.136.
++#  define GGML_CONV1D_SSE 1
++#  define GGML_CONV1D_OCB 4
++#  define GGML_CONV1D_VEC 2
++#  define GGML_CONV1D_LANES 4
+ #else
+ #  define GGML_CONV1D_OCB 4
+ #  define GGML_CONV1D_VEC 4
+@@ -7964,6 +7976,14 @@ static void ggml_conv1d_leaky_copy(float * dst, const float * src, int64_t n, fl
+         _mm256_storeu_ps(dst + i, _mm256_fmadd_ps(s, _mm256_and_ps(v, _mm256_cmp_ps(v, z, _CMP_LT_OQ)),
+                                                      _mm256_and_ps(v, _mm256_cmp_ps(v, z, _CMP_GT_OQ))));
+     }
++#elif defined(GGML_CONV1D_SSE)
++    const __m128 z = _mm_setzero_ps();
++    const __m128 s = _mm_set1_ps(slope);
++    for (; i + 4 <= n; i += 4) {
++        const __m128 v = _mm_loadu_ps(src + i);
++        _mm_storeu_ps(dst + i, _mm_add_ps(_mm_and_ps(v, _mm_cmpgt_ps(v, z)),
++                                          _mm_mul_ps(s, _mm_and_ps(v, _mm_cmplt_ps(v, z)))));
++    }
+ #endif
+     for (; i < n; ++i) {
+         dst[i] = ggml_conv1d_leaky_s(src[i], slope);
+@@ -8073,6 +8093,44 @@ static inline void ggml_conv_1d_direct_tile_impl(const float * xp, const float *
+         for (int i = 0; i < ocn; ++i)
+             for (int j = 0; j < GGML_CONV1D_VEC; ++j) _mm256_storeu_ps(y + (oc0 + i) * OL + p0 + j * 8, acc[i][j]);
+     }
++#elif defined(GGML_CONV1D_SSE)
++    __m128 acc[GGML_CONV1D_OCB][GGML_CONV1D_VEC];
++    for (int i = 0; i < GGML_CONV1D_OCB; ++i) {
++        const float b = (bias && oc0 + i < OC) ? bias[oc0 + i] : 0.0f;
++        for (int j = 0; j < GGML_CONV1D_VEC; ++j) acc[i][j] = _mm_set1_ps(b);
++    }
++    for (int64_t ic = 0; ic < IC; ++ic) {
++        const float * xrow = xp + ic * LP + p0;
++        for (int64_t kx = 0; kx < KW; ++kx) {
++            const float * q = xrow + kx * dil;
++            __m128 xv[GGML_CONV1D_VEC];
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) xv[j] = _mm_loadu_ps(q + j * 4);
++            const float * w = wp + (ic * KW + kx) * OC + oc0;
++            for (int i = 0; i < GGML_CONV1D_OCB; ++i) {
++                const __m128 wv = _mm_set1_ps(w[i]);
++                for (int j = 0; j < GGML_CONV1D_VEC; ++j) acc[i][j] = _mm_add_ps(acc[i][j], _mm_mul_ps(wv, xv[j]));
++            }
++        }
++    }
++    if (CLAMP) {
++        float t[GGML_CONV1D_OCB][GGML_CONV1D_VEC * 4];
++        for (int i = 0; i < GGML_CONV1D_OCB; ++i)
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) _mm_storeu_ps(&t[i][j * 4], acc[i][j]);
++        for (int i = 0; i < ocn; ++i) {
++            const int64_t off = (oc0 + i) * OL + p0;
++            for (int64_t k = pmin - p0; k < GGML_CONV1D_VEC * 4; ++k)
++                y[off + k] = t[i][k] + (RES ? res[off + k] : 0.0f);
++        }
++    } else if (RES) {
++        for (int i = 0; i < ocn; ++i)
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) {
++                const int64_t off = (oc0 + i) * OL + p0 + j * 4;
++                _mm_storeu_ps(y + off, _mm_add_ps(acc[i][j], _mm_loadu_ps(res + off)));
++            }
++    } else {
++        for (int i = 0; i < ocn; ++i)
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) _mm_storeu_ps(y + (oc0 + i) * OL + p0 + j * 4, acc[i][j]);
++    }
+ #elif defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
+     // ARMv6 -- ARM1176, the Pi Zero / Zero W / Pi 1, and only it. Arithmetically identical to the
+     // generic arm below (bit-identical output, checked); the sixteen accumulators are named scalars
