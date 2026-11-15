@@ -140,7 +140,14 @@ Where the reference already decodes each sentence chunk from a fresh state (Pock
 driver's `stream_feed` makes one chunk, and the pieces joined are the one-pass waveform bit for bit. Every
 other TTS is cut by loom-py instead -- the text split into sentences, one `infer` each -- and says so with
 `exact=False`, because the joins are not one pass's. The first piece waits for a whole sentence: on the dev
-box Pocket-TTS's first of three is ready after 3.65 s against 11.0 s for the clip. Per frame is next.
+box Pocket-TTS's first of three is ready after 3.65 s against 11.0 s for the clip.
+
+**Pocket-TTS a frame at a time** ([ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md)).
+Its Mimi decoder runs as `mimi_step`, the next few latents with the decoder's state (conv tails,
+transposed-conv overlaps, 250 keys and values per layer) carried in and out and kept on the device, as
+upstream's `generate_audio_stream` decodes. A stream's pieces grow from one frame (80 ms) to eight; the
+first audio is ready after 0.20 s instead of 3.65 s, at the one-pass speed (1.68x real time, RTF 0.595),
+and the join is within 1.2e-06 of `infer`, which still decodes a chunk per call.
 
 ### Streaming: which other models can, and how
 
@@ -198,7 +205,7 @@ the text classifiers distilbert-ner and punctuate-all (whole text in, labels out
 
 | Model | Kind | What it needs |
 |---|---|---|
-| pocket-tts, pocket-tts-18m / -7m / -2m | exact: AR latents, causal Mimi decoder (`generate_audio_stream`) | **per sentence chunk: built** (ADR-100), after a re-export. Per frame: re-export the Mimi decoder step with its conv state; today one call over each chunk's latents |
+| pocket-tts, pocket-tts-18m / -7m / -2m | exact: AR latents, causal Mimi decoder (`generate_audio_stream`) | **per frame: built** (ADR-101; a sentence chunk per piece with `piece_frames = 0`, ADR-100), after a re-export |
 | qwen3-tts-12hz-0.6b + qwen3-tts-tokenizer-12hz | exact: AR frames, causal codec | driver: emit each chunk of the existing chunked decode ([ADR-034](../adrs/adr-034-a-chunked-decode-is-the-drivers-loop-not-a-longer-call.md)) as it is made |
 | audio8-tts-realistic-0.6b + audio8-tts-codec | exact by construction: AR frames; codec all causal (convs, transposed convs, window-128 transformer) | driver: decode with ≥ receptive-field left context, or a state-carrying codec re-export. Upstream's own code has no streaming entry point; the README's SGLang-Omni adapter does, unbenchmarked |
 | voxcpm2 | exact: `generate_streaming`, the AudioVAE's `streaming_decode` carries causal-conv state per patch | re-export: the VAE decoder step with its state |
@@ -254,7 +261,7 @@ fixture set is kept for exactly this reason; `v5` is the contract-declaring set.
 | | |
 |---|---|
 | Authority | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) |
-| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
+| Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
 | Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md) |
 | Active tasks | [Backlog → Host API](../backlog/active-index.md#host-api) |
 
