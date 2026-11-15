@@ -1,6 +1,7 @@
 #pragma once
 
 #include "loom/core/backend.h"
+#include "loom/core/cache_lease.h"
 
 #include <ggml-cpp.h>
 
@@ -22,7 +23,7 @@ namespace loom {
 // N+1 produce the identical graph. Reads are still a plain ggml_view over [0, n_kv), which is all a
 // contiguous single-sequence cache needs. See SPECIFICATION.md §8/the implementation plan for what
 // generalizing back to multi-sequence would need -- the index tensor is the half of it that now exists.
-class KvCache {
+class KvCache : public LeasedCache {
 public:
     // n_embd_k / n_embd_v are the *flattened* per-token K/V widths (n_head_kv * n_embd_head_k/v, i.e.
     // what a token's K or V vector looks like collapsed across all KV heads) -- matches llama.cpp's
@@ -75,6 +76,17 @@ public:
     uint32_t kv_size() const { return kv_size_; }
     bool ring() const { return ring_; }
 
+    // The cells some write has reached since the current stream took the cache: the extent a park has
+    // to copy (ADR-099). A high-water mark, so a driver that rewinds its `n_past` makes a park copy
+    // rows it will overwrite, never miss rows it will read. A ring that has wrapped is all of it.
+    uint32_t rows_used() const { return rows_used_; }
+    // Called wherever cells are written: a graph's cell index, a host `set_rows`.
+    void note_written(uint64_t end_position);
+
+    // An empty cache of the same geometry on the same backend: a stream's own (`StreamCaches`).
+    std::unique_ptr<KvCache> make_like() const;
+    ggml_backend_t backend() const { return backend_; }
+
     // Zeroes the whole cache. Doesn't reset any "current length" bookkeeping -- that's the caller's
     // (Generator's) responsibility via its own n_past counter; KvCache itself is a dumb storage/view
     // provider with no notion of "how full" it currently is.
@@ -83,7 +95,14 @@ public:
     KvCache(const KvCache&) = delete;
     KvCache& operator=(const KvCache&) = delete;
 
+protected:
+    // Per layer, K's then V's first `rows_used` rows: [n_layer][K rows | V rows].
+    void park(std::vector<float>& out) const override;
+    void restore(const std::vector<float>& in) override;
+    void forget() override { rows_used_ = 0; }
+
 private:
+    ggml_backend_t backend_;
     ggml_context_ptr store_ctx_;
     ggml_backend_buffer_ptr store_buf_;
     std::vector<ggml_tensor*> k_layers_;
@@ -92,6 +111,7 @@ private:
     uint32_t n_embd_v_;
     uint32_t kv_size_;
     bool ring_ = false;
+    uint32_t rows_used_ = 0;
 };
 
 class GgufModel;

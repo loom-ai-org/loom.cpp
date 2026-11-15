@@ -24,6 +24,7 @@
 
 #include "loom/core/gguf_model.h"
 #include "loom/core/lua_bridge.h"
+#include "loom/core/stream_state.h"
 
 #include <cstdint>
 #include <optional>
@@ -81,6 +82,59 @@ std::vector<int32_t> eos_token_ids(const GgufModel& model);
 std::vector<int32_t> generate(LoomLuaBridge& bridge, const GgufModel& model,
                               const std::vector<int32_t>& prompt_tokens,
                               const GenerateOptions& options = {});
+
+// The tokens-out door (ADR-099): the same generation as `generate`, handed back as it is drawn.
+//
+// A driver that loops over the KV cache inside one call exports `stream_open` (prefill, first token),
+// `stream_feed{max_tokens}` (up to that many more) and `stream_finish` beside `infer_with_past`, keeps
+// its cursor in the stream's `StreamState`, and sets the state value `done` when its own loop would
+// have stopped. A one-token driver (`infer` only) is streamed by this class's own loop, so every such
+// file already streams. A looping driver without the three functions is refused; `generate` still runs
+// it.
+//
+// Greedy, the ids equal `generate`'s with the same options; seeded, too, because a seeded stream draws
+// from a generator of its own (stream_state.h). Streams on one model are independent: the KV and conv
+// caches are parked or per-stream as `LoomLuaBridge::set_stream_caches` says.
+class GenerationStream {
+public:
+    GenerationStream(LoomLuaBridge& bridge, const GgufModel& model, std::vector<int32_t> prompt_tokens,
+                     GenerateOptions options = {});
+
+    // Whether this file's driver can be streamed at all.
+    static bool supported(const LoomLuaBridge& bridge);
+
+    // Up to `max_tokens` more generated ids; empty once finished. The stop token never comes back when
+    // `strip_eos` is set, as with `generate`.
+    std::vector<int32_t> next(uint32_t max_tokens = 1);
+
+    // Back to the prompt, nothing generated.
+    void reset();
+
+    bool finished() const { return finished_; }
+    // Everything handed back so far.
+    const std::vector<int32_t>& tokens() const { return tokens_; }
+    // Whether the stream ended on a stop token that was dropped.
+    bool stopped_on_eos() const { return stripped_; }
+    const StreamState& state() const { return state_; }
+
+private:
+    bool driver_done() const;
+    static std::vector<double> as_ids(const LoomLuaBridge::Value& v);
+
+    LoomLuaBridge& bridge_;
+    std::vector<int32_t> prompt_;
+    GenerateOptions options_;
+    int32_t eos_ = -1;
+    std::vector<int32_t> strip_;
+    bool driver_loop_ = false;
+
+    StreamState state_;
+    std::vector<int32_t> tokens_;
+    std::vector<double> running_;
+    bool opened_ = false;
+    bool finished_ = false;
+    bool stripped_ = false;
+};
 
 } // namespace text
 } // namespace loom

@@ -70,7 +70,8 @@ working exactly as they do; the state belongs on the engine side, as output buff
   kaldi's `snip_edges=False` reflection. No topology changed.
 * The one-pass path keeps no whole-clip feature matrix any more.
 * Not covered yet: tokens out for LMs, audio out for TTS, and the other ASR families. Each is a driver
-  with the three functions (a re-export); the epic's survey says which.
+  with the three functions (a re-export); the epic's survey says which. Tokens out, and the model's KV
+  and conv-state caches, which this state did not hold: [ADR-099](adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md).
 
 ## Related
 

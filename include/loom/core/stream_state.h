@@ -23,17 +23,41 @@
 // A one-pass `call(fn, args)` gets a fresh state for that call alone, so `infer` can be `stream_open`,
 // one `stream_feed` with the whole input and `stream_finish`, and the one-pass gate tests the stream's
 // code.
+//
+// THE MODEL'S CACHES (ADR-099). A decode loop that runs across calls keeps its history in the model's
+// `KvCache` / `ConvStateCache`, which every stream shares. A state either PARKS -- leases the shared
+// cache, its rows copied out while another stream runs (`cache_lease.h`) -- or owns a cache of its own,
+// as `StreamCaches` says per backend. A one-pass call's state always leases: it is gone when the call
+// returns, and a cache allocated for it would be too.
+//
+// ITS OWN RANDOM STREAM, once seeded. A sampled stream drawing from the bridge's one generator would
+// draw a different sequence whenever another stream ran in between; a seeded state carries its own.
+#include "loom/core/cache_lease.h"
+
 #include <ggml-backend.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace loom {
 
+class ConvStateCache;
+class KvCache;
 class OutputStore;
+
+// How a stream keeps its rows of the model's caches apart from other streams' (ADR-099).
+enum class StreamCaches {
+    Auto,      // PerStream on a discrete GPU, Park on the CPU, an integrated GPU or an accelerator
+    Park,      // lease the model's cache; copy the rows out while another stream runs
+    PerStream, // a cache of the stream's own; nothing copied, a full cache per stream
+};
+// What `mode` means for a cache on `backend`.
+bool stream_owns_cache(StreamCaches mode, ggml_backend_t backend);
 
 class StreamState {
 public:
@@ -61,16 +85,44 @@ public:
     // `keep_state` reshapes it to the source's geometry and copies backend to backend.
     OutputStore& tensors_for_write(const std::string& name, ggml_backend_t backend);
 
-    // Everything dropped: a stream reopened from scratch.
+    // Everything dropped: a stream reopened from scratch. Its own caches are kept for the next run,
+    // which overwrites them from position 0; parked rows are not.
     void clear();
+
+    // A one-pass call's state: always leases the model's caches, whatever the mode.
+    bool one_pass() const { return one_pass_; }
+    void set_one_pass(bool one_pass) { one_pass_ = one_pass; }
+
+    // This stream's slot for the shared cache whose serial is `cache_serial`.
+    const std::shared_ptr<ParkedRows>& parked(uint64_t cache_serial);
+    // This stream's own cache standing in for `shared`, allocated like it on first use.
+    KvCache& own_cache(const KvCache& shared);
+    ConvStateCache& own_cache(const ConvStateCache& shared);
+
+    struct Rng {
+        std::mt19937 engine;
+        std::normal_distribution<float> normal{0.0f, 1.0f};
+        std::uniform_real_distribution<float> uniform{0.0f, 1.0f};
+    };
+    // Gives the stream a generator of its own, seeded; null until then, which means the bridge's.
+    void seed_rng(uint32_t seed);
+    Rng* rng() const { return rng_.get(); }
 
     // Bytes the tensor entries hold on their backends, and the values on the host.
     size_t tensor_bytes() const;
     size_t value_bytes() const;
+    // Rows parked on the host while another stream holds a cache, and the caches this stream owns.
+    size_t parked_bytes() const;
+    size_t cache_bytes() const;
 
 private:
     std::unordered_map<std::string, Value> values_;
     std::unordered_map<std::string, std::unique_ptr<OutputStore>> tensors_;
+    std::unordered_map<uint64_t, std::shared_ptr<ParkedRows>> parked_;
+    std::unordered_map<uint64_t, std::unique_ptr<KvCache>> own_kv_;
+    std::unordered_map<uint64_t, std::unique_ptr<ConvStateCache>> own_conv_;
+    std::unique_ptr<Rng> rng_;
+    bool one_pass_ = false;
 };
 
 } // namespace loom
