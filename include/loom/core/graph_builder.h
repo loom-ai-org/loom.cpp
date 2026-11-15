@@ -238,6 +238,12 @@ public:
     // is whatever the largest call so far needed. `false` restores the default, with the under-use
     // count starting again from zero and the next call rebuilt, so that its need is measured.
     void hold_compute_buffer(bool hold);
+
+    // The caches this builder's next build writes and reads (ADR-099): a stream with caches of its own
+    // lends them per call. Handing over a different cache drops the retained graph, whose views point
+    // into the old one. Compared by `LeasedCache::serial`, since the old cache may be gone and a new one
+    // may sit at its address.
+    void set_caches(KvCache* kv_cache, ConvStateCache* conv_state);
     // Releases the retained graph and every buffer it owns NOW -- the compute buffer (on a hybrid
     // builder, the scheduler and its per-backend buffers) and the declared inputs' storage. The next
     // build() constructs a fresh graph at exactly the size it needs. For a host that knows it is about
@@ -294,6 +300,8 @@ private:
     ggml_backend_t backend_;
     KvCache* kv_cache_;
     ConvStateCache* conv_state_;
+    uint64_t kv_serial_ = 0;
+    uint64_t conv_serial_ = 0;
     size_t compute_meta_bytes_;
     // Exactly one of these is ever non-null, chosen once by `backends_.hybrid()`: the gallocr for the
     // CPU-only path, the scheduler for the hybrid one. See the class comment.

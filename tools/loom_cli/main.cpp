@@ -18,6 +18,8 @@
 
 
 #include <algorithm>
+#include <chrono>
+#include <functional>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -36,14 +38,18 @@ void print_usage(const char* argv0) {
                   "usage: %s --model <path.gguf> --prompt \"<text or token ids>\" [--n-predict N]\n"
                   "       %s --model <asr.gguf> --wav <path.wav> [--language en] "
                   "[--task transcribe|translate] [--target-language xx] [--timestamps] "
-                  "[--no-condition-on-previous]\n"
+                  "[--no-condition-on-previous] [--stream MS [--vad <vad.gguf>] [--input name=v ...]]\n"
+                  "       %s --model <lm.gguf> --prompt \"<text>\" --stream N "
+                  "[--stream-caches auto|park|per-stream]\n"
+                  "       %s --model <tts.gguf> --prompt \"<text>\" --out out.wav --stream 1 "
+                  "[--codec <codec.gguf>]\n"
                   "       %s --model <tts-or-codec.gguf> --prompt \"<phonemes|text|codes>\" "
                   "--out out.wav\n"
                   "       %s --model <voice-cloning-tts.gguf> --wav <ref.wav> "
                   "--ref-text \"<what it says>\" --prompt \"<text>\" --out out.wav\n"
                   "       %s --model <text-to-codes.gguf> --prompt \"<text>\" --codec <codec.gguf> "
                   "--out out.wav\n"
-                  "       %s --model <audio-classifier-or-embedder.gguf> --wav <clip.wav>\n"
+                  "       %s --model <audio-classifier-or-embedder.gguf> --wav <clip.wav> [--stream MS]\n"
                   "\n"
                   "  --chat                        wrap --prompt in the model's own chat template\n"
                   "  --system <text>               a system turn ahead of it (implies --chat)\n"
@@ -76,7 +82,7 @@ void print_usage(const char* argv0) {
                   "  $LOOM_PROFILE_NODES=1         ... and a second table keyed on the NODE name, which\n"
                   "                                is the only thing that says which graph a bucket is in\n"
                   "                                (profile with ONE thread; see include/loom/core/profile.h)\n",
-                  argv0, argv0, argv0, argv0, argv0, argv0);
+                  argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 // What ran where, after a device run. The number that matters is the split count: each split is a point
@@ -135,6 +141,36 @@ uint32_t rate_override(const DriverInputs& extra) {
     return 0;
 }
 
+// `--stream` on a model whose answer is audio: `SpeechStream`, each piece reported as it is made -- a
+// few hidden rows for Soprano (ADR-114; `--input piece_tokens=N`, 0 a sentence), a few latent frames for
+// Pocket-TTS (ADR-101), audio frames for LFM2.5-Audio and Voxtral (ADR-115, ADR-116) or mel frames for
+// SpeechT5 (ADR-119; `--input piece_frames=N` fixes the count). The waveform is written whole at the end, so what this shows is when each piece
+// WOULD have been playable.
+std::vector<float> run_speech_stream(loom::Session& session, loom::audio::SpeechStream::Inputs inputs,
+                                     uint32_t rate, uint32_t channels) {
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    loom::audio::SpeechStream stream(session.bridge(), std::move(inputs));
+    std::vector<float> audio;
+    double first = -1.0;
+    while (!stream.finished()) {
+        const std::vector<float> piece = stream.next();
+        if (piece.empty()) continue;
+        const double at = std::chrono::duration<double>(clock::now() - t0).count();
+        if (first < 0) first = at;
+        audio.insert(audio.end(), piece.begin(), piece.end());
+        std::printf("  piece %zu", stream.pieces_done());
+        if (stream.pieces_total() > 0) std::printf("/%zu", stream.pieces_total());
+        std::printf(": %.2f s of audio, ready at %.3f s\n", static_cast<double>(piece.size()) / channels / rate, at);
+        std::fflush(stdout);
+    }
+    const double wall = std::chrono::duration<double>(clock::now() - t0).count();
+    const double seconds = static_cast<double>(audio.size()) / channels / rate;
+    std::printf("  streamed: first audio after %.3f s; %.2f s of audio in %.2f s = %.2fx real time (RTF %.3f)\n",
+                first, seconds, wall, wall > 0 ? seconds / wall : 0.0, seconds > 0 ? wall / seconds : 0.0);
+    return audio;
+}
+
 // Runs a model whose OUTPUT KIND is audio and writes the waveform.
 //
 // **This is the half of the CLI that did not exist**, and its absence was not a small gap: with two
@@ -150,7 +186,7 @@ uint32_t rate_override(const DriverInputs& extra) {
 int synthesize(loom::GgufModel& model, const loom::Backends& backends,
                 const std::vector<int32_t>& ids, const std::string& input_name,
                 const DriverInputs& extra,
-                const std::string& out_path, uint32_t rate_override, uint32_t seed) {
+                const std::string& out_path, uint32_t rate_override, uint32_t seed, bool stream = false) {
     uint32_t rate = model.has_kv("loom.sample_rate") ? model.hparam_u32("sample_rate") : 0;
     if (rate == 0) rate = rate_override;
     if (rate == 0) {
@@ -172,21 +208,32 @@ int synthesize(loom::GgufModel& model, const loom::Backends& backends,
     inputs["seed"] = static_cast<double>(seed);
     set_inputs(inputs, extra);
 
-    const auto result = session.bridge().call("infer", inputs);
-    const auto* samples = std::get_if<std::vector<double>>(&result);
-    if (samples == nullptr) {
-        std::fprintf(stderr, "this model's driver returned a single number, not a waveform\n");
-        return 1;
-    }
-    std::vector<float> audio(samples->begin(), samples->end());
-    double peak = 0.0, sum_sq = 0.0;
-    for (float v : audio) { peak = std::max(peak, std::abs(static_cast<double>(v))); sum_sq += v * v; }
-    // Peak and rms, because they have caught something: real speech lands near +-0.3, and audio that
-    // leaves [-1, 1] means the conditioning is wrong rather than the vocoder (Retro-006).
     // Interleaved channels, read off the file: a stereo codec returns `L R L R ...`, and dividing its
     // length by the rate alone would report twice the duration and write a mono file at half speed.
     const uint32_t channels = model.has_kv("loom.channels")
                                   ? std::max<uint32_t>(model.hparam_u32("channels"), 1) : 1;
+    std::vector<float> audio;
+    if (stream) {
+        if (!loom::audio::SpeechStream::supported(session.bridge())) {
+            std::fprintf(stderr, "error: --stream: this model's driver has no live path (stream_open / "
+                                 "stream_feed / stream_finish). It was exported before streaming, or its "
+                                 "family does not stream yet; without --stream it synthesises as before.\n");
+            return 1;
+        }
+        audio = run_speech_stream(session, std::move(inputs), rate, channels);
+    } else {
+        const auto result = session.bridge().call("infer", inputs);
+        const auto* samples = std::get_if<std::vector<double>>(&result);
+        if (samples == nullptr) {
+            std::fprintf(stderr, "this model's driver returned a single number, not a waveform\n");
+            return 1;
+        }
+        audio.assign(samples->begin(), samples->end());
+    }
+    double peak = 0.0, sum_sq = 0.0;
+    for (float v : audio) { peak = std::max(peak, std::abs(static_cast<double>(v))); sum_sq += v * v; }
+    // Peak and rms, because they have caught something: real speech lands near +-0.3, and audio that
+    // leaves [-1, 1] means the conditioning is wrong rather than the vocoder (Retro-006).
     std::printf("  %zu samples x %u channel(s) at %u Hz = %.2f s, peak %.4f, rms %.4f\n",
                 audio.size() / channels, channels, rate,
                 static_cast<double>(audio.size()) / channels / rate, peak,
@@ -287,7 +334,82 @@ struct Text2CodesRequest {
     std::string codec_path;
     std::string codes_out;
     std::string out_wav;
+    bool stream = false;                // `--stream`: codes to the codec as each frame is drawn
 };
+
+// `--stream` on a pair: the LM's codes handed to the codec as each frame is drawn (ADR-102), so audio is
+// ready a frame after the LM has made it. Both files stay loaded, which the one-pass path avoids -- the
+// price of not waiting for the last frame.
+int stream_pair(loom::GgufModel& lm, const loom::Backends& backends,
+                const loom::audio::SpeechStream::Inputs& inputs, uint32_t width, const Text2CodesRequest& req,
+                uint32_t codec_width, const std::optional<uint32_t>& absent) {
+    using clock = std::chrono::steady_clock;
+    if (req.codec_path.empty() || req.out_wav.empty()) {
+        std::fprintf(stderr, "error: --stream decodes as it goes, so it needs --codec <codec.gguf> and --out\n");
+        return 1;
+    }
+    loom::Session lm_session(lm, backends);
+    auto codec = loom::GgufModel::load(req.codec_path, backends);
+    std::printf("loaded '%s'\n", req.codec_path.c_str());
+    loom::Session codec_session(*codec, backends);
+    for (const auto& [bridge, what] : {std::pair{&lm_session.bridge(), "this model"},
+                                       std::pair{&codec_session.bridge(), "the codec"}}) {
+        if (!loom::audio::SpeechStream::supported(*bridge)) {
+            std::fprintf(stderr, "error: --stream: %s has no live path (stream_open / stream_feed / "
+                                 "stream_finish); it was exported before streaming. Without --stream the pair "
+                                 "runs as before.\n", what);
+            return 1;
+        }
+    }
+    const uint32_t rate = codec->has_kv("loom.sample_rate") ? codec->hparam_u32("sample_rate") : 0;
+    const auto t0 = clock::now();
+    loom::audio::SpeechStream codes(lm_session.bridge(), inputs);
+    loom::audio::CodecStream decoder(codec_session.bridge());
+    std::vector<float> audio;
+    std::vector<int32_t> all, pending;
+    double first = -1.0;
+    size_t frames = 0, pushes = 0;
+    // The codes go to the codec in pushes that GROW, 1 frame, then 2, 4 and 8 (loom-py's
+    // `CodecStream.GROWN`): one frame per push cost the 12 Hz codec RTF 2.56 on the dev box, and four or
+    // more beat its one-pass decode (ADR-102).
+    const auto push = [&]() {
+        const std::vector<float> wav = decoder.push(widen_rows(pending, width, codec_width, absent));
+        audio.insert(audio.end(), wav.begin(), wav.end());
+        frames += pending.size() / width;
+        pending.clear();
+        ++pushes;
+        const double at = std::chrono::duration<double>(clock::now() - t0).count();
+        // A push may hand back nothing yet: a codec decoded by windows holds its last frames for their
+        // lookahead (Dia's DAC, ADR-103), so the first audio is the first push that returns samples.
+        if (first < 0 && !wav.empty()) first = at;
+        std::printf("  frame %zu: %.2f s of audio ready at %.3f s\n", frames,
+                    rate ? static_cast<double>(audio.size()) / rate : 0.0, at);
+        std::fflush(stdout);
+    };
+    while (!codes.finished()) {
+        const std::vector<float> piece = codes.next();
+        if (piece.empty()) continue;
+        const std::vector<int32_t> rows(piece.begin(), piece.end());
+        all.insert(all.end(), rows.begin(), rows.end());
+        pending.insert(pending.end(), rows.begin(), rows.end());
+        if (pending.size() / width >= std::min<size_t>(8, size_t{1} << std::min<size_t>(pushes, 3))) push();
+    }
+    if (!pending.empty()) push();
+    const std::vector<float> tail = decoder.finish();
+    audio.insert(audio.end(), tail.begin(), tail.end());
+    const double wall = std::chrono::duration<double>(clock::now() - t0).count();
+    const double seconds = rate ? static_cast<double>(audio.size()) / rate : 0.0;
+    std::printf("  streamed: %zu frame(s); first audio after %.3f s; %.2f s of audio in %.2f s = %.2fx real "
+                "time (RTF %.3f)\n", frames, first, seconds, wall, wall > 0 ? seconds / wall : 0.0,
+                seconds > 0 ? wall / seconds : 0.0);
+    if (!req.codes_out.empty()) {
+        loom_cli::write_codes_gguf(req.codes_out, all, width, lm.architecture());
+        std::printf("  wrote %s\n", req.codes_out.c_str());
+    }
+    loom_cli::write_wav_pcm16(req.out_wav, audio, rate ? rate : 24000, 1);
+    std::printf("  wrote %s\n", req.out_wav.c_str());
+    return 0;
+}
 
 // **Text in, codec tokens out, and the codec that turns them into audio.** Dia, Qwen3-TTS and MOSS-TTS
 // are two files each (ADR-022): an AR LM that emits frames of codes and a codec that decodes them.
@@ -425,6 +547,8 @@ int text_to_codes(std::unique_ptr<loom::GgufModel>& model, const loom::ModelCont
         return 1;
     }
 
+    if (req.stream) return stream_pair(*model, backends, inputs, width, req, codec_width, absent);
+
     std::vector<double> flat;
     {
         loom::Session session(*model, backends);
@@ -496,10 +620,130 @@ std::string format_time(double seconds) {
     return buf;
 }
 
+// `--stream MS`: the clip through `TranscriptionStream`, one push per MS of audio. Each update that adds
+// text prints with the audio time it was decoded at -- the end of the piece that completed it -- which
+// is the transcript a live caller would have seen by then.
+void run_asr_stream(loom::Session& session, const loom::GgufModel& model, const std::vector<float>& waveform,
+                    uint32_t rate, uint32_t stream_ms, loom::audio::TranscriptionStream::Inputs inputs) {
+    using clock = std::chrono::steady_clock;
+    const size_t piece = std::max<size_t>(1, static_cast<size_t>(rate) * stream_ms / 1000);
+    loom::audio::TranscriptionStream stream(session.bridge(), model, std::move(inputs));
+    const auto print = [&](const loom::audio::TranscriptUpdate& u) {
+        if (u.delta.empty()) return;
+        std::printf("[%s] %s%s\n", format_time(static_cast<double>(u.samples) / rate).c_str(),
+                    u.revised ? "(revised) " : "", u.delta.c_str());
+        std::fflush(stdout);
+    };
+    const auto t0 = clock::now();
+    for (size_t at = 0; at < waveform.size(); at += piece) {
+        print(stream.push(waveform.data() + at, std::min(piece, waveform.size() - at)));
+    }
+    print(stream.finish());
+    const double wall = std::chrono::duration<double>(clock::now() - t0).count();
+    const double audio = static_cast<double>(waveform.size()) / rate;
+    std::printf("transcript: %s\n", stream.text().c_str());
+    std::fprintf(stderr, "(streamed %.2f s in %u ms pieces: %.2fx real time, RTF %.3f; stream state %.1f MB)\n",
+                 audio, stream_ms, wall > 0 ? audio / wall : 0.0, audio > 0 ? wall / audio : 0.0,
+                 (stream.state().tensor_bytes() + stream.state().value_bytes()) / 1e6);
+}
+
+// `--stream MS` on a frame classifier or embedder: `FrameStream` (ADR-106), one push per MS of audio. A
+// classifier prints each change of its most probable label when the push that revealed it returns, beside
+// the frame time it starts at -- what a live caller would have known by then; an embedder, the rows each
+// push answered. A presentation, like the one-pass table: no threshold, no smoothing. `--input name=v`
+// goes to the driver's `stream_open` (MarbleNet's `lookahead_frames`, ADR-120).
+void run_frame_stream(loom::Session& session, const loom::GgufModel& model, const std::vector<float>& clip,
+                      uint32_t rate, uint32_t stream_ms, const DriverInputs& extra_inputs) {
+    using clock = std::chrono::steady_clock;
+    const size_t piece = std::max<size_t>(1, static_cast<size_t>(rate) * stream_ms / 1000);
+    loom::audio::FrameStream::Inputs inputs;
+    for (const DriverInput& in : extra_inputs) {
+        if (in.values.size() == 1 && !in.array) inputs[in.name] = in.values[0];
+        else inputs[in.name] = in.values;
+    }
+    loom::audio::FrameStream stream(session.bridge(), model, std::move(inputs));
+    const bool classes = stream.output_kind() == loom::modality::CLASS;
+    int64_t current = -1;
+    const auto print = [&](const loom::audio::FrameUpdate& u) {
+        const double heard = static_cast<double>(u.samples) / rate;
+        if (!classes) {
+            if (u.n_rows) std::printf("  [%8.3f s heard] rows %u-%u\n", heard, u.first_row, u.first_row + u.n_rows - 1);
+            return;
+        }
+        for (uint32_t r = 0; r < u.n_rows; ++r) {
+            const float* row = u.values.data() + static_cast<size_t>(r) * stream.width();
+            const int64_t best = std::max_element(row, row + stream.width()) - row;
+            if (best == current) continue;
+            current = best;
+            std::printf("  [%8.3f s heard] %8.3f  %s\n", heard, stream.row_start(u.first_row + r),
+                        stream.labels()[best].c_str());
+            std::fflush(stdout);
+        }
+    };
+    const auto t0 = clock::now();
+    for (size_t at = 0; at < clip.size(); at += piece) print(stream.push(clip.data() + at, std::min(piece, clip.size() - at)));
+    print(stream.finish());
+    const double wall = std::chrono::duration<double>(clock::now() - t0).count();
+    const double audio = static_cast<double>(clip.size()) / rate;
+    std::fprintf(stderr, "(streamed %.2f s in %u ms pieces, %u frames: %.1fx real time, RTF %.4f; stream state "
+                 "%.1f KB)\n", audio, stream_ms, stream.rows(), wall > 0 ? audio / wall : 0.0,
+                 audio > 0 ? wall / audio : 0.0, (stream.state().tensor_bytes() + stream.state().value_bytes()) / 1e3);
+}
+
+// The bytes of `s` up to its last complete UTF-8 character: a byte-level BPE token can end inside one,
+// and printing half of it would print a replacement character the next token then cannot take back.
+size_t utf8_complete(const std::string& s) {
+    size_t end = s.size();
+    size_t back = 0;
+    while (end > 0 && back < 4 && (static_cast<unsigned char>(s[end - 1]) & 0xC0) == 0x80) {
+        --end;
+        ++back;
+    }
+    if (end == 0) return s.size();
+    const auto lead = static_cast<unsigned char>(s[end - 1]);
+    const size_t need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+    return need == back + 1 || need == 1 ? s.size() : end - 1;
+}
+
+// `--stream N` on a text model: `GenerationStream`, N tokens per pull, each new piece of text printed
+// as it is drawn. Without a vocabulary the ids print instead.
+void run_text_stream(loom::Session& session, const loom::GgufModel& model, const std::vector<int32_t>& prompt,
+                     const loom::text::GenerateOptions& options, uint32_t per_pull,
+                     const std::function<std::string(const std::vector<int32_t>&)>& decode) {
+    using clock = std::chrono::steady_clock;
+    loom::text::GenerationStream stream(session.bridge(), model, prompt, options);
+    const auto t0 = clock::now();
+    double first = -1.0;
+    size_t printed = 0;
+    while (!stream.finished()) {
+        const std::vector<int32_t> ids = stream.next(per_pull);
+        if (first < 0 && !ids.empty()) first = std::chrono::duration<double>(clock::now() - t0).count();
+        if (decode) {
+            const std::string text = decode(stream.tokens());
+            const size_t upto = stream.finished() ? text.size() : utf8_complete(text);
+            if (upto > printed && text.size() >= printed) {
+                std::fwrite(text.data() + printed, 1, upto - printed, stdout);
+                printed = upto;
+            }
+        } else {
+            for (int32_t id : ids) std::printf(" %d", id);
+        }
+        std::fflush(stdout);
+    }
+    const double wall = std::chrono::duration<double>(clock::now() - t0).count();
+    const size_t n = stream.tokens().size() + (stream.stopped_on_eos() ? 1 : 0);
+    std::printf("\n");
+    std::fprintf(stderr, "(streamed %zu tokens, %u per pull: first after %.3f s, %.2f tok/s after it; "
+                 "stream state %.1f MB)\n",
+                 n, per_pull, first, n > 1 && wall > first ? (n - 1) / (wall - first) : 0.0,
+                 (stream.state().value_bytes() + stream.state().parked_bytes() + stream.state().cache_bytes()) / 1e6);
+}
+
 void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string& wav_path,
              const std::string& language_name, const std::string& task_name,
              const std::string& target_language_name, bool timestamps,
-             bool condition_on_previous) {
+             bool condition_on_previous, uint32_t stream_ms, const DriverInputs& extra_inputs,
+             const std::string& vad_path) {
     // EVERYTHING BELOW THE ARGUMENT PARSING IS THE ENGINE'S NOW (loom/core/transcribe.h). This function
     // used to hold the whole long-form loop -- windowing, segment splitting, the timestamp-aware seek,
     // prev_tokens conditioning -- and loom-py could not reach any of it, so its users got fixed cuts
@@ -516,6 +760,77 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     // (loom/core/session.h). The copy that used to be here attached a KvCache and no ConvStateCache,
     // which would have thrown inside the driver for any speech model carrying ShortConv blocks.
     loom::Session session(model, backends);
+
+    if (!vad_path.empty() && stream_ms == 0) throw loom::Error("--vad cuts a --stream into lines; it needs --stream MS");
+    if (stream_ms > 0 && !vad_path.empty()) {
+        // VAD lines (ADR-127): any recogniser, its one pass re-run over the line still being spoken.
+        auto vad = loom::GgufModel::load(vad_path, backends);
+        loom::Session vad_session(*vad, backends);
+        loom::audio::LineOptions options;
+        options.transcribe.language = language_name;
+        options.transcribe.task = task_name;
+        options.transcribe.target_language = target_language_name;
+        for (const DriverInput& in : extra_inputs) {
+            if (in.values.size() != 1 || in.array) throw loom::Error("--input " + in.name + ": a line option is one number");
+            const double v = in.values[0];
+            if (in.name == "update_seconds") options.update_seconds = v;
+            else if (in.name == "threshold") options.threshold = static_cast<float>(v);
+            else if (in.name == "window_seconds") options.window_seconds = static_cast<float>(v);
+            else if (in.name == "max_line_seconds") options.max_line_seconds = static_cast<float>(v);
+            else if (in.name == "look_behind") options.look_behind = static_cast<size_t>(v);
+            else if (in.name == "max_tokens_per_second") options.max_tokens_per_second = static_cast<float>(v);
+            else if (in.name == "decode_incomplete") options.decode_incomplete = v != 0.0;
+            else throw loom::Error("--input " + in.name + ": not a line option (update_seconds, threshold, "
+                                   "window_seconds, max_line_seconds, look_behind, max_tokens_per_second, "
+                                   "decode_incomplete)");
+        }
+        loom::audio::LineStream stream(session.bridge(), model, vad_session.bridge(), *vad, options);
+        const uint32_t rate = stream.sample_rate();
+        const size_t piece = std::max<size_t>(1, static_cast<size_t>(rate) * stream_ms / 1000);
+        const auto print = [&](const loom::audio::LineUpdate& u) {
+            for (size_t k : u.touched) {
+                const loom::audio::Line& line = stream.lines()[k];
+                std::printf("[%s] line %zu %s %s: %s\n", format_time(static_cast<double>(u.samples) / rate).c_str(), k,
+                            format_time(static_cast<double>(line.start) / rate).c_str(),
+                            line.complete ? "(final)" : "(open)", line.text.c_str());
+            }
+            std::fflush(stdout);
+        };
+        const auto t0 = std::chrono::steady_clock::now();
+        for (size_t at = 0; at < waveform.size(); at += piece)
+            print(stream.push(waveform.data() + at, std::min(piece, waveform.size() - at)));
+        print(stream.finish());
+        const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const double audio = static_cast<double>(waveform.size()) / rate;
+        std::printf("transcript: %s\n", stream.text().c_str());
+        std::fprintf(stderr, "(streamed %.2f s in %u ms pieces, %zu lines: %.2fx real time, RTF %.3f)\n", audio,
+                     stream_ms, stream.lines().size(), wall > 0 ? audio / wall : 0.0, audio > 0 ? wall / audio : 0.0);
+        print_device_report(session.bridge());
+        return;
+    }
+    if (stream_ms > 0) {
+        // The live door, fed from a file: the clip pushed in pieces of `stream_ms` as fast as they
+        // decode, each piece's new text printed when it lands. The options below select a decode the
+        // live door does not take yet, so naming one is refused rather than ignored. `--language` it
+        // takes, as the id `transcribe` would resolve it to (Nemotron's prompt, ADR-109).
+        if (!task_name.empty() || !target_language_name.empty() || timestamps || !condition_on_previous) {
+            throw loom::Error("--stream takes no --task, --target-language, --timestamps or "
+                              "--no-condition-on-previous: the live door decodes with the file's defaults");
+        }
+        loom::audio::TranscriptionStream::Inputs inputs;
+        // `--input name=v` goes to the driver's `stream_open`: the stream's own options (Moonshine's
+        // `update_seconds`; the unified ASR's `left_seconds`, `chunk_seconds`, `right_seconds`, ADR-110).
+        for (const DriverInput& in : extra_inputs) {
+            if (in.values.size() == 1 && !in.array) inputs[in.name] = in.values[0];
+            else inputs[in.name] = in.values;
+        }
+        if (!language_name.empty()) {
+            inputs["language"] = loom::audio::TranscriptionStream::language_input(model, language_name);
+        }
+        run_asr_stream(session, model, waveform, asr_rate ? asr_rate : 16000, stream_ms, std::move(inputs));
+        print_device_report(session.bridge());
+        return;
+    }
 
     loom::audio::TranscribeOptions options;
     options.timestamps = timestamps;
@@ -559,6 +874,9 @@ int main(int argc, char** argv) {
     std::string target_language_name;
     bool timestamps = false;
     bool condition_on_previous = true;
+    uint32_t stream_ms = 0;
+    std::string vad_path;
+    loom::StreamCaches stream_caches = loom::StreamCaches::Auto;
     std::string system_text;
     bool has_prompt = false;
     bool has_ref_text = false;
@@ -615,6 +933,23 @@ int main(int argc, char** argv) {
             target_language_name = argv[++i];
         } else if (arg == "--timestamps") {
             timestamps = true;
+        } else if (arg == "--stream" && i + 1 < argc) {
+            // The live door: push the --wav clip in pieces of this many milliseconds, or, for a text
+            // model, pull this many tokens at a time.
+            stream_ms = static_cast<uint32_t>(std::stoul(argv[++i]));
+            if (stream_ms == 0) {
+                std::fprintf(stderr, "error: --stream takes a piece length (ms of audio, or tokens) above 0\n");
+                return 1;
+            }
+        } else if (arg == "--stream-caches" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "auto") stream_caches = loom::StreamCaches::Auto;
+            else if (mode == "park") stream_caches = loom::StreamCaches::Park;
+            else if (mode == "per-stream") stream_caches = loom::StreamCaches::PerStream;
+            else {
+                std::fprintf(stderr, "error: --stream-caches takes auto, park or per-stream\n");
+                return 1;
+            }
         } else if (arg == "--no-condition-on-previous") {
             // On by default, as in Whisper's own CLI, and switchable for the same reason it is there:
             // carried context is what makes a sentence survive a window boundary, and it is also what
@@ -645,6 +980,8 @@ int main(int argc, char** argv) {
             has_n_predict = true;
         } else if (arg == "--codec" && i + 1 < argc) {
             codec_path = argv[++i];
+        } else if (arg == "--vad" && i + 1 < argc) {
+            vad_path = argv[++i];
         } else if (arg == "--codes-out" && i + 1 < argc) {
             codes_out = argv[++i];
         } else if (arg == "--out" && i + 1 < argc) {
@@ -774,6 +1111,17 @@ int main(int argc, char** argv) {
             }
             const std::vector<float> clip = loom_cli::load_wav_pcm16_mono(wav_path, contract.sample_rate);
             loom::Session session(*model, backends);
+            if (stream_ms > 0) {
+                if (!loom::audio::FrameStream::supported(session.bridge())) {
+                    std::fprintf(stderr, "error: --stream: this model's driver has no live path (stream_open / "
+                                         "stream_feed / stream_finish); it was exported before streaming. Without "
+                                         "--stream it runs the clip in one call as before.\n");
+                    return 1;
+                }
+                run_frame_stream(session, *model, clip, contract.sample_rate, stream_ms, extra_inputs);
+                print_device_report(session.bridge());
+                return 0;
+            }
             if (contract.output_kind == loom::modality::EMBEDDINGS) {
                 const loom::audio::Embeddings result = loom::audio::embed(session.bridge(), *model, clip);
                 auto norm = [&](uint32_t row) {
@@ -851,6 +1199,7 @@ int main(int argc, char** argv) {
             req.codec_path = codec_path;
             req.codes_out = codes_out;
             req.out_wav = out_wav;
+            req.stream = stream_ms > 0;
             return text_to_codes(model, contract, backends, req);
         }
 
@@ -922,7 +1271,7 @@ int main(int argc, char** argv) {
                 }
                 std::printf("\n");
                 return synthesize(*model, backends, widen_rows(file.codes, file.n_codebooks, width, absent),
-                                  "codes", extra_inputs, out_wav, rate_override(extra_inputs), synth_seed);
+                                  "codes", extra_inputs, out_wav, rate_override(extra_inputs), synth_seed, stream_ms > 0);
             }
             const std::vector<double> codes = read_number_spec(prompt_text);
             if (width > 0 && codes.size() % width != 0) {
@@ -934,7 +1283,7 @@ int main(int argc, char** argv) {
                         width > 0 ? codes.size() / width : codes.size());
             const std::vector<int32_t> ids(codes.begin(), codes.end());
             return synthesize(*model, backends, ids, "codes", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "supertonic") {
@@ -963,7 +1312,7 @@ int main(int argc, char** argv) {
                 }
                 if (!out_wav.empty()) {
                     return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                                      rate_override(extra_inputs), synth_seed);
+                                      rate_override(extra_inputs), synth_seed, stream_ms > 0);
                 }
             }
             return 0;
@@ -988,7 +1337,7 @@ int main(int argc, char** argv) {
             }
             if (out_wav.empty()) return 0;
             return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "pocket_tts") {
@@ -1009,7 +1358,7 @@ int main(int argc, char** argv) {
             std::printf("  %zu id(s)\n", ids.size());
             if (out_wav.empty()) return 0;
             return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "soprano") {
@@ -1027,7 +1376,7 @@ int main(int argc, char** argv) {
             std::printf("  %zu id(s)\n", ids.size());
             if (out_wav.empty()) return 0;
             return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "cosyvoice3") {
@@ -1046,7 +1395,7 @@ int main(int argc, char** argv) {
             std::printf("  %zu id(s)\n", ids.size());
             if (out_wav.empty()) return 0;
             return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "voxcpm2") {
@@ -1065,7 +1414,7 @@ int main(int argc, char** argv) {
             }
             if (out_wav.empty()) return 0;
             return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (contract.task == loom::task_names::TTS && model->has_kv("tokenizer.ggml.model") &&
@@ -1083,7 +1432,7 @@ int main(int argc, char** argv) {
             std::printf("  %zu id(s)\n", ids.size());
             if (out_wav.empty()) return 0;
             return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "f5") {
@@ -1132,7 +1481,7 @@ int main(int argc, char** argv) {
             extra.push_back({"waveform", std::vector<double>(reference.begin(), reference.end()), true});
             extra.push_back({"n_ref_text", std::vector<double>{static_cast<double>(ref_ids.size())}, false});
             return synthesize(*model, backends, all_ids, "text_ids", extra, out_wav,
-                              rate_override(extra_inputs), synth_seed);
+                              rate_override(extra_inputs), synth_seed, stream_ms > 0);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "phonemes") {
@@ -1176,7 +1525,7 @@ int main(int argc, char** argv) {
                 }
                 if (!out_wav.empty()) {
                     return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
-                                      rate_override(extra_inputs), synth_seed);
+                                      rate_override(extra_inputs), synth_seed, stream_ms > 0);
                 }
             }
             return 0;
@@ -1250,7 +1599,7 @@ int main(int argc, char** argv) {
                     return 0;
                 }
                 return synthesize(*model, backends, prompt_tokens, "tokens", extra_inputs, out_wav,
-                                  rate_override(extra_inputs), synth_seed);
+                                  rate_override(extra_inputs), synth_seed, stream_ms > 0);
             }
 
             if (is_multi_topology) {
@@ -1263,9 +1612,16 @@ int main(int argc, char** argv) {
                 // which is how the divergence was found (docs/HIGH-LEVEL-API.md §1).
                 loom::Session session(*model, backends);
 
-                std::printf("Running dynamic GGUF generation for %d tokens...\n", n_predict);
                 loom::text::GenerateOptions gen = gen_opts;
                 gen.max_new_tokens = n_predict;
+                if (stream_ms > 0) {
+                    session.bridge().set_stream_caches(stream_caches);
+                    run_text_stream(session, *model, prompt_tokens, gen, stream_ms,
+                                    has_text_vocab ? std::function<std::string(const std::vector<int32_t>&)>(decode_ids)
+                                                   : nullptr);
+                    return 0;
+                }
+                std::printf("Running dynamic GGUF generation for %d tokens...\n", n_predict);
                 const std::vector<int32_t> generated =
                     loom::text::generate(session.bridge(), *model, prompt_tokens, gen);
 
@@ -1300,7 +1656,7 @@ int main(int argc, char** argv) {
 
         if (has_wav) {
             run_asr(*model, backends, wav_path, language_name, task_name, target_language_name, timestamps,
-                    condition_on_previous);
+                    condition_on_previous, stream_ms, extra_inputs, vad_path);
         }
     } catch (const loom::Error& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

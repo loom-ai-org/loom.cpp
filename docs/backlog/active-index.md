@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-10
+last_updated: 2026-11-15
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **Republish Zipformer small after 1.0.0rc21 (P4.53 needs `ARGMAX`)** | P4.49-P4.54 are merged (loom.cpp #112, loom-exporter #74, 2026-11-06). The published `zipformer-small-loom` is the rc20 export: it still runs the joint once per frame. A fresh export has the block-4 joint ending in `ARGMAX`, which no runtime before `loom-py-rt` 1.0.0rc21 has (`OP_FIRST_RUNTIME`). Full 60 s transcription with it: dev-box CPU 7.39 -> 6.61 s, Vega 3 8.00 -> 5.66 s, Intel iGPU 2.70 -> 1.62 s, M1 CPU 1.36 -> 1.09 s, Metal 1.44 -> 1.09 s. After rc21: export, gate, republish. [Epic-05](../epics/epic-05-edge-performance.md#p449-p453--zipformers-encoder-is-slower-than-pytorchs--scoped-2026-11-05) |
+| **Republish Zipformer small, and publish Zipformer small streaming, after 1.0.0rc21 (P4.53 needs `ARGMAX`)** | `zipformer-small-streaming` is built and verified (2026-11-08, [Epic-03](../epics/epic-03-model-coverage.md#zipformer-small-streaming-the-chunk-loop-in-the-driver)); its joint is the same block-4 `ARGMAX` one, so it publishes with the republish.  P4.49-P4.54 are merged (loom.cpp #112, loom-exporter #74, 2026-11-06). The published `zipformer-small-loom` is the rc20 export: it still runs the joint once per frame. A fresh export has the block-4 joint ending in `ARGMAX`, which no runtime before `loom-py-rt` 1.0.0rc21 has (`OP_FIRST_RUNTIME`). Full 60 s transcription with it: dev-box CPU 7.39 -> 6.61 s, Vega 3 8.00 -> 5.66 s, Intel iGPU 2.70 -> 1.62 s, M1 CPU 1.36 -> 1.09 s, Metal 1.44 -> 1.09 s. After rc21: export, gate, republish. [Epic-05](../epics/epic-05-edge-performance.md#p449-p453--zipformers-encoder-is-slower-than-pytorchs--scoped-2026-11-05) |
 | **LiteRT thread (2026-10-11): int8 is where XNNPACK's case is. The queue, in the user's order** | Results: Engine — performance, the XNNPACK item. ~~**(1) Q4 arm**~~ **DONE 2026-10-11** (the XNNPACK item's "4-bit" block): Q4_0 is slower than Q8_0 in ggml except on ARMv6; ggml's own Q4_0 repack matches XNNPACK `qb4w` on the M1; `qb4w` wins 1.5-1.9x only where no repack applies (A72); XNNPACK's 4-bit is slower than its int8 everywhere; `qb4w` cannot take Q4_0 blocks as-is (positive BF16 scales only). ~~**(2) `CPU_REPACK` in the engine**~~ **DONE 2026-10-11, opt-in** ([ADR-075](../adrs/adr-075-quantized-weights-reach-ggmls-repack-by-placement-and-routing.md), `LOOM_CPU_REPACK=1|kleidiai`): on the M1, whisper-small 1.24-1.54x and Qwen3-0.6B decode 1.34-1.56x at one thread, 1.02-1.07x at 8 (memory-bound); KleidiAI best for Q8_0 prefill (1.53x) but 0.83x on Q8_0 decode at one thread. Whether it becomes the default is the open item under Engine — performance. ~~**(3) ADR: the XNNPACK microkernel bridge**~~ **WRITTEN 2026-10-11, proposed** ([ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md)): a ggml patch adding a `CPU_XNNPACK` buffer type built like KleidiAI's, with only the selected per-ISA `qd8` kernels vendored and run on ggml's own threads; weights as row-uniform Q8_0 (`--quantize Q8_0_PC`), which every backend still reads as plain Q8_0 and the bridge packs losslessly; first cut `mul_mat` on Q8_0 only; main case the A72 (2.4-2.7x at the GEMM), then x86 Q8_0. ~~**(4) ADR: static int8 (qs8)**~~ **WRITTEN 2026-10-11, proposed** ([ADR-077](../adrs/adr-077-static-int8-for-citrinet-256-on-the-pi-zero.md)): the RTF ~1.5 estimate was taken against the wrong baseline and is withdrawn. Against the F32 conv sweep Citrinet actually runs (0.22 GOP/s), XNNPACK `qs8` (0.54-0.62 on ARMv6) gives RTF ~1.8; even an infinitely fast GEMM leaves 0.82. So real time needs the non-GEMM 24% faster too, and an ARMv6 int8 GEMM ~2x XNNPACK's. Its four gates in order: split the 24% by op on the board; an ARMv6 int8 GEMM >= 1.2 GOP/s; WER; jfk on the board. ~~**(5) Port XNNPACK's softmax**~~ **PORTED 2026-10-13 as `ggml-0029`** (the `SOFT_MAX` item): one thread, dense/causal, x86 1.45x/2.05x, Pi 4 2.10x/2.14x, M1 1.54x/1.71x, Pi Zero 1.46x/1.15x; accuracy kept by a grouped f64 sum. CosyVoice3's free-running gate failed on it; a control showed it measures chaos, mel and ASR held on two more fixtures, and its bound is now 6e-2. ~~**(6) Fix ggml's F32 GEMM throughput at large K**~~ **PATCHED 2026-10-13 as `ggml-0030`, aarch64 only, bit-identical** (the large-K item): Pi 4 K=3072 1.35x at 1 thread, 1.41x at 4. Original: (whisper `fc2`, K=3072, runs at half the rate of K=768 on the Pi 4 and the Pi Zero, not on the M1). Find where the drop starts by sweeping K, then fix the K blocking. It also hits Qwen3-0.6B's `down_proj` (the large-K item). The gemma-3 "KV leak" was not one ([Retro-084](../retros/retro-084-a-sampler-was-logged-as-a-leaking-cache.md)). The LiteRT steps 1-2 (ADR-072, ADR-073), the T5 encoder bias (ADR-074) and the pad_crop retirement are released in 1.0.0-rc18 (loom.cpp #77/#78, loom-exporter #57). |
 | **Raspberry Pi 4 after P4.35-P4.40 (merged 2026-10-24)** | The Pi 4 table ([BENCHMARKS.md](../BENCHMARKS.md#raspberry-pi-4)), re-run on main `159f4cb` + `ggml-0053`, has VITS F32 against onnxruntime at **1.34x** (was 1.03x) and 5.03x `Q8_0_PC` (was 3.90x), Citrinet F32 0.65x (was 0.61x), whisper-small 1.00x F32 (unresolved) and 1.17x `Q8_0_PC`, and rows for the distilled Pocket TTS models (18m/7m/2m at RTF 0.50/0.27/0.13 F32, Q8_0_PC 1.68x/1.21x/1.03x faster). The largest shares of a VITS synthesis left on the board (profile after P4.40, 2.49 s of node time): the flow and text encoder's im2col convolutions at 286 positions, 17%; the vocoder's staged convolutions, 27% over three stages; and the resblock-sum ADDs at 73 216 x 32 and 18 304 x 64, 13% at memory speed. [Epic-05](../epics/epic-05-edge-performance.md#p440-vitss-vocoder-convolutions-on-the-raspberry-pi-4-2026-10-23) |
 | **ADR-079: ARMv6 F32 kernels on the VFP11's short vectors, then dynamic int8 (user, 2026-10-14)** | ADR-077's cross-model analysis found F32 at equal effort beats today's ggml by more than either int8 option adds: projected 1.3-3.0x on 11 of 13 Pi Zero models from the F32 family alone. **P4.32a done 2026-10-14:** the `LEN = 4` harness (`scripts/armv6_shortvec.py`), and gate 1 passed on the board in RunFast and IEEE mode, with sabotage red ([ADR-079 gate 1](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md#gate-1-measured-2026-10-14-passed)). **P4.32b done 2026-10-14** (`ggml-0032`): vocoder convs 2.67x at the op; amy/de051/VITS **1.73-1.74x** end to end (de051 RTF 1.91 -> 1.10), outputs identical to the ear (ASR oracle) ([ADR-079 P4.32b](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md#p432b-measured-2026-10-14-the-direct-conv-tile-in-ggml-ggml-0032)). **P4.32b's wide/dilated shapes + P4.32c (GEMV, `ggml-0033`) done 2026-10-15**, all outputs bit-identical: VITS 1.37x more (RTF 7.91), amy 1.23x (3.16), Moonshine F32 1.32x (4.27), Silero VAD 1.47x ([ADR-079](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md#p432bs-wide-and-dilated-shapes-and-p432c-the-gemv-measured-2026-10-15)). **P4.32d done 2026-10-15** (`ggml-0034`: GEMM n >= 24, 1x1 and strided convs on the same kernel): Citrinet Q8_0 1.72x (RTF 1.54), Moonshine F32 1.43x (RTF 2.98), conformer 1.18x, heart 1.16x; transcripts and CTC argmax unchanged ([ADR-079 P4.32d](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md#p432d-measured-2026-10-15-the-gemm-1x1-and-strided-convolutions-ggml-0034)). **P4.32e done 2026-10-15** (`ggml-0035`, depthwise on a ring of VFP registers): 10.9x at the op; Citrinet F32 1.28x, Q8_0 1.27x end to end, CTC ids unchanged ([ADR-079 P4.32e](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md#p432e-measured-2026-10-15-the-depthwise-kernel-ggml-0035)). **P4.32f f1 done 2026-10-15** (`ggml-0036`, RELU + time mask in the conv epilogue, plus the exporter's topology CSE that put each mask MUL next to its producer): Citrinet F32 1.067x end to end (RTF 1.28 -> 1.20), outputs bit-identical with the epilogue on and off; most of P4.32f's projected budget turned out to be fused already ([ADR-079 P4.32f](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md#p432f-measured-2026-10-15-the-convolution-epilogue-ggml-0036-and-the-exporters-topology-cse)). **P4.32g built 2026-10-15** (STFT/ISTFT engine ops on an FFT, [ADR-080](../adrs/adr-080-stft-and-istft-are-engine-ops-on-an-fft.md)): heart-nano 3.09x (RTF 0.33), heart 1.79x (RTF 0.87, now faster than real time), Citrinet 1.04x (RTF 1.14), all after a re-export. **P4.32f f2 steps 1-2 done 2026-10-16** (`ggml-0037` elementwise passes at memory speed, bit-identical, 1.02-1.07x on ten models; `ggml-0038` transposed convolutions as polyphase direct convs, amy 1.134x, de051 1.145x (RTF 0.88), VITS 1.077x, same transcripts) ([ADR-079 P4.32f f2](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md#p432f-f2-measured-2026-10-16-the-elementwise-passes-ggml-0037-and-the-transposed-convolution-ggml-0038)). **f2 step 3a done 2026-10-16** (`ggml-0039`: GELU_ERF bit-identical 2.48x, SIGMOID/SILU 2.13x, TANH 3.92x at the op on the VFP's short vectors; 1.01-1.05x on eight models, heart 1.054x; the gate caught a NaN the CI test had passed, [Retro-087](../retros/retro-087-a-worst-error-check-passed-a-nan.md)) ([ADR-079 step 3a](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md#step-3a-measured-2026-10-16-the-activations-ggml-0039)). **f2 step 3b measured out 2026-10-16** (the resblock-tail fusion bought nothing; f1's `ggml-0036` epilogue now defaults OFF, Citrinet F32 1.040x, [ADR-079 step 3b](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md#step-3b-measured-2026-10-16-the-resblock-tail-measured-out-and-ggml-0036s-epilogue-now-off-by-default)). **P4.33 built 2026-10-16** (`ggml-0041`-`0044`: `CPU_ARMV6_I8`, a dynamic int8 GEMV, GEMM tiles and pointwise convs on the exporter's new `--quantize Q8_0_PC`; the engine places those weights by default on ARMv6): **Citrinet-256-ls 1.321x over F32 (RTF 0.89), Moonshine tiny 1.243x (WER 10.09%, within its bar), WakeHuBERT 1.124x**; Silero VAD 1.20x but fails its bar by one flipped frame, so no quantized card ([ADR-079 P4.33](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md#p433-measured-2026-10-16-dynamic-int8-ggml-0041-ggml-0042-ggml-0043)). f2 step 3c and f3 stay as leftovers. Static int8 is held. Items under Engine — performance, the ADR-079 item; [ADR-079](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md). |
@@ -223,7 +223,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
     *Context: [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)*
 * [ ] **Qwen3-ASR-0.6B variants beyond the exported leaf** — `qwen3-asr-0.6b-hf` is shipped; the 1.7B
   and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
-* [ ] **Zipformer's other variants.** Small, non-streaming, transducer is built ([Epic-03](../epics/epic-03-model-coverage.md)). Medium and large should reuse the leaf; `-streaming` is a different leaf, with six cache tensors per layer. CUDA has not run it yet.
+* [ ] **Zipformer's other variants.** Small and small streaming are built ([Epic-03](../epics/epic-03-model-coverage.md#zipformer-small-streaming-the-chunk-loop-in-the-driver)). Medium and large should reuse the two leaves; the streaming leaf's 320 ms and 1280 ms latencies are its `CHUNK_SIZE` / `LEFT_CONTEXT` constants. The CTC heads are not exported. CUDA has not run either leaf, and no GPU has run the streaming one.
 * [ ] **P5 breadth: family 14 (music)**: MusicGen Small is published (2026-10-10); the next leaf is unscoped (see *Now*).
   Every earlier family in the coverage-per-effort order is complete or parked. Chatterbox showed that a leaf
   composes from the existing templates, so what the next one costs is its own front end and its own
@@ -241,10 +241,15 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 * [ ] **`log_softmax` lowers as `log(softmax(x))`** (coremltools' torch frontend), which is -inf below
   about -103 in f32. Canary's head stops before it; the CTC heads still carry it. Harmless for an argmax,
   wrong as a tensor. A stable form needs a row max the engine has no primitive for.
+* [ ] **Nemotron 3.5 ASR at Q8_0: a one-chunk stream call drifts.** `encoder_step` on 4 rows is 0.376 from the F32
+  encoder where the one call and 2+ chunks per call are 0.148 (f5_tts_ref, dev-box AVX2); ids still matched on
+  two clips. Find the op that is less accurate at 4 rows before a Q8_0 file is published. *Context:
+  [ADR-109](../adrs/adr-109-nemotron-asr-streams-its-cache-aware-encoder-a-chunk-at-a-time.md)*
 * [ ] **Kyutai STT and LFM2.5-Audio are published at F32** (rc14, 2026-10-02): at F32 Kyutai runs
   about 5x slower than real time on the 2-core box and LFM2.5's two files are 5.2 and 5.5 GB. Measure
   Q8_0 against each gate (`test_e2e_kyutai_stt_lua_driver`, `test_e2e_lfm25_audio_{asr,tts}_lua_driver`,
-  whose reference scripts are in `scripts/`) and republish if the transcripts and codes hold.
+  whose reference scripts are in `scripts/`) and republish if the transcripts and codes hold. Kyutai Q8_0 on jfk
+  (2026-11-11, ADR-108): the same text as F32, one pass 0.70x real time (RTF 1.44) against F32's 0.26x.
 * [ ] **LFM2.5-Audio's interleaved speech-to-speech door** (`generate_interleaved`, text and audio in a
   fixed 6:12 pattern, multi-turn chat) -- not requested; the TTS door's phases are all it needs, plus
   an audio-in prompt segment (the ASR door's encoder) and the interleave schedule in the driver.
@@ -277,6 +282,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
     model costs N+1 checkpoint loads under isolation today. It would not change the peak.
 
 ## Exporter / MIL compiler
+
+* [ ] **A strided slice is refused, not lowered.** `slice_by_index` ignored `stride` and declared the unstrided
+  extent ([Retro-103](../retros/retro-103-an-argument-the-lowering-did-not-read.md)); it now raises. Outer-axis
+  strides could lower to a VIEW with `nb1`..`nb3`; the innermost axis needs a gather. The published files
+  have not been re-exported against the refusal, so one that hid a strided slice would surface there.
 
 * [ ] **P4.34: pad weight axes to what the kernels need ([ADR-081](../adrs/adr-081-the-exporter-pads-weight-axes-to-what-the-kernels-need.md), accepted 2026-10-22).** Built: loom-exporter #64 (`pad_axes.py`, default `auto`). Vocetta2 exported with it and published (F32 + Q8_0_PC, three repos): F32 1.10-1.36x on the Pi Zero, 1.09-1.15x on the Pi 4 at one thread. Republished on rc19 where it pads materially: Kokoro, StyleTTS2, sanoTTS heart/heart-nano, WakeHuBERT, Citrinet-256 (the state anchor above). Open: a board check of those padded F32 files against the rc18 ones; whether any sub-2% straggler is worth republishing; the Q8 rule's cases (conformer, sanoTTS 0.51m, Moonshine streaming small) once they publish an int8 file; the residual-stream v2.
 * [ ] **A shape read as DATA aborts in the engine.** (Nemotron ASR met it too, 2026-10-10: `(n - 1) - arange(2n - 1)` put a 4-wide `n - 1` into a SUB; spelled `-arange(1 - n, n)` instead.) `length / waveform.shape[1]` (or `lengths *
@@ -370,6 +380,14 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — correctness
 
+* [ ] **The hybrid path still lays a graph out by the graph before it.** `GraphBuilder::allocate_scheduled`
+  hands `ggml_backend_sched_alloc_graph` the graph, and the scheduler's gallocr re-plans only when it does not
+  fit, as the CPU path did until [Retro-105](../retros/retro-105-a-graph-laid-out-by-the-graph-before-it.md).
+  Not seen to bite (the conv fusion that read the layout is CPU-only, and CosyVoice3's CUDA stream
+  interleaved bit-identically), but a layout-dependent kernel on a device would. The fix is a
+  `ggml_backend_sched_reserve` per rebuild, held back because P4.46's re-split retry for the vc4 pool sits on
+  that path and needs a Pi to check.
+
 * [ ] **A seed is not portable across C++ standard libraries.** `lua_bridge.h` draws through
   `std::normal_distribution` / `std::uniform_real_distribution`, whose algorithms are implementation-defined,
   so the same seed gives different VITS durations and Matcha noise on Windows (MSVC STL) than on Linux
@@ -407,6 +425,22 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   shape of bug one op over.*
 
 ## Engine — performance
+
+* [ ] **Chatterbox's remaining CPU gap to PyTorch.** Workstation CPU (Core Ultra 9 285K, 8 performance + 16
+  efficiency cores), 8 s of audio: upstream PyTorch 12.5 s; loom 16.25 s at 16 threads and 20.4 s at its default
+  24, after [ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md) batched both
+  guidance pairs (T3 is now ahead of PyTorch per token). Two parts, measured separately:
+  * *The default thread count on a hybrid CPU* (about 4 s). `default_cpu_thread_count()` is the physical core
+    count, 24 here, and every node's barrier then waits on the slow cores: the batched T3 step is 61 ms at 24
+    threads and 44 at 16. The estimator goes the other way (4.1 s at 24, 4.9 at 16). Measure across the zoo before
+    choosing a rule (performance cores only? a count per graph?); read
+    [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) first.
+  * *The estimator* (about 1.5-2.3 s). The flow's 10 guided steps take 4.0 s at 24 threads where upstream's take
+    2.6 s, the same batch of two: a compute-bound U-Net (convolutions, 12 transformer blocks over ~700 frames),
+    so ggml's F32 GEMM and conv paths on these shapes. Profile per op with one thread before guessing.
+
+  Kit on the workstation: `/mnt/datasets/loom-chatterbox-prof/` (the English checkpoint, `torch_baseline.py`,
+  `timer_patch.py` for per-module wall times in the bridge, `mm_bench.cpp`); a re-export takes ~100 s.
 
 * [ ] **x86 without AVX2 runs loom's own kernels scalar.** The conv1d direct tile and friends are AVX2-only;
   on an SSE4.2 CPU (Celeron N4100) the build limited to that variant is 1.5x (Zipformer) to 2.5x (VITS) slower
@@ -944,6 +978,115 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   [Epic-07 §4](../epics/epic-07-text-frontends-and-tokenizers.md) before opening this one.
 
 ## Host API
+
+* [ ] **A streaming API for every model that can stream: the rest of the survey.** The live door is built
+  for ASR on Zipformer streaming (2026-11-08, [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md)):
+  engine-owned `StreamState`, `stream_open` / `stream_feed` / `stream_finish`, `TranscriptionStream`,
+  `loom_cli --stream`, loom-py `speech2text.stream()`. Tokens out is built for the causal LMs
+  ([ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md): the KV and conv caches
+  parked or per-stream, `GenerationStream`, loom-py `text2text.stream()`); they need a re-export to carry
+  the stream functions. Audio out is built a sentence at a time
+  ([ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md): `SpeechStream`, exact
+  for Pocket-TTS x4 and Soprano after a re-export, loom-py cuts every other TTS by sentence), and Pocket-TTS
+  a frame at a time (ADR-101: first audio after 0.20 s), and the Qwen3-TTS codec pair
+  ([ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md):
+  a `CodecStream` with its state carried; the talker is RTF ~11 on the dev-box CPU, so live only on a GPU),
+  and Audio8-TTS's pair on the same machinery, and MOSS-TTS and Dia
+  ([ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md): a module may declare a ring KV
+  cache of its own; DAC decoded in windows), and MusicGen with EnCodec, and SNAC alone
+  ([ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md): EnCodec's LSTM
+  carried across pushes by `run_recurrent`'s `carry`, its convolutions windowed; SNAC's noise drawn per frame),
+  and Silero VAD through a fifth door, `FrameStream`, audio in and rows out
+  ([ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md): 1.9e-06 from one call),
+  and Moonshine streaming tiny and small, which re-decode
+  ([ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md): the hypothesis in the
+  state, encoder windows; the stream ends on one call's ids; small is 0.81x real time on the dev-box CPU),
+  and Kyutai STT, frame-synchronous
+  ([ADR-108](../adrs/adr-108-kyutai-stt-streams-its-encoder-with-moshis-state-carried.md): moshi's encoder state
+  carried on the device, the RVQ in one graph; Q8_0 0.68x real time on the dev-box CPU, as fast as its one pass),
+  and Nemotron 3.5 ASR, cache-aware
+  ([ADR-109](../adrs/adr-109-nemotron-asr-streams-its-cache-aware-encoder-a-chunk-at-a-time.md): the encoder a few
+  320 ms chunks per call with its caches carried; the stream ends on one call's ids; a stream's language by name),
+  and the unified ASR, buffered
+  ([ADR-110](../adrs/adr-110-the-unified-asr-streams-the-way-nemos-buffered-streaming-does.md): NeMo's streaming
+  loop, its latency a stream option; ends on NeMo's streamed ids; 0.33x real time at the default on the dev-box CPU),
+  and VoxCPM2, a patch at a time
+  ([ADR-111](../adrs/adr-111-voxcpm2-streams-a-patch-at-a-time-through-a-state-carrying-vae-step.md): the AudioVAE's
+  conv state carried; first 160 ms after 3.4 s where the one pass takes 49 s on the dev-box CPU),
+  and CosyVoice3, a hop of tokens at a time
+  ([ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md):
+  upstream's streaming mode, the flow re-run per hop under the DiT's chunk mask; so it joins to `infer` with
+  `streaming = 1`, not the default; first 1.36 s after 46.5 s where the one pass takes 141 s on the dev-box CPU),
+  and Soprano within a sentence
+  ([ADR-114](../adrs/adr-114-soprano-streams-within-a-sentence-by-decoding-windows-of-hidden-rows.md): the decoder
+  over windows of rows with its receptive field either side; bit-identical to `infer`; first 64 ms after 0.32 s),
+  and LFM2.5-Audio's TTS a frame at a time
+  ([ADR-115](../adrs/adr-115-lfm25-audio-tts-streams-a-frame-at-a-time-by-detokenizing-windows.md): the detokenizer
+  over windows from its receptive field back; first 60 ms after 2.1 s where the one pass takes 41 s on the dev-box CPU),
+  and Voxtral-4B-TTS a frame at a time
+  ([ADR-116](../adrs/adr-116-voxtral-tts-streams-a-frame-at-a-time-through-its-chunked-causal-codec.md): the one
+  pass's chunked causal codec decode, started at the first new frame; first 80 ms after 4.4 s where the one pass
+  takes 38 s on the workstation's CPU),
+  and Chatterbox a hop at a time
+  ([ADR-117](../adrs/adr-117-chatterbox-streams-a-hop-at-a-time-by-re-running-its-full-attention-flow.md):
+  CosyVoice2's re-run loop over S3Gen's `finalize` hook, HiFT re-run with 20 frames held; its flow attends over
+  everything, so the join is not `infer`'s audio but nearer it than another noise draw; first 0.6 s after 37 s
+  where the one pass takes 126 s on the dev-box CPU; RTX 5090: 49/49, first piece after 0.5 s, the stream 3.0x real time; both guidance pairs one batch of two since
+  [ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md)),
+  and SpeechT5 a few mel frames at a time
+  ([ADR-119](../adrs/adr-119-speecht5-streams-mel-frames-by-vocoding-windows.md): the postnet + HiFi-GAN over
+  windows of its 34-frame receptive field either side; first 32 ms after 1.7 s where the one pass takes 22.6 s
+  on the dev-box CPU; every audio-out row of the survey is now built),
+  and WakeHuBERT and MarbleNet a frame at a time
+  ([ADR-120](../adrs/adr-120-a-frame-model-with-a-finite-reach-streams-by-windows-over-its-one-pass-graph.md): the
+  one-pass graph over windows holding each frame's measured reach; `FrameStream` takes `stream_open` options,
+  MarbleNet's `lookahead_frames`). Open there: a state-carrying WakeHuBERT step if a device needs 20 ms pushes
+  cheaper than recomputing 2.4 s of context (2.0x real time on the dev box),
+  and Qwen3-ASR and oruk-loop the way `streaming_transcribe` re-feeds everything
+  ([ADR-121](../adrs/adr-121-qwen3-asr-streams-the-way-its-reference-does-re-encoding-only-what-changed.md):
+  the prefix cut from text through `loom.tokenize`/`detokenize`; only the 8 s encoder window still filling
+  re-encoded, the decoder's keys over the rest kept; 0.37x real time on 30 s on the dev-box CPU where re-feeding
+  is 0.22x; the prefix still grows, as upstream's).
+  Parakeet TDT and RNN-T stream as NeMo's buffered script does
+  ([ADR-122](../adrs/adr-122-parakeet-streams-the-way-nemos-buffered-script-does.md): ADR-110's loop shared, TDT's
+  jump carried; NeMo's ids at four latencies).
+  Conformer-CTC and both Citrinets stream as NeMo's `FrameBatchASR` does
+  ([ADR-123](../adrs/adr-123-a-nemo-ctc-model-streams-the-way-framebatchasr-does.md): the leaf multi-phase, its
+  driver's mel checked step by step).
+  Canary streams under both of NeMo's policies, wait-k and AlignAtt
+  ([ADR-124](../adrs/adr-124-canary-streams-the-way-nemos-aed-streaming-script-does.md): the decoder's layer -2
+  cross-attention a second output; every step's kept context NeMo's). Every NeMo row of the survey is built.
+  On an RTX 5090 every NeMo stream passes its gate and runs 29-309x real time (Canary's 60 s AlignAtt 11.5x -> 52x)
+  ([ADR-125](../adrs/adr-125-a-buffered-stream-runs-on-the-gpu-without-host-round-trips.md)).
+  The re-decoding rows are built too, each in the reference the user chose: HuBERT and data2vec in the transformers
+  pipeline's strided chunks
+  ([ADR-126](../adrs/adr-126-a-wav2vec2-style-ctc-model-streams-in-the-transformers-pipelines-strided-chunks.md));
+  moonshine-tiny, Granite Speech, LFM2.5-Audio ASR, SenseVoice, Paraformer and GigaAM in Moonshine's VAD lines,
+  `LineStream` composing the zoo's Silero with any recogniser, no re-export
+  ([ADR-127](../adrs/adr-127-a-recogniser-without-a-streaming-mode-streams-in-moonshines-vad-lines.md));
+  Whisper as ufal's SimulStreaming streams it
+  ([ADR-128](../adrs/adr-128-whisper-streams-the-way-simulstreaming-does.md)). All gated on the dev-box CPU or
+  the RTX 5090 or both.
+  pyannote streams as diart's voice activity detection does
+  ([ADR-129](../adrs/adr-129-pyannote-streams-the-way-diarts-voice-activity-detection-does.md): a speech score per
+  row, `loom.stream.labels`, rows on diart's own grid stated per row; every row and turn diart's on 35 cases), and
+  flan-t5-small hands its tokens back as they are drawn
+  ([ADR-130](../adrs/adr-130-an-encoder-decoder-token-stream-keeps-its-per-call-context-in-the-state.md): the cross
+  K/V and source length kept in the stream state; the published file, which the door took for a causal LM, is now
+  refused). **Every row of the survey is built** (the user chose flan-t5 alone for the per-call-context loops,
+  2026-11-15). What is left: the user merges the stacks; each row publishes after a re-export on the rc21+ engine.
+  Not built unless asked: diart's full diarization (needs a speaker-embedding export), LFM2.5-Audio full duplex,
+  the streaming checkpoints on disk outside the zoo
+  ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
+  CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,
+  after the native RSQRT, ggml-0063 (no TF32 for a tagged product) and ggml-0064 (a prefix-stable cumsum). Chatterbox's is the second
+  (49/49, 2026-11-13); no other stream has been gated on one (Voxtral's ran there through `loom_cli`); the per-stream cache mode is what `Auto` picks there.
+  The user asked that every model amenable to streaming gets it, name or no name (2026-11-08).
+
+* [ ] **lfm2-350m-modular re-feeds the whole sequence every token.** Its per-layer export carries no KV
+  or conv-state cache, so its only entry is `infer` and each token costs more than the last (the
+  monolithic export caches both and loops in `infer_with_past`). Give the modular chain the caches, or
+  stop publishing it beside the monolithic one. Found 2026-11-08 while building tokens out (ADR-099).
 
 * [ ] **Expose the compute-buffer controls in loom-py.** `LoomLuaBridge::hold_compute_buffers`,
   `release_compute_buffers` and `compute_buffer_bytes` exist in the engine, but a Python host cannot

@@ -67,6 +67,7 @@ ModelContract ModelContract::read(const GgufModel& model) {
     c.phonemizer_ruleset = opt_str(model, "phonemizer.ruleset");
     c.languages = opt_arr_str(model, "loom.text.languages");
     c.labels = opt_arr_str(model, "loom.labels");
+    c.stream_labels = opt_arr_str(model, "loom.stream.labels");
     c.entry_points = opt_arr_str(model, "loom.entry_points");
 
     c.output_granularity = opt_str(model, "output.granularity");
