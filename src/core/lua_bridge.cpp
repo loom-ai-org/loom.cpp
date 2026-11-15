@@ -2280,6 +2280,15 @@ int LoomLuaBridge::l_get_weight(lua_State* L) {
     }
 }
 
+template <typename Cache> Cache* LoomLuaBridge::stream_cache(Cache* shared) {
+    if (shared == nullptr || active_state_ == nullptr) return shared;
+    if (!active_state_->one_pass() && stream_owns_cache(stream_caches_, shared->backend())) {
+        return &active_state_->own_cache(*shared);
+    }
+    shared->lease(active_state_->parked(shared->serial()));
+    return shared;
+}
+
 // `loom.seed_kv(module, source [, n_rows])` -> n_rows. Writes the FIRST n_rows positions of `module`'s KV
 // cache from a saved attention state, so the driver's next call attends over them at n_past = n_rows.
 // `source` is either a weight name in the module's file (a driver weight, read tensor to tensor with no
@@ -2294,7 +2303,7 @@ int LoomLuaBridge::l_seed_kv(lua_State* L) {
         if (it == self->modules_.end()) {
             return luaL_error(L, "loom.seed_kv: unregistered module '%s'", module_name);
         }
-        KvCache* kv = it->second.kv_cache;
+        KvCache* kv = self->stream_cache(it->second.kv_cache);
         if (kv == nullptr) {
             return luaL_error(L, "loom.seed_kv: module '%s' has no KV cache (its topology has no "
                                  "ATTENTION node, so there is nothing to seed)", module_name);
@@ -2518,8 +2527,10 @@ GraphBuilder& LoomLuaBridge::module_builder(Module& mod) {
                                                       mod.conv_state);
         mod.builder->hold_compute_buffer(hold_compute_buffers_);
     }
+    mod.builder->set_caches(stream_cache(mod.kv_cache), stream_cache(mod.conv_state));
     return *mod.builder;
 }
+
 
 void LoomLuaBridge::hold_compute_buffers(bool hold) {
     hold_compute_buffers_ = hold;
@@ -2564,6 +2575,7 @@ bool LoomLuaBridge::has_function(const std::string& fn_name) const {
 
 LoomLuaBridge::Value LoomLuaBridge::call(const std::string& fn_name, const std::unordered_map<std::string, Value>& args) {
     StreamState scratch;
+    scratch.set_one_pass(true);
     return call(fn_name, args, scratch);
 }
 
@@ -2578,6 +2590,20 @@ LoomLuaBridge::Value LoomLuaBridge::call(const std::string& fn_name,
         ~ActiveState() { self->active_state_ = previous; }
     } guard{this, active_state_};
     active_state_ = &state;
+    // A seeded stream draws from its own generator: swapped in for the call and back out on every way
+    // out, so the bridge's stream and every other stream's are where they were.
+    struct RngSwap {
+        LoomLuaBridge* self;
+        StreamState::Rng* rng;
+        void swap() {
+            if (rng == nullptr) return;
+            std::swap(self->rng_, rng->engine);
+            std::swap(self->normal_dist_, rng->normal);
+            std::swap(self->uniform_dist_, rng->uniform);
+        }
+        ~RngSwap() { swap(); }
+    } rng_swap{this, state.rng()};
+    rng_swap.swap();
 
     lua_getglobal(L_, fn_name.c_str());
     if (!lua_isfunction(L_, -1)) {

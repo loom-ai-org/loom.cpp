@@ -937,10 +937,19 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 * [ ] **A streaming API for every model that can stream: the rest of the survey.** The live door is built
   for ASR on Zipformer streaming (2026-11-08, [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md)):
   engine-owned `StreamState`, `stream_open` / `stream_feed` / `stream_finish`, `TranscriptionStream`,
-  `loom_cli --stream`, loom-py `speech2text.stream()`. Next: the other ASR rows, tokens out for the LMs and
-  audio out for TTS and codecs, each a driver with the three functions (a re-export) plus a door per
-  direction ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
+  `loom_cli --stream`, loom-py `speech2text.stream()`. Tokens out is built for the causal LMs
+  ([ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md): the KV and conv caches
+  parked or per-stream, `GenerationStream`, loom-py `text2text.stream()`); they need a re-export to carry
+  the stream functions. Next: the other ASR rows, audio out for TTS and codecs, and the decode loops with
+  per-call context (Whisper, T5, the speech LMs), each a driver with the three functions (a re-export)
+  ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
+  No GPU has run either door yet; the per-stream cache mode is what `Auto` picks there.
   The user asked that every model amenable to streaming gets it, name or no name (2026-11-08).
+
+* [ ] **lfm2-350m-modular re-feeds the whole sequence every token.** Its per-layer export carries no KV
+  or conv-state cache, so its only entry is `infer` and each token costs more than the last (the
+  monolithic export caches both and loops in `infer_with_past`). Give the modular chain the caches, or
+  stop publishing it beside the monolithic one. Found 2026-11-08 while building tokens out (ADR-099).
 
 * [ ] **Expose the compute-buffer controls in loom-py.** `LoomLuaBridge::hold_compute_buffers`,
   `release_compute_buffers` and `compute_buffer_bytes` exist in the engine, but a Python host cannot

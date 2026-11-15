@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -38,6 +39,8 @@ void print_usage(const char* argv0) {
                   "       %s --model <asr.gguf> --wav <path.wav> [--language en] "
                   "[--task transcribe|translate] [--target-language xx] [--timestamps] "
                   "[--no-condition-on-previous] [--stream MS]\n"
+                  "       %s --model <lm.gguf> --prompt \"<text>\" --stream N "
+                  "[--stream-caches auto|park|per-stream]\n"
                   "       %s --model <tts-or-codec.gguf> --prompt \"<phonemes|text|codes>\" "
                   "--out out.wav\n"
                   "       %s --model <voice-cloning-tts.gguf> --wav <ref.wav> "
@@ -77,7 +80,7 @@ void print_usage(const char* argv0) {
                   "  $LOOM_PROFILE_NODES=1         ... and a second table keyed on the NODE name, which\n"
                   "                                is the only thing that says which graph a bucket is in\n"
                   "                                (profile with ONE thread; see include/loom/core/profile.h)\n",
-                  argv0, argv0, argv0, argv0, argv0, argv0);
+                  argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 // What ran where, after a device run. The number that matters is the split count: each split is a point
@@ -524,6 +527,55 @@ void run_asr_stream(loom::Session& session, const loom::GgufModel& model, const 
                  (stream.state().tensor_bytes() + stream.state().value_bytes()) / 1e6);
 }
 
+// The bytes of `s` up to its last complete UTF-8 character: a byte-level BPE token can end inside one,
+// and printing half of it would print a replacement character the next token then cannot take back.
+size_t utf8_complete(const std::string& s) {
+    size_t end = s.size();
+    size_t back = 0;
+    while (end > 0 && back < 4 && (static_cast<unsigned char>(s[end - 1]) & 0xC0) == 0x80) {
+        --end;
+        ++back;
+    }
+    if (end == 0) return s.size();
+    const auto lead = static_cast<unsigned char>(s[end - 1]);
+    const size_t need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+    return need == back + 1 || need == 1 ? s.size() : end - 1;
+}
+
+// `--stream N` on a text model: `GenerationStream`, N tokens per pull, each new piece of text printed
+// as it is drawn. Without a vocabulary the ids print instead.
+void run_text_stream(loom::Session& session, const loom::GgufModel& model, const std::vector<int32_t>& prompt,
+                     const loom::text::GenerateOptions& options, uint32_t per_pull,
+                     const std::function<std::string(const std::vector<int32_t>&)>& decode) {
+    using clock = std::chrono::steady_clock;
+    loom::text::GenerationStream stream(session.bridge(), model, prompt, options);
+    const auto t0 = clock::now();
+    double first = -1.0;
+    size_t printed = 0;
+    while (!stream.finished()) {
+        const std::vector<int32_t> ids = stream.next(per_pull);
+        if (first < 0 && !ids.empty()) first = std::chrono::duration<double>(clock::now() - t0).count();
+        if (decode) {
+            const std::string text = decode(stream.tokens());
+            const size_t upto = stream.finished() ? text.size() : utf8_complete(text);
+            if (upto > printed && text.size() >= printed) {
+                std::fwrite(text.data() + printed, 1, upto - printed, stdout);
+                printed = upto;
+            }
+        } else {
+            for (int32_t id : ids) std::printf(" %d", id);
+        }
+        std::fflush(stdout);
+    }
+    const double wall = std::chrono::duration<double>(clock::now() - t0).count();
+    const size_t n = stream.tokens().size() + (stream.stopped_on_eos() ? 1 : 0);
+    std::printf("\n");
+    std::fprintf(stderr, "(streamed %zu tokens, %u per pull: first after %.3f s, %.2f tok/s after it; "
+                 "stream state %.1f MB)\n",
+                 n, per_pull, first, n > 1 && wall > first ? (n - 1) / (wall - first) : 0.0,
+                 (stream.state().value_bytes() + stream.state().parked_bytes() + stream.state().cache_bytes()) / 1e6);
+}
+
 void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string& wav_path,
              const std::string& language_name, const std::string& task_name,
              const std::string& target_language_name, bool timestamps,
@@ -602,6 +654,7 @@ int main(int argc, char** argv) {
     bool timestamps = false;
     bool condition_on_previous = true;
     uint32_t stream_ms = 0;
+    loom::StreamCaches stream_caches = loom::StreamCaches::Auto;
     std::string system_text;
     bool has_prompt = false;
     bool has_ref_text = false;
@@ -659,10 +712,20 @@ int main(int argc, char** argv) {
         } else if (arg == "--timestamps") {
             timestamps = true;
         } else if (arg == "--stream" && i + 1 < argc) {
-            // Push the --wav clip through the live door in pieces of this many milliseconds.
+            // The live door: push the --wav clip in pieces of this many milliseconds, or, for a text
+            // model, pull this many tokens at a time.
             stream_ms = static_cast<uint32_t>(std::stoul(argv[++i]));
             if (stream_ms == 0) {
-                std::fprintf(stderr, "error: --stream takes a piece length in milliseconds above 0\n");
+                std::fprintf(stderr, "error: --stream takes a piece length (ms of audio, or tokens) above 0\n");
+                return 1;
+            }
+        } else if (arg == "--stream-caches" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "auto") stream_caches = loom::StreamCaches::Auto;
+            else if (mode == "park") stream_caches = loom::StreamCaches::Park;
+            else if (mode == "per-stream") stream_caches = loom::StreamCaches::PerStream;
+            else {
+                std::fprintf(stderr, "error: --stream-caches takes auto, park or per-stream\n");
                 return 1;
             }
         } else if (arg == "--no-condition-on-previous") {
@@ -1313,9 +1376,16 @@ int main(int argc, char** argv) {
                 // which is how the divergence was found (docs/HIGH-LEVEL-API.md §1).
                 loom::Session session(*model, backends);
 
-                std::printf("Running dynamic GGUF generation for %d tokens...\n", n_predict);
                 loom::text::GenerateOptions gen = gen_opts;
                 gen.max_new_tokens = n_predict;
+                if (stream_ms > 0) {
+                    session.bridge().set_stream_caches(stream_caches);
+                    run_text_stream(session, *model, prompt_tokens, gen, stream_ms,
+                                    has_text_vocab ? std::function<std::string(const std::vector<int32_t>&)>(decode_ids)
+                                                   : nullptr);
+                    return 0;
+                }
+                std::printf("Running dynamic GGUF generation for %d tokens...\n", n_predict);
                 const std::vector<int32_t> generated =
                     loom::text::generate(session.bridge(), *model, prompt_tokens, gen);
 
