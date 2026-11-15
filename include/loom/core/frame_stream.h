@@ -18,6 +18,12 @@
 // here once so two hosts cannot disagree about it, and checked the same way -- an answer that is not whole
 // rows is an error naming both numbers.
 //
+// A stream may answer other rows than `infer` does, on a grid of its own (ADR-129: pyannote as diart's voice
+// activity detection streams it): the export declares the rows' labels as `loom.stream.labels`, and the
+// driver states each row's start and duration in state `row_times` -- two numbers per row it returned,
+// set by every call that returns rows -- where the frame grid does not hold. Every update carries the
+// times either way.
+//
 // Only a `frame` answer streams. A clip classifier's one row needs the whole clip; it has nothing to
 // hand back before the end, and its door is `classify`.
 #include "loom/core/gguf_model.h"
@@ -41,6 +47,10 @@ struct FrameUpdate {
     uint32_t n_rows = 0;
     // Samples pushed so far, over every call.
     size_t samples = 0;
+    // Each row's start and duration in seconds of the stream: the frame grid's (`frame_offset` and
+    // `frame_rate`), or what the driver stated in `row_times`.
+    std::vector<double> row_start;
+    std::vector<double> row_duration;
 };
 
 class FrameStream {
@@ -68,14 +78,16 @@ public:
     bool finished() const { return finished_; }
     // `modality::CLASS` or `modality::EMBEDDINGS`.
     const std::string& output_kind() const { return output_kind_; }
-    // The declared labels, for a class answer; empty for embeddings.
+    // The declared labels (`loom.stream.labels` where the export gives the stream its own), for a class
+    // answer; empty for embeddings.
     const std::vector<std::string>& labels() const { return labels_; }
     uint32_t width() const { return width_; }
     double frame_rate() const { return frame_rate_; }
     double frame_offset() const { return frame_offset_; }
     // Rows handed back so far.
     uint32_t rows() const { return rows_; }
-    // Where frame `row` starts, in seconds from the start of the stream.
+    // Where frame `row` starts on the frame grid, in seconds from the start of the stream. A driver that
+    // states `row_times` has its own grid: read the update's `row_start` instead.
     double row_start(uint32_t row) const { return frame_offset_ + static_cast<double>(row) / frame_rate_; }
     const StreamState& state() const { return state_; }
 

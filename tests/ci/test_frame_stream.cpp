@@ -6,7 +6,9 @@
 //   * two streams on one model, and a one-pass call between their pushes, leave each other alone;
 //   * an answer that is not whole rows is an error naming the numbers;
 //   * a clip answer, a contract that is not audio in, and a driver without the three functions are
-//     refused at construction.
+//     refused at construction;
+//   * a stream may answer its own labels (`loom.stream.labels`) on a grid of its own (`row_times`), and
+//     every update carries each row's start and duration either way (ADR-129).
 #include "test_util.h"
 
 #include "loom/loom.h"
@@ -132,6 +134,48 @@ void test_a_skewed_answer_is_an_error(ggml_backend_t backend) {
     LOOM_CHECK_THROWS(s.finish(), loom::Error); // a bare number is not rows
 }
 
+void test_a_stream_answers_its_own_rows_on_its_own_grid(ggml_backend_t backend) {
+    // The grid's times when the driver states none: frame 2 starts at 0.5 + 2 / 4 s.
+    {
+        auto model = load("audio_frame_classifier.gguf", backend);
+        loom::Session session(*model, backend);
+        session.bridge().load_script(kStream);
+        loom::audio::FrameStream s(session.bridge(), *model);
+        s.push(std::vector<float>(8, 0.5f));
+        const loom::audio::FrameUpdate u = s.push(std::vector<float>(4, 0.5f));
+        LOOM_CHECK(u.first_row == 2 && u.row_start.size() == 1 && u.row_duration.size() == 1);
+        LOOM_CHECK(std::fabs(u.row_start[0] - 1.0) < 1e-9 && std::fabs(u.row_duration[0] - 0.25) < 1e-9);
+    }
+    auto model = load("audio_frame_classifier_stream_labels.gguf", backend);
+    loom::Session session(*model, backend);
+    // Two rows on a grid of 0.1 s from 3.0, then one of 0.5 s; a third call states times for two rows
+    // and returns one.
+    session.bridge().load_script(
+        "function stream_open(i) loom.set_state('n', 0) return {} end\n"
+        "function stream_feed(i)\n"
+        "  local n = loom.state('n') + 1\n"
+        "  loom.set_state('n', n)\n"
+        "  if n == 1 then loom.set_state('row_times', {3.0, 0.1, 3.1, 0.1}) return {0.2, 0.9} end\n"
+        "  if n == 2 then loom.set_state('row_times', {3.2, 0.5}) return {0.7} end\n"
+        "  loom.set_state('row_times', {1, 1, 2, 2}) return {0.5}\n"
+        "end\n"
+        "function stream_finish(i) loom.set_state('row_times', {}) return {} end\n");
+    loom::audio::FrameStream s(session.bridge(), *model);
+    LOOM_CHECK(s.labels() == std::vector<std::string>{"speech"} && s.width() == 1);
+    const loom::audio::FrameUpdate a = s.push(std::vector<float>(1, 0.0f));
+    LOOM_CHECK(a.n_rows == 2 && a.row_start == (std::vector<double>{3.0, 3.1}) &&
+               a.row_duration == (std::vector<double>{0.1, 0.1}));
+    const loom::audio::FrameUpdate b = s.push(std::vector<float>(1, 0.0f));
+    LOOM_CHECK(b.first_row == 2 && b.row_start == std::vector<double>{3.2} && b.row_duration == std::vector<double>{0.5});
+    bool named = false;
+    try {
+        s.push(std::vector<float>(1, 0.0f));
+    } catch (const loom::Error& e) {
+        named = std::string(e.what()).find("1 rows and 4 numbers of `row_times`") != std::string::npos;
+    }
+    LOOM_CHECK(named);
+}
+
 void test_what_cannot_stream_is_refused(ggml_backend_t backend) {
     // The fixture's own driver: `infer` alone.
     {
@@ -166,6 +210,7 @@ int main() {
     test_streams_leave_each_other_alone(backend.get());
     test_an_embedder_streams_rows_of_its_width(backend.get());
     test_a_skewed_answer_is_an_error(backend.get());
+    test_a_stream_answers_its_own_rows_on_its_own_grid(backend.get());
     test_what_cannot_stream_is_refused(backend.get());
 
     LOOM_TEST_REPORT_AND_RETURN();

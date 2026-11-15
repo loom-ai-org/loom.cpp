@@ -31,7 +31,7 @@ FrameStream::FrameStream(LoomLuaBridge& bridge, const GgufModel& model, Inputs i
     }
     output_kind_ = contract.output_kind;
     if (output_kind_ == modality::CLASS) {
-        labels_ = contract.labels;
+        labels_ = contract.stream_labels.empty() ? contract.labels : contract.stream_labels;
         width_ = static_cast<uint32_t>(labels_.size());
     } else {
         width_ = contract.embedding_dim;
@@ -96,6 +96,23 @@ FrameUpdate FrameStream::absorb(const LoomLuaBridge::Value& result, const char* 
         // driver returns its rows as an array like any other.
         throw Error(std::string("FrameStream: the driver's ") + fn + " returned a single number where an "
                     "array of rows was expected.");
+    }
+    if (const StreamState::Value* times = state_.value("row_times")) {
+        if (times->data.size() != 2 * static_cast<size_t>(update.n_rows)) {
+            throw Error(std::string("FrameStream: the driver's ") + fn + " returned " +
+                        std::to_string(update.n_rows) + " rows and " + std::to_string(times->data.size()) +
+                        " numbers of `row_times`, where each row has a start and a duration.");
+        }
+        for (uint32_t r = 0; r < update.n_rows; ++r) {
+            update.row_start.push_back(times->data[2 * r]);
+            update.row_duration.push_back(times->data[2 * r + 1]);
+        }
+        state_.erase_value("row_times");
+    } else {
+        for (uint32_t r = 0; r < update.n_rows; ++r) {
+            update.row_start.push_back(row_start(rows_ + r));
+            update.row_duration.push_back(1.0 / frame_rate_);
+        }
     }
     rows_ += update.n_rows;
     return update;
