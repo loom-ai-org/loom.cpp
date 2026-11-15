@@ -242,8 +242,8 @@ is diart's voice activity detection: `infer` over 5 s chunks every 0.5 s, speech
 class is not `non_speech`, Hamming-weighted over the last `latency / step` chunks. The rows are a speech
 score (`loom.stream.labels`), not `infer`'s classes, and each call's rows sit on that region's own grid, so
 the driver states every row's start (`row_times`; `FrameUpdate::row_start` for every stream). The port keeps
-diart's float arithmetic, which decides its crops; every row and turn is diart's on 35 cases. 3.9x real time
-on the dev box at 0.5 s steps.
+diart's float arithmetic, which decides its crops; every row and turn is diart's on 35 cases. On the dev box
+at 0.5 s steps: 2.5x real time at the default two threads, 3.9x on one (tiny per-step LSTM graphs).
 
 **A re-decoding ASR: Moonshine streaming** ([ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md)).
 Its decoder cross-attends to every encoder row, so no prefix of the transcript is final. The driver keeps
