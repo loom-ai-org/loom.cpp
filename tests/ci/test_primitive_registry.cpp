@@ -943,7 +943,13 @@ void test_rsqrt_is_native_and_bit_identical() {
     const std::vector<float> got = get_f32(out);
     for (size_t i = 0; i < wx.size(); ++i) {
         const float want = 1.0f / std::sqrt(wx[i]);
-        LOOM_CHECK(std::memcmp(&got[i], &want, sizeof(float)) == 0);
+        if (std::memcmp(&got[i], &want, sizeof(float)) == 0) continue;
+        // A denormal input may also read as zero: ggml's RunFast (ggml-0061 on x86-64, ggml-0031 on
+        // ARMv6) sets denormals-are-zero for the compute threads, where the custom op this replaced ran
+        // too, so it answered 1/sqrt(0) = +inf there as well. This host thread computes `want` without it.
+        // Every normal input must still be bit-identical.
+        const bool denormal = std::fpclassify(wx[i]) == FP_SUBNORMAL;
+        LOOM_CHECK(denormal && std::isinf(got[i]) && got[i] > 0);
     }
 }
 
