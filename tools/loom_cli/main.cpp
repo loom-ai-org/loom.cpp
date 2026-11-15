@@ -41,7 +41,8 @@ void print_usage(const char* argv0) {
                   "[--no-condition-on-previous] [--stream MS]\n"
                   "       %s --model <lm.gguf> --prompt \"<text>\" --stream N "
                   "[--stream-caches auto|park|per-stream]\n"
-                  "       %s --model <tts.gguf> --prompt \"<text>\" --out out.wav --stream 1\n"
+                  "       %s --model <tts.gguf> --prompt \"<text>\" --out out.wav --stream 1 "
+                  "[--codec <codec.gguf>]\n"
                   "       %s --model <tts-or-codec.gguf> --prompt \"<phonemes|text|codes>\" "
                   "--out out.wav\n"
                   "       %s --model <voice-cloning-tts.gguf> --wav <ref.wav> "
@@ -332,7 +333,80 @@ struct Text2CodesRequest {
     std::string codec_path;
     std::string codes_out;
     std::string out_wav;
+    bool stream = false;                // `--stream`: codes to the codec as each frame is drawn
 };
+
+// `--stream` on a pair: the LM's codes handed to the codec as each frame is drawn (ADR-102), so audio is
+// ready a frame after the LM has made it. Both files stay loaded, which the one-pass path avoids -- the
+// price of not waiting for the last frame.
+int stream_pair(loom::GgufModel& lm, const loom::Backends& backends,
+                const loom::audio::SpeechStream::Inputs& inputs, uint32_t width, const Text2CodesRequest& req,
+                uint32_t codec_width, const std::optional<uint32_t>& absent) {
+    using clock = std::chrono::steady_clock;
+    if (req.codec_path.empty() || req.out_wav.empty()) {
+        std::fprintf(stderr, "error: --stream decodes as it goes, so it needs --codec <codec.gguf> and --out\n");
+        return 1;
+    }
+    loom::Session lm_session(lm, backends);
+    auto codec = loom::GgufModel::load(req.codec_path, backends);
+    std::printf("loaded '%s'\n", req.codec_path.c_str());
+    loom::Session codec_session(*codec, backends);
+    for (const auto& [bridge, what] : {std::pair{&lm_session.bridge(), "this model"},
+                                       std::pair{&codec_session.bridge(), "the codec"}}) {
+        if (!loom::audio::SpeechStream::supported(*bridge)) {
+            std::fprintf(stderr, "error: --stream: %s has no live path (stream_open / stream_feed / "
+                                 "stream_finish); it was exported before streaming. Without --stream the pair "
+                                 "runs as before.\n", what);
+            return 1;
+        }
+    }
+    const uint32_t rate = codec->has_kv("loom.sample_rate") ? codec->hparam_u32("sample_rate") : 0;
+    const auto t0 = clock::now();
+    loom::audio::SpeechStream codes(lm_session.bridge(), inputs);
+    loom::audio::CodecStream decoder(codec_session.bridge());
+    std::vector<float> audio;
+    std::vector<int32_t> all, pending;
+    double first = -1.0;
+    size_t frames = 0, pushes = 0;
+    // The codes go to the codec in pushes that GROW, 1 frame, then 2, 4 and 8 (loom-py's
+    // `CodecStream.GROWN`): one frame per push cost the 12 Hz codec RTF 2.56 on the dev box, and four or
+    // more beat its one-pass decode (ADR-102).
+    const auto push = [&]() {
+        const std::vector<float> wav = decoder.push(widen_rows(pending, width, codec_width, absent));
+        audio.insert(audio.end(), wav.begin(), wav.end());
+        frames += pending.size() / width;
+        pending.clear();
+        ++pushes;
+        const double at = std::chrono::duration<double>(clock::now() - t0).count();
+        if (first < 0) first = at;
+        std::printf("  frame %zu: %.2f s of audio ready at %.3f s\n", frames,
+                    rate ? static_cast<double>(audio.size()) / rate : 0.0, at);
+        std::fflush(stdout);
+    };
+    while (!codes.finished()) {
+        const std::vector<float> piece = codes.next();
+        if (piece.empty()) continue;
+        const std::vector<int32_t> rows(piece.begin(), piece.end());
+        all.insert(all.end(), rows.begin(), rows.end());
+        pending.insert(pending.end(), rows.begin(), rows.end());
+        if (pending.size() / width >= std::min<size_t>(8, size_t{1} << std::min<size_t>(pushes, 3))) push();
+    }
+    if (!pending.empty()) push();
+    const std::vector<float> tail = decoder.finish();
+    audio.insert(audio.end(), tail.begin(), tail.end());
+    const double wall = std::chrono::duration<double>(clock::now() - t0).count();
+    const double seconds = rate ? static_cast<double>(audio.size()) / rate : 0.0;
+    std::printf("  streamed: %zu frame(s); first audio after %.3f s; %.2f s of audio in %.2f s = %.2fx real "
+                "time (RTF %.3f)\n", frames, first, seconds, wall, wall > 0 ? seconds / wall : 0.0,
+                seconds > 0 ? wall / seconds : 0.0);
+    if (!req.codes_out.empty()) {
+        loom_cli::write_codes_gguf(req.codes_out, all, width, lm.architecture());
+        std::printf("  wrote %s\n", req.codes_out.c_str());
+    }
+    loom_cli::write_wav_pcm16(req.out_wav, audio, rate ? rate : 24000, 1);
+    std::printf("  wrote %s\n", req.out_wav.c_str());
+    return 0;
+}
 
 // **Text in, codec tokens out, and the codec that turns them into audio.** Dia, Qwen3-TTS and MOSS-TTS
 // are two files each (ADR-022): an AR LM that emits frames of codes and a codec that decodes them.
@@ -469,6 +543,8 @@ int text_to_codes(std::unique_ptr<loom::GgufModel>& model, const loom::ModelCont
                              "<ref.wav> (%u Hz mono)\n", contract.sample_rate);
         return 1;
     }
+
+    if (req.stream) return stream_pair(*model, backends, inputs, width, req, codec_width, absent);
 
     std::vector<double> flat;
     {
@@ -1005,6 +1081,7 @@ int main(int argc, char** argv) {
             req.codec_path = codec_path;
             req.codes_out = codes_out;
             req.out_wav = out_wav;
+            req.stream = stream_ms > 0;
             return text_to_codes(model, contract, backends, req);
         }
 

@@ -170,6 +170,22 @@ add_test(NAME test_e2e_speech_stream COMMAND test_e2e_speech_stream)
 set_tests_properties(test_e2e_speech_stream PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_speech_stream PROPERTIES SKIP_RETURN_CODE 77)
 
+# The codec half of a streamed pair (ADR-102): `CodecStream`'s pushes decode to `infer`'s waveform, and
+# streams on one codec do not see each other. LOOM_STREAM_CODEC_GGUF + LOOM_STREAM_CODES_NPY.
+add_executable(test_e2e_codec_stream gate/test_e2e_codec_stream.cpp)
+target_link_libraries(test_e2e_codec_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_codec_stream COMMAND test_e2e_codec_stream)
+set_tests_properties(test_e2e_codec_stream PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_codec_stream PROPERTIES SKIP_RETURN_CODE 77)
+
+# A streamed codec pair (ADR-102): the LM's stream is its one-pass codes, the pair's audio is the codec's
+# one-pass decode of them, and interleaved LM streams keep their own prompts.
+add_executable(test_e2e_codec_pair_stream gate/test_e2e_codec_pair_stream.cpp)
+target_link_libraries(test_e2e_codec_pair_stream PRIVATE loom::engine)
+add_test(NAME test_e2e_codec_pair_stream COMMAND test_e2e_codec_pair_stream)
+set_tests_properties(test_e2e_codec_pair_stream PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_codec_pair_stream PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_e2e_chat_generation gate/test_e2e_chat_generation.cpp)
 target_link_libraries(test_e2e_chat_generation PRIVATE loom::engine)
 add_test(NAME test_e2e_chat_generation COMMAND test_e2e_chat_generation)
