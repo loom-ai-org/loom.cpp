@@ -1042,7 +1042,16 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   cross-attention a second output; every step's kept context NeMo's). Every NeMo row of the survey is built.
   On an RTX 5090 every NeMo stream passes its gate and runs 29-309x real time (Canary's 60 s AlignAtt 11.5x -> 52x)
   ([ADR-125](../adrs/adr-125-a-buffered-stream-runs-on-the-gpu-without-host-round-trips.md)).
-  Next: the re-decoding rows, pyannote, and the decode loops with per-call context (Whisper, T5, the speech LMs), each a driver
+  The re-decoding rows are built too, each in the reference the user chose: HuBERT and data2vec in the transformers
+  pipeline's strided chunks
+  ([ADR-126](../adrs/adr-126-a-wav2vec2-style-ctc-model-streams-in-the-transformers-pipelines-strided-chunks.md));
+  moonshine-tiny, Granite Speech, LFM2.5-Audio ASR, SenseVoice, Paraformer and GigaAM in Moonshine's VAD lines,
+  `LineStream` composing the zoo's Silero with any recogniser, no re-export
+  ([ADR-127](../adrs/adr-127-a-recogniser-without-a-streaming-mode-streams-in-moonshines-vad-lines.md));
+  Whisper as ufal's SimulStreaming streams it
+  ([ADR-128](../adrs/adr-128-whisper-streams-the-way-simulstreaming-does.md)). All gated on the dev-box CPU or
+  the RTX 5090 or both.
+  Next: pyannote, and the decode loops with per-call context (T5, the speech LMs' token stream), each a driver
   with the three functions (a re-export)
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,
