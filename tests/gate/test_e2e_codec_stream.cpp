@@ -12,7 +12,8 @@
 //      file's, bit for bit (the decode graph did not move), and the stream door refuses it.
 //
 // LOOM_STREAM_CODEC_GGUF: a codec exported with the stream functions (qwen3-tts-tokenizer-12hz,
-// audio8-tts-codec -- whose `infer` is one call at any length, so its stream is checked to the end).
+// audio8-tts-codec and moss-audio-tokenizer-v2 -- whose `infer` is one call at any length, so their streams
+// are checked to the end -- and dac-44khz, whose windows match one call to f32 rounding).
 // LOOM_STREAM_CODES_NPY: `[frames, width]` codes, F32, from the codec's own LM -- random ids decode to noise
 // that clips at +-1, where a difference can hide.
 
@@ -78,14 +79,23 @@ int main() {
     std::vector<int64_t> shape;
     const std::vector<float> raw = loom_test::read_npy_f32(npy, shape);
     LOOM_CHECK(shape.size() == 2 && shape[0] > 0);
-    const size_t width = static_cast<size_t>(shape[1]);
-    const std::vector<int32_t> codes(raw.begin(), raw.end());
-    const size_t frames = codes.size() / width;
-
     ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(gguf, backend.get());
     LOOM_CHECK(model != nullptr);
+    // Codes narrower than the codec (MOSS-TTS emits 12 of its codec's 32) are widened with the codec's
+    // absent id, as every host widens them (ADR-050).
+    const size_t width = model->hparam_u32("codec.n_codebooks");
+    const size_t given = static_cast<size_t>(shape[1]);
+    LOOM_CHECK(given == width || (given < width && model->has_kv("loom.codec.absent_code")));
+    std::vector<int32_t> codes;
+    for (size_t f = 0; f < raw.size() / given; ++f) {
+        for (size_t c = 0; c < width; ++c) {
+            codes.push_back(c < given ? static_cast<int32_t>(raw[f * given + c])
+                                      : static_cast<int32_t>(model->hparam_u32("codec.absent_code")));
+        }
+    }
+    const size_t frames = codes.size() / width;
     loom::Session session(*model, backend.get());
     loom::LoomLuaBridge& bridge = session.bridge();
     LOOM_CHECK(loom::audio::CodecStream::supported(bridge));
