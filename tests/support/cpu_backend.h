@@ -60,6 +60,26 @@ inline const BackendLoader g_backend_loader;
 
 } // namespace detail
 
+// The thread count a `loom::Device` would give this backend (`$LOOM_N_THREADS`, else the physical core
+// count), so a test runs the way the engine does. ggml's own default is 4 whatever the machine has: on
+// a 2-core / 4-thread box that made the pyannote stream gate 3x slower than the same stream through
+// `loom_cli` (ADR-129), and two such tests at once oversubscribed the cores into a 40x slowdown. A test
+// that wants a particular count (the kernel sweeps) still sets it itself, after this.
+//
+// Through the registry's proc address, as the engine's `apply_cpu_threads` does, so it links in a
+// `GGML_BACKEND_DL` build too.
+inline void apply_engine_threads(ggml_backend_t backend) {
+    if (backend == nullptr) return;
+    const int n = loom::default_cpu_thread_count();
+    if (n <= 0) return;
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) return;
+    auto set_n_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads"));
+    if (set_n_threads != nullptr) set_n_threads(backend, n);
+}
+
 // An OWNING handle, exactly as `ggml_backend_cpu_init()` returned, so that every
 // `ggml_backend_ptr backend(...)` call site kept its meaning across the rename.
 //
@@ -76,7 +96,9 @@ inline ggml_backend_t cpu_backend() {
                      "or point $GGML_BACKEND_PATH at it.\n");
         return nullptr;
     }
-    return ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    apply_engine_threads(backend);
+    return backend;
 }
 
 // The backend a test should run on: the CPU, or whatever `$LOOM_TEST_DEVICE=gpu` finds.
@@ -100,6 +122,15 @@ inline ggml_backend_t test_backend() {
         std::fprintf(stderr, "  [LOOM_TEST_DEVICE=gpu] no GPU device registered; using the CPU\n");
     }
     return cpu_backend();
+}
+
+// The same switch for a test that opens a `loom::Device` (a primary with the CPU behind it, so an op the
+// device lacks still runs) rather than one bare backend: "gpu" when `$LOOM_TEST_DEVICE=gpu`, else "cpu".
+// Unlike `test_backend` it does not fall back -- `Device::open("gpu")` with no GPU is an error, which is
+// the answer a GPU run wants.
+inline const char* test_device_name() {
+    const char* want = std::getenv("LOOM_TEST_DEVICE");
+    return (want != nullptr && std::string(want) == "gpu") ? "gpu" : "cpu";
 }
 
 } // namespace loom_test

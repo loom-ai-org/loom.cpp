@@ -30,6 +30,7 @@ const StreamState::Value* StreamState::value(const std::string& name) const {
 }
 
 void StreamState::set_value(const std::string& name, Value value) { values_[name] = std::move(value); }
+StreamState::Value& StreamState::value_for_write(const std::string& name) { return values_[name]; }
 
 void StreamState::erase_value(const std::string& name) { values_.erase(name); }
 

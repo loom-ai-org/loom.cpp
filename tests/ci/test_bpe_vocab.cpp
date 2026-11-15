@@ -138,5 +138,36 @@ int main() {
         }
     }
 
+    // `loom.tokenize` / `loom.detokenize` (ADR-121): a driver reaches the vocabulary of the file whose
+    // modules its bridge runs, and gets exactly what the vocabulary itself gives -- the bytes of an
+    // incomplete character included, which is how a driver sees where a cut landed.
+    {
+        loom::LoomLuaBridge bridge(backend.get());
+        bridge.register_module("m", *model, loom::GraphTopology{});
+        bridge.load_script(R"(
+            function ids_of(inputs) return loom.tokenize(inputs.text_bytes and string.char(unpack(inputs.text_bytes)) or "") end
+            function bytes_of(inputs)
+                local s = loom.detokenize(inputs.ids)
+                return {string.byte(s, 1, -1)}
+            end
+        )");
+        const std::string text = "hello world, don't 12";
+        const std::vector<double> text_bytes(text.begin(), text.end());
+        const auto got = std::get<std::vector<double>>(bridge.call("ids_of", {{"text_bytes", text_bytes}}));
+        const std::vector<int32_t> want = vocab->encode(text);
+        LOOM_CHECK(std::vector<int32_t>(got.begin(), got.end()) == want);
+        const auto bytes = std::get<std::vector<double>>(
+            bridge.call("bytes_of", {{"ids", std::vector<double>(want.begin(), want.end())}}));
+        LOOM_CHECK(std::string(bytes.begin(), bytes.end()) == text);
+        // Half of a two-byte character (0xC3 of "é"): the byte itself, not a replacement character.
+        const auto half = std::get<std::vector<double>>(bridge.call("bytes_of", {{"ids", std::vector<double>{0xC3}}}));
+        LOOM_CHECK(half.size() == 1 && half[0] == 0xC3);
+
+        // A bridge with no model registered has no vocabulary, and says so.
+        loom::LoomLuaBridge bare(backend.get());
+        bare.load_script("function t(inputs) return loom.tokenize('x') end");
+        LOOM_CHECK_THROWS(bare.call("t", {}), loom::Error);
+    }
+
     LOOM_TEST_REPORT_AND_RETURN();
 }
