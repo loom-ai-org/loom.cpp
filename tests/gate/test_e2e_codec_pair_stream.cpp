@@ -9,9 +9,11 @@
 //      under both cache modes: each draws exactly what it drew alone. The one-pass call overwrites every
 //      module's retained outputs, the prompt's text schedule included, which is why a stream keeps its own.
 //
-// LOOM_STREAM_LM_CODES_GGUF: qwen3-tts-12hz-0.6b exported with the stream functions.
-// LOOM_STREAM_CODEC_GGUF:    its codec (qwen3-tts-tokenizer-12hz) exported with them.
-// LOOM_STREAM_REF_NPY:       a reference clip at 24 kHz, F32 -- the Base model clones a voice and has none.
+// LOOM_STREAM_LM_CODES_GGUF: a text-to-codes model exported with the stream functions (qwen3-tts-12hz-0.6b,
+//                            audio8-tts-realistic-0.6b).
+// LOOM_STREAM_CODEC_GGUF:    its codec, exported with them.
+// LOOM_STREAM_REF_NPY:       a reference clip at the LM's rate, F32, for a model that clones and has no voice
+//                            of its own (Qwen3-TTS Base); optional otherwise.
 
 #include "test_util.h"
 #include "fixtures.h"
@@ -50,13 +52,13 @@ int main() {
     const char* lm_path = loom_test::fixture_env("LOOM_STREAM_LM_CODES_GGUF");
     const char* codec_path = loom_test::fixture_env("LOOM_STREAM_CODEC_GGUF");
     const char* ref_path = loom_test::fixture_env("LOOM_STREAM_REF_NPY");
-    if (lm_path == nullptr || codec_path == nullptr || ref_path == nullptr) {
-        std::fprintf(stderr, "skipping: set LOOM_STREAM_LM_CODES_GGUF, LOOM_STREAM_CODEC_GGUF and "
-                              "LOOM_STREAM_REF_NPY\n");
+    if (lm_path == nullptr || codec_path == nullptr) {
+        std::fprintf(stderr, "skipping: set LOOM_STREAM_LM_CODES_GGUF and LOOM_STREAM_CODEC_GGUF "
+                              "(and LOOM_STREAM_REF_NPY for a model that clones)\n");
         return kSkipReturnCode;
     }
     std::vector<int64_t> shape;
-    const std::vector<float> ref = loom_test::read_npy_f32(ref_path, shape);
+    const std::vector<float> ref = ref_path ? loom_test::read_npy_f32(ref_path, shape) : std::vector<float>{};
 
     ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
@@ -74,9 +76,10 @@ int main() {
 
     const auto inputs_for = [&](const std::string& text, double seed) {
         const std::vector<int32_t> ids = vocab->encode(text);
-        return Inputs{{"tokens", std::vector<double>(ids.begin(), ids.end())},
-                      {"waveform", std::vector<double>(ref.begin(), ref.end())},
-                      {"max_new_tokens", kFrames}, {"seed", seed}};
+        Inputs in{{"tokens", std::vector<double>(ids.begin(), ids.end())}, {"max_new_tokens", kFrames},
+                  {"seed", seed}};
+        if (!ref.empty()) in["waveform"] = std::vector<double>(ref.begin(), ref.end());
+        return in;
     };
     const Inputs a = inputs_for("The history of the city of Rome begins on the Palatine hill.", 5.0);
     const Inputs b = inputs_for("Bread needs flour, water and salt.", 6.0);
