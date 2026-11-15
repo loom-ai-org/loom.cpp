@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -73,6 +74,20 @@ struct GraphTopology {
     // the decoder twice per step over two independent histories -- and getting it wrong is silent,
     // because two streams sharing a cache read each other's cells and produce plausible tokens.
     bool private_kv_cache = false;
+
+    // A KV cache of this module's OWN geometry, from the topology's optional `"kv_cache"` object (ADR-103):
+    // a module whose layers differ in width or window from the file's one LM cache -- MOSS-TTS's codec
+    // decodes through six transformers, each with its own width and window -- declares the cache it
+    // needs, and gets it privately. Absent, the module uses the file's `loom.*` geometry as before.
+    struct KvGeometry {
+        uint32_t n_layer = 0;
+        uint32_t n_embd_k = 0;
+        uint32_t n_embd_v = 0;
+        uint32_t size = 0;
+        bool ring = false;
+        uint32_t window = 0;
+    };
+    std::optional<KvGeometry> kv_geometry;
 
     // Throws loom::SchemaError on malformed JSON, an unsupported "version", or a structurally invalid
     // node/repeat_for block.

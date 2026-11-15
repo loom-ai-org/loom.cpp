@@ -1,4 +1,5 @@
 #include "loom/core/graph_builder.h"
+#include "loom/core/conv_state_cache.h"
 #include "loom/core/kv_cache.h"
 #include "loom/core/output_store.h"
 #include "loom/core/profile.h"
@@ -19,11 +20,13 @@ namespace {
 // lets a GPU backend stage its tiles in half precision: Vulkan's matmul_f32_f32 keeps both operands in
 // float16_t shared memory on any fp16-capable device (and its coopmat paths convert them to f16
 // outright), and Metal's kernel_mul_mm_f32_f32 loads both into `half` threadgroup tiles. Any |value| >
-// 65504 becomes inf there, and inf * 0 is NaN. CPU and CUDA (cuBLAS SGEMM) never do this, so a model can
-// be exact on both and still produce nothing on Vulkan or Metal: SenseVoice's kaldi power spectrum peaks
+// 65504 becomes inf there, and inf * 0 is NaN. The CPU never does this, so a model can be exact there and
+// still produce nothing on Vulkan or Metal: SenseVoice's kaldi power spectrum peaks
 // near 1e10, its mel projection came back 99.5% NaN, and the transcript was ''. GGML_PREC_F32 is ggml's
 // own way of asking for full precision; cmake/patches/ggml-0023 and ggml-0024 make those two backends
-// honour it for F32 x F32 (stock ggml ignores it there). It is set with ggml_prec_set_acc, which since
+// honour it for F32 x F32 (stock ggml ignores it there). CUDA is not exact by default either: every cuBLAS
+// handle runs F32 in TF32 (a 10-bit mantissa), and so do MMF's F32 tiles; ggml-0063 makes a tagged
+// product skip both. CosyVoice3's pinned LM draws and its 10-step ODE mel moved under TF32 (ADR-069). It is set with ggml_prec_set_acc, which since
 // ggml v0.26 (llama/26675) is what ggml_mul_mat_set_prec became: the same op_params[0], so the patches
 // read it unchanged. Tagged here, on the finished graph, rather than at each ggml_mul_mat call site, so
 // that a new primitive cannot forget it. A non-F32 `a` (F16, a quantized weight) is left alone: that is
@@ -197,6 +200,8 @@ GraphBuilder::GraphBuilder(const GraphTopology& topo, GgufModel& model, Backends
                             KvCache* kv_cache, size_t compute_meta_bytes, ConvStateCache* conv_state)
     : topo_(topo), model_(model), backends_(backends), backend_(backends.primary),
       kv_cache_(kv_cache), conv_state_(conv_state), compute_meta_bytes_(compute_meta_bytes) {
+    kv_serial_ = kv_cache_ ? kv_cache_->serial() : 0;
+    conv_serial_ = conv_state_ ? conv_state_->serial() : 0;
     if (backend_ == nullptr) {
         throw Error("GraphBuilder: no primary backend -- construct a loom::Device, or pass a "
                     "ggml_backend_t directly");
@@ -221,13 +226,17 @@ int64_t GraphBuilder::real_n_kv(const DynamicAxes& axes) const {
     if (kv_cache_ == nullptr || !kv_cache_->ring() || n_kv == 0) return n_kv;
     // A RING holds the last `kv_size` positions (ADR-066), so a step past its capacity reads all of it.
     // A call of several tokens that WRAPS cannot be served: its later rows would overwrite cells its
-    // earlier queries still attend to, since every row is written before any is read.
+    // earlier queries still attend to, since every row is written before any is read -- unless the
+    // ring is larger than its WINDOW by at least the call (ADR-103): then the cells overwritten hold
+    // positions every query in the call has already left behind.
     const auto capacity = static_cast<int64_t>(kv_cache_->kv_size());
-    if (n_kv > capacity && axes.count("n_tokens") && axes.at("n_tokens") > 1.0) {
+    const int64_t room = kv_cache_->window() > 0 ? capacity - kv_cache_->window() : 1;
+    if (n_kv > capacity && axes.count("n_tokens") && axes.at("n_tokens") > static_cast<double>(room)) {
         throw SchemaError("GraphBuilder::build: " + std::to_string(std::llround(axes.at("n_tokens"))) +
                            " tokens at n_past " + std::to_string(std::llround(axes.at("n_past"))) +
                            " would wrap this model's " + std::to_string(capacity) +
-                           "-cell ring KV cache; past its capacity a ring takes one token per call");
+                           "-cell ring KV cache; past its capacity a ring takes " + std::to_string(room) +
+                           " token(s) per call");
     }
     return std::min(n_kv, capacity);
 }
@@ -305,6 +314,8 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
         if (kv_cells_ != nullptr) {
             KvCache::fill_cell_index(kv_cells_, static_cast<uint32_t>(std::llround(axes.at("n_past"))),
                                      ring_size());
+            kv_cache_->note_written(static_cast<uint64_t>(std::llround(axes.at("n_past"))) +
+                                    static_cast<uint64_t>(kv_cells_->ne[0]));
         }
         cached_.n_kv_real = real_n_kv(axes);
         ++reuses_;
@@ -402,6 +413,8 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
             }
             KvCache::fill_cell_index(kv_cells_, static_cast<uint32_t>(std::llround(axes.at("n_past"))),
                                      ring_size());
+            kv_cache_->note_written(static_cast<uint64_t>(std::llround(axes.at("n_past"))) +
+                                    static_cast<uint64_t>(kv_cells_->ne[0]));
         }
     }
 
@@ -493,6 +506,20 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
         }
         if (!galloc_) {
             galloc_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
+        }
+        // **Planned for THIS graph, every rebuild** (ADR-117). `ggml_gallocr_alloc_graph` re-plans only
+        // when the graph does not fit the last plan, so a graph built after a larger one of the same
+        // topology took the larger one's offsets, and the same graph had another layout depending on what
+        // ran before it. The layout is not only where things are: the CPU backend's conv fusion
+        // (ggml-0036) checks whether its result overlaps its input, falls back to the unfused nodes when
+        // it does, and the two round differently. Chatterbox's HiFT came out 1.1e-07 apart for one mel run
+        // before and after a longer one, and a stream interleaved with another lost its bit-identity. The
+        // buffer still only grows here (reserve reallocates only past its size); the offsets are this
+        // graph's own, so its result is too. One planning pass per REBUILD, never per reuse: Soprano's one
+        // pass (an LM rebuilding per KV bucket, a decoder per window) took 2.86 s with it and 3.00 s without,
+        // five interleaved runs each on the dev box -- noise.
+        if (!ggml_gallocr_reserve(galloc_.get(), gf)) {
+            throw Error("GraphBuilder::build: ggml_gallocr_reserve failed");
         }
         if (!ggml_gallocr_alloc_graph(galloc_.get(), gf)) {
             throw Error("GraphBuilder::build: ggml_gallocr_alloc_graph failed");
@@ -811,6 +838,20 @@ void GraphBuilder::reserve(uint32_t n_ctx_max) {
     if (n_ctx_max > 1) {
         build({{"n_tokens", 1.0}, {"n_past", static_cast<double>(n_ctx_max - 1)}});
     }
+}
+
+} // namespace loom
+
+namespace loom {
+
+void GraphBuilder::set_caches(KvCache* kv_cache, ConvStateCache* conv_state) {
+    const uint64_t kv_serial = kv_cache ? kv_cache->serial() : 0;
+    const uint64_t conv_serial = conv_state ? conv_state->serial() : 0;
+    if (kv_serial != kv_serial_ || conv_serial != conv_serial_) drop_retained_graph();
+    kv_cache_ = kv_cache;
+    conv_state_ = conv_state;
+    kv_serial_ = kv_serial;
+    conv_serial_ = conv_serial;
 }
 
 } // namespace loom

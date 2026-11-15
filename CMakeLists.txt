@@ -36,10 +36,17 @@ add_library(loom_engine
     src/core/conv_state_cache.cpp
     src/core/kv_cache.cpp
     src/core/output_store.cpp
+    src/core/cache_lease.cpp
+    src/core/stream_state.cpp
     src/core/profile.cpp
     src/core/model_contract.cpp
     src/core/session.cpp
+    src/core/asr_text.cpp
     src/core/transcribe.cpp
+    src/core/speech_stream.cpp
+    src/core/frame_stream.cpp
+    src/core/line_stream.cpp
+    src/core/transcribe_stream.cpp
     src/core/asr_long_form.cpp
     src/core/text_generate.cpp
     src/core/text_classify.cpp
