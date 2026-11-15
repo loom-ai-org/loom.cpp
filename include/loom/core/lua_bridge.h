@@ -20,6 +20,7 @@ namespace loom {
 
 class KvCache;
 class ConvStateCache;
+class StreamState;
 class GraphBuilder;
 class OutputStore;
 
@@ -140,6 +141,15 @@ public:
 
     Value call(const std::string& fn_name, const std::unordered_map<std::string, Value>& args);
 
+    // The same call with `state` reachable from the driver for its duration: `loom.state`,
+    // `loom.set_state`, `loom.keep_state` and `{state = name}` input references all address it
+    // (stream_state.h, ADR-098). How a host runs a stream's `stream_open` / `stream_feed` /
+    // `stream_finish`: the driver functions hold nothing between calls, the host's `StreamState` does,
+    // so streams on one bridge do not see each other. The plain `call` above hands each call a fresh
+    // state of its own, which is what lets a one-pass `infer` run the stream functions inside one call.
+    Value call(const std::string& fn_name, const std::unordered_map<std::string, Value>& args,
+               StreamState& state);
+
     // Reseeds the shared RNG from C++, the same door `loom.seed_rng` gives a driver script -- so a HOST
     // can make a sampled generation reproducible without the driver having to expose a seed argument
     // (P4.24). Same stream, so the draw-ORDER caveat `rng_` documents applies to both callers.
@@ -203,6 +213,10 @@ private:
     std::unordered_map<std::string, Module> modules_;
     // hold_compute_buffers' setting, applied to each builder as module_builder() creates it.
     bool hold_compute_buffers_ = false;
+
+    // The stream state the current `call` runs against; null outside a call. Set and restored by `call`
+    // itself, so a binding that finds it null is being run outside any driver call.
+    StreamState* active_state_ = nullptr;
 
     // Backs loom.seed_rng/loom.gaussian_array/loom.uniform_array -- the SAME engine/distribution shapes
     // (std::mt19937 + std::normal_distribution<float>(0,1) + std::uniform_real_distribution<float>(0,1))
@@ -349,6 +363,15 @@ private:
     // graph input can reach -- the only other writer is an ATTENTION node, which writes what it just
     // projected. First needed by Pocket-TTS, whose voices ship as KV caches; ADR-043.
     static int l_seed_kv(lua_State* L);
+    // `loom.state(name)`, `loom.set_state(name, value)` and `loom.keep_state(name, module)`: the
+    // current call's stream state (stream_state.h, ADR-098). MEET the binding criterion: they read no
+    // model config, every name is an argument, and what they hold is engine-owned state between calls,
+    // which no topology can declare -- the same reason `OutputStore` exists. Any streaming family uses
+    // them unchanged; the first is Zipformer streaming.
+    static int l_state(lua_State* L);
+    static int l_set_state(lua_State* L);
+    static int l_keep_state(lua_State* L);
+    static StreamState& active_state(LoomLuaBridge* self, const char* fname);
 };
 
 } // namespace loom

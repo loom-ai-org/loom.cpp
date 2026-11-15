@@ -934,13 +934,13 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Host API
 
-* [ ] **A live speech-to-text door: audio pushed in, partial transcripts read out.** Every streaming ASR in the
-  zoo runs over a finished clip. Zipformer small streaming's driver is already `init` / `feed` / `finish`
-  ([ADR-097](../adrs/adr-097-a-streaming-checkpoint-runs-its-chunk-loop-behind-the-one-pass-door.md)); it
-  needs a session that keeps the driver's state between calls in the engine and loom-py, and a chunked
-  fbank. Each other model joins by re-export: Kyutai STT's driver is frame-synchronous already, while
-  Nemotron 3.5 ASR (exported offline) and Moonshine Streaming (whole-clip windowed encoder) also need
-  incremental encoders. Asked about 2026-11-08; deferred by the user until after the streaming leaf.
+* [ ] **A streaming API for every model that can stream: the rest of the survey.** The live door is built
+  for ASR on Zipformer streaming (2026-11-08, [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md)):
+  engine-owned `StreamState`, `stream_open` / `stream_feed` / `stream_finish`, `TranscriptionStream`,
+  `loom_cli --stream`, loom-py `speech2text.stream()`. Next: the other ASR rows, tokens out for the LMs and
+  audio out for TTS and codecs, each a driver with the three functions (a re-export) plus a door per
+  direction ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
+  The user asked that every model amenable to streaming gets it, name or no name (2026-11-08).
 
 * [ ] **Expose the compute-buffer controls in loom-py.** `LoomLuaBridge::hold_compute_buffers`,
   `release_compute_buffers` and `compute_buffer_bytes` exist in the engine, but a Python host cannot
