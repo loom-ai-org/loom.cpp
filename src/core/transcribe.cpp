@@ -272,6 +272,7 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
             args = {{"waveform", window_at(waveform, 0, static_cast<uint32_t>(n_padded))},
                     {"audio_samples", static_cast<double>(n_real)}};
         }
+        if (options.max_new_tokens > 0) args["max_new_tokens"] = static_cast<double>(options.max_new_tokens);
         const auto decode = [&](const std::unordered_map<std::string, LoomLuaBridge::Value>& call_args) {
             const LoomLuaBridge::Value result = bridge.call("infer", call_args);
             std::vector<int32_t> decoded;

@@ -42,6 +42,7 @@ namespace loom {
 // unknown task from a newer exporter must flow through here untouched instead of failing to parse.
 namespace task_names {
 inline constexpr const char* TEXT_GENERATION = "text-generation";
+inline constexpr const char* TEXT2TEXT_GENERATION = "text2text-generation";
 inline constexpr const char* ASR = "automatic-speech-recognition";
 inline constexpr const char* TTS = "text-to-speech";
 inline constexpr const char* AUDIO_CODEC = "audio-codec";
@@ -134,6 +135,10 @@ struct ModelContract {
     // unlike the ASR language table, which is a sparse map into a vocabulary -- because a classifier's
     // classes are 0..n-1 by construction.
     std::vector<std::string> labels;
+    // `loom.stream.labels`: what a frame STREAM's rows are, when they are not `labels` (ADR-129) --
+    // pyannote's stream answers diart's speech score, not the seven powerset classes `infer` returns.
+    // Empty when the stream answers what `infer` does.
+    std::vector<std::string> stream_labels;
 
     // `loom.output.granularity`: `token`, `frame` or `clip` (see `granularity` above). A `class` output
     // that declares none is `token`, because every such file is family 12's and predates the key; any

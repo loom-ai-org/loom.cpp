@@ -76,6 +76,10 @@ struct TranscribeOptions {
     bool timestamps = false;
     // Carry each window's tokens into the next as `prev_tokens`.
     bool condition_on_previous = true;
+    // A token budget for a one-call (dynamic-length) recogniser, handed to its driver as `max_new_tokens`.
+    // 0: omitted, and the driver applies its own. `LineStream` sets it for Moonshine's per-line budget
+    // (ADR-127); a windowed decode keeps its own per-window budget either way.
+    uint32_t max_new_tokens = 0;
 };
 
 struct Transcription {

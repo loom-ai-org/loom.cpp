@@ -919,6 +919,34 @@ void test_pow_constant_exponent_is_native() {
     }
 }
 
+// RSQRT is built from ggml's own ops, as POW's -0.5 is, so a device runs every RMSNorm without a fallback
+// split. It is the custom op's arithmetic -- a rounded sqrt, then a rounded division -- so the CPU result is
+// BIT-IDENTICAL to `1.0f / std::sqrt(x)`, which this checks over values from denormals to 2e15 and at 0.
+void test_rsqrt_is_native_and_bit_identical() {
+    GgmlScratch s;
+    ggml_tensor* x = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 64, 3);
+    ggml_set_input(x);
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("RSQRT")(pc, {x}, {})[0];
+    LOOM_CHECK(out->ne[0] == 64 && out->ne[1] == 3);
+    ggml_cgraph* gf = s.expand(out);
+    int n_custom = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) n_custom += ggml_graph_node(gf, i)->op == GGML_OP_MAP_CUSTOM1;
+    LOOM_CHECK(n_custom == 0);
+
+    std::vector<float> wx(192);
+    for (size_t i = 0; i < wx.size(); ++i) wx[i] = std::ldexp(1.0f + 0.37f * static_cast<float>(i % 7), static_cast<int>(i) - 140);
+    wx[0] = 0.0f;
+    set_f32(x, wx);
+    s.compute(gf);
+    const std::vector<float> got = get_f32(out);
+    for (size_t i = 0; i < wx.size(); ++i) {
+        const float want = 1.0f / std::sqrt(wx[i]);
+        LOOM_CHECK(std::memcmp(&got[i], &want, sizeof(float)) == 0);
+    }
+}
+
 // A grouped kernel reaching the DEPTHWISE op must say so rather than abort inside ggml_im2col, whose
 // own assert names neither the op nor the channel count. This is the other half of Retro-046: the
 // exporter decides depthwise on the kernel's shape now, and this is what catches a file that predates
@@ -3134,6 +3162,7 @@ int main() {
     test_conv_1d_grouped_permuted_input();
     test_conv_1d_grouped_batched_against_reference();
     test_pow_constant_exponent_is_native();
+    test_rsqrt_is_native_and_bit_identical();
     test_argmax_rows();
     test_conv_1d_dw_rejects_a_grouped_kernel();
     test_depthwise_conv_transpose_1d_via_composition();

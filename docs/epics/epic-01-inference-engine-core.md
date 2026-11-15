@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: inference-engine
-last_updated: 2026-10-11
+last_updated: 2026-11-14
 ---
 
 # Epic-01: The Data-Driven ggml Inference Engine Core
@@ -59,6 +59,11 @@ script** as embedded Lua, alongside the weights those describe. The engine parse
   `run_ode` from `n_elems`. Noise that a graph takes as an input is drawn by the driver with
   `loom.gaussian_array` / `uniform_array`, in the reference's order, and a caller may override either
   ([ADR-042](../adrs/adr-042-a-samplers-noise-is-the-engines-a-graph-inputs-noise-is-the-drivers.md)).
+* **A driver can reach its file's vocabulary.** `loom.tokenize(text)` and `loom.detokenize(ids)` use the
+  byte-level BPE of the model whose modules the bridge runs, loaded on first use. `detokenize` returns the
+  vocabulary's bytes, an incomplete character included. They exist for a reference that holds text where a
+  driver holds ids: Qwen3-ASR's stream re-encodes its last answer before cutting it
+  ([ADR-121](../adrs/adr-121-qwen3-asr-streams-the-way-its-reference-does-re-encoding-only-what-changed.md)).
 
 **Two gotchas worth knowing before changing anything here.** Graph reuse and length-dependent constants
 interact: a constant folded into a retained graph at one length is wrong at another, and the failure is

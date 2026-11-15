@@ -1,5 +1,6 @@
 #include "loom/core/lua_bridge.h"
 
+#include "loom/core/bpe_vocab.h"
 #include "loom/core/duration_aligner.h"
 #include "loom/core/graph_builder.h"
 #include "loom/core/conv_state_cache.h"
@@ -2461,6 +2462,88 @@ int LoomLuaBridge::l_set_state(lua_State* L) {
     }
 }
 
+// THE ARRAY STATE A STREAM GROWS A PUSH AT A TIME, without the whole of it crossing into Lua and back on
+// every push. `loom.state` builds a Lua table of the entry and `loom.set_state` reads one back, so a driver
+// that kept its audio as one array paid for ALL of it per push: Canary's buffered stream held up to 14 s
+// (224k samples) and spent 3.4 ms of every 100 ms push converting them twice -- 56% of a 60 s stream on an
+// RTX 5090 once the model's own time had come down. These touch only what they name.
+//
+// `loom.append_state(name, values)`: appends a flat array (or nothing, for nil) to the array entry `name`,
+// creating it; returns its new length.
+int LoomLuaBridge::l_append_state(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string name = luaL_checkstring(L, 1);
+        StreamState& state = active_state(self, "loom.append_state");
+        const StreamState::Value* old = state.value(name);
+        if (old != nullptr && old->scalar) throw Error("'" + name + "' holds a number, not an array");
+        std::vector<double> more;
+        if (!lua_isnoneornil(L, 2)) more = read_number_array(L, 2);
+        StreamState::Value& v = state.value_for_write(name);
+        v.data.insert(v.data.end(), more.begin(), more.end());
+        lua_pushinteger(L, static_cast<lua_Integer>(v.data.size()));
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.append_state: %s", e.what());
+    }
+}
+
+// `loom.state_slice(name, offset, count)`: elements [offset, offset + count) of the array entry `name`
+// (0-based), as a table; past the end is refused rather than padded, so a driver's arithmetic error is
+// an error and not silence.
+int LoomLuaBridge::l_state_slice(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string name = luaL_checkstring(L, 1);
+        const lua_Integer offset = luaL_checkinteger(L, 2), count = luaL_checkinteger(L, 3);
+        const StreamState::Value* v = active_state(self, "loom.state_slice").value(name);
+        if (v == nullptr || v->scalar) throw Error("'" + name + "' is not an array entry");
+        if (offset < 0 || count < 0 || static_cast<size_t>(offset + count) > v->data.size()) {
+            throw Error("[" + std::to_string(offset) + ", " + std::to_string(offset + count) + ") is outside '" +
+                        name + "' (" + std::to_string(v->data.size()) + " elements)");
+        }
+        push_number_array(L, std::vector<double>(v->data.begin() + offset, v->data.begin() + offset + count));
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.state_slice: %s", e.what());
+    }
+}
+
+// `loom.drop_state(name, n)`: removes the first `n` elements of the array entry `name` -- what a sliding
+// buffer no longer reads.
+int LoomLuaBridge::l_drop_state(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string name = luaL_checkstring(L, 1);
+        const lua_Integer n = luaL_checkinteger(L, 2);
+        StreamState& state = active_state(self, "loom.drop_state");
+        const StreamState::Value* old = state.value(name);
+        if (old == nullptr || old->scalar) throw Error("'" + name + "' is not an array entry");
+        if (n < 0 || static_cast<size_t>(n) > old->data.size()) {
+            throw Error("cannot drop " + std::to_string(n) + " of '" + name + "''s " +
+                        std::to_string(old->data.size()) + " elements");
+        }
+        StreamState::Value& v = state.value_for_write(name);
+        v.data.erase(v.data.begin(), v.data.begin() + n);
+        return 0;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.drop_state: %s", e.what());
+    }
+}
+
+// `loom.state_size(name)`: the array entry's length, 0 when there is none.
+int LoomLuaBridge::l_state_size(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string name = luaL_checkstring(L, 1);
+        const StreamState::Value* v = active_state(self, "loom.state_size").value(name);
+        lua_pushinteger(L, static_cast<lua_Integer>(v == nullptr ? 0 : v->data.size()));
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.state_size: %s", e.what());
+    }
+}
+
 // `loom.keep_state(name, module)`: copies every retained output of `module` into the stream's tensor
 // entry `name`, backend to backend, for a later call of this stream to read as `{state = name, ...}`.
 //
@@ -2535,6 +2618,7 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"argmax_row_range", &LoomLuaBridge::l_argmax_row_range},
         {"argmax_rows", &LoomLuaBridge::l_argmax_rows},
         {"sample_row", &LoomLuaBridge::l_sample_row},     {"seed_rng", &LoomLuaBridge::l_seed_rng},
+        {"tokenize", &LoomLuaBridge::l_tokenize},         {"detokenize", &LoomLuaBridge::l_detokenize},
         {"gaussian_array", &LoomLuaBridge::l_gaussian_array},
         {"uniform_array", &LoomLuaBridge::l_uniform_array},
         {"expand_by_duration", &LoomLuaBridge::l_expand_by_duration},
@@ -2543,6 +2627,8 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"seed_kv", &LoomLuaBridge::l_seed_kv},
         {"state", &LoomLuaBridge::l_state},               {"set_state", &LoomLuaBridge::l_set_state},
         {"keep_state", &LoomLuaBridge::l_keep_state},
+        {"append_state", &LoomLuaBridge::l_append_state}, {"state_slice", &LoomLuaBridge::l_state_slice},
+        {"drop_state", &LoomLuaBridge::l_drop_state},     {"state_size", &LoomLuaBridge::l_state_size},
     };
     for (const auto& b : bindings) {
         lua_pushlightuserdata(L_, this);
@@ -2559,6 +2645,47 @@ LoomLuaBridge::~LoomLuaBridge() {
 void LoomLuaBridge::register_module(const std::string& name, GgufModel& model, GraphTopology topo,
                                      KvCache* kv_cache, ConvStateCache* conv_state) {
     modules_[name] = Module{&model, std::move(topo), kv_cache, conv_state, backends_, nullptr, nullptr};
+    if (!text_model_) text_model_ = &model;
+}
+
+const BpeVocab& LoomLuaBridge::text_vocab() {
+    if (!text_vocab_) {
+        if (!text_model_) throw Error("no model is registered, so there is no vocabulary to use");
+        text_vocab_ = BpeVocab::load(*text_model_);
+        if (!text_vocab_) {
+            throw Error("this file's vocabulary is not byte-level BPE (tokenizer.ggml.model), which is the only "
+                        "kind a driver can tokenize with yet");
+        }
+    }
+    return *text_vocab_;
+}
+
+int LoomLuaBridge::l_tokenize(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        size_t n = 0;
+        const char* text = luaL_checklstring(L, 1, &n);
+        const std::vector<int32_t> ids = self->text_vocab().encode(std::string(text, n));
+        push_number_array(L, std::vector<double>(ids.begin(), ids.end()));
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.tokenize: %s", e.what());
+    }
+}
+
+int LoomLuaBridge::l_detokenize(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::vector<double> raw = read_number_array(L, 1);
+        std::vector<int32_t> ids;
+        ids.reserve(raw.size());
+        for (double v : raw) ids.push_back(static_cast<int32_t>(v));
+        const std::string text = self->text_vocab().decode(ids);
+        lua_pushlstring(L, text.data(), text.size());
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.detokenize: %s", e.what());
+    }
 }
 
 std::vector<LoomLuaBridge::ModuleDeviceReport> LoomLuaBridge::device_report() const {

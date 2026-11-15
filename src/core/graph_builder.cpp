@@ -20,11 +20,13 @@ namespace {
 // lets a GPU backend stage its tiles in half precision: Vulkan's matmul_f32_f32 keeps both operands in
 // float16_t shared memory on any fp16-capable device (and its coopmat paths convert them to f16
 // outright), and Metal's kernel_mul_mm_f32_f32 loads both into `half` threadgroup tiles. Any |value| >
-// 65504 becomes inf there, and inf * 0 is NaN. CPU and CUDA (cuBLAS SGEMM) never do this, so a model can
-// be exact on both and still produce nothing on Vulkan or Metal: SenseVoice's kaldi power spectrum peaks
+// 65504 becomes inf there, and inf * 0 is NaN. The CPU never does this, so a model can be exact there and
+// still produce nothing on Vulkan or Metal: SenseVoice's kaldi power spectrum peaks
 // near 1e10, its mel projection came back 99.5% NaN, and the transcript was ''. GGML_PREC_F32 is ggml's
 // own way of asking for full precision; cmake/patches/ggml-0023 and ggml-0024 make those two backends
-// honour it for F32 x F32 (stock ggml ignores it there). It is set with ggml_prec_set_acc, which since
+// honour it for F32 x F32 (stock ggml ignores it there). CUDA is not exact by default either: every cuBLAS
+// handle runs F32 in TF32 (a 10-bit mantissa), and so do MMF's F32 tiles; ggml-0063 makes a tagged
+// product skip both. CosyVoice3's pinned LM draws and its 10-step ODE mel moved under TF32 (ADR-069). It is set with ggml_prec_set_acc, which since
 // ggml v0.26 (llama/26675) is what ggml_mul_mat_set_prec became: the same op_params[0], so the patches
 // read it unchanged. Tagged here, on the finished graph, rather than at each ggml_mul_mat call site, so
 // that a new primitive cannot forget it. A non-F32 `a` (F16, a quantized weight) is left alone: that is
@@ -504,6 +506,20 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
         }
         if (!galloc_) {
             galloc_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
+        }
+        // **Planned for THIS graph, every rebuild** (ADR-117). `ggml_gallocr_alloc_graph` re-plans only
+        // when the graph does not fit the last plan, so a graph built after a larger one of the same
+        // topology took the larger one's offsets, and the same graph had another layout depending on what
+        // ran before it. The layout is not only where things are: the CPU backend's conv fusion
+        // (ggml-0036) checks whether its result overlaps its input, falls back to the unfused nodes when
+        // it does, and the two round differently. Chatterbox's HiFT came out 1.1e-07 apart for one mel run
+        // before and after a longer one, and a stream interleaved with another lost its bit-identity. The
+        // buffer still only grows here (reserve reallocates only past its size); the offsets are this
+        // graph's own, so its result is too. One planning pass per REBUILD, never per reuse: Soprano's one
+        // pass (an LM rebuilding per KV bucket, a decoder per window) took 2.86 s with it and 3.00 s without,
+        // five interleaved runs each on the dev box -- noise.
+        if (!ggml_gallocr_reserve(galloc_.get(), gf)) {
+            throw Error("GraphBuilder::build: ggml_gallocr_reserve failed");
         }
         if (!ggml_gallocr_alloc_graph(galloc_.get(), gf)) {
             throw Error("GraphBuilder::build: ggml_gallocr_alloc_graph failed");
