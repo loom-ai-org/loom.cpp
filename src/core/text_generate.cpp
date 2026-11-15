@@ -1,4 +1,5 @@
 #include "loom/core/text_generate.h"
+#include "loom/core/model_contract.h"
 
 #include "loom/loom_errors.h"
 
@@ -181,10 +182,11 @@ GenerationStream::GenerationStream(LoomLuaBridge& bridge, const GgufModel& model
     if (!model.has_kv("model.driver_script")) {
         throw LoadError("GenerationStream: model carries no driver_script; it can be inspected but not run.");
     }
-    if (!supported(bridge)) {
+    if (!supported(bridge, model)) {
         throw LoadError("GenerationStream: this file's driver runs its decode loop inside one call "
-                        "(`infer_with_past`) and exports no `stream_open` / `stream_feed` / "
-                        "`stream_finish`, so it cannot hand tokens back as they are drawn. A re-export "
+                        "(`infer_with_past`, or `infer` for an encoder-decoder) and exports no "
+                        "`stream_open` / `stream_feed` / `stream_finish`, so it cannot hand tokens back "
+                        "as they are drawn. A re-export "
                         "with this runtime's exporter adds them; `generate` still runs it one-pass.");
     }
     if (prompt_.empty()) {
@@ -201,6 +203,13 @@ GenerationStream::GenerationStream(LoomLuaBridge& bridge, const GgufModel& model
 bool GenerationStream::supported(const LoomLuaBridge& bridge) {
     // The one-token shape keeps nothing across calls but the tokens, which this class holds.
     return bridge.has_function("stream_open") || !bridge.has_function("infer_with_past");
+}
+
+bool GenerationStream::supported(const LoomLuaBridge& bridge, const GgufModel& model) {
+    if (bridge.has_function("stream_open")) return true;
+    // flan-t5 before ADR-130: no `infer_with_past`, so the bridge-only test took it for a one-token LM,
+    // and the loop fed its answer back as the SOURCE -- one token came back, then nothing.
+    return supported(bridge) && ModelContract::read(model).task != task_names::TEXT2TEXT_GENERATION;
 }
 
 void GenerationStream::reset() {

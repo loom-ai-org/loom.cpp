@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-14
+last_updated: 2026-11-15
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -1051,8 +1051,16 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   Whisper as ufal's SimulStreaming streams it
   ([ADR-128](../adrs/adr-128-whisper-streams-the-way-simulstreaming-does.md)). All gated on the dev-box CPU or
   the RTX 5090 or both.
-  Next: pyannote, and the decode loops with per-call context (T5, the speech LMs' token stream), each a driver
-  with the three functions (a re-export)
+  pyannote streams as diart's voice activity detection does
+  ([ADR-129](../adrs/adr-129-pyannote-streams-the-way-diarts-voice-activity-detection-does.md): a speech score per
+  row, `loom.stream.labels`, rows on diart's own grid stated per row; every row and turn diart's on 35 cases), and
+  flan-t5-small hands its tokens back as they are drawn
+  ([ADR-130](../adrs/adr-130-an-encoder-decoder-token-stream-keeps-its-per-call-context-in-the-state.md): the cross
+  K/V and source length kept in the stream state; the published file, which the door took for a causal LM, is now
+  refused). **Every row of the survey is built** (the user chose flan-t5 alone for the per-call-context loops,
+  2026-11-15). What is left: the user merges the stacks; each row publishes after a re-export on the rc21+ engine.
+  Not built unless asked: diart's full diarization (needs a speaker-embedding export), LFM2.5-Audio full duplex,
+  the streaming checkpoints on disk outside the zoo
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,
   after the native RSQRT, ggml-0063 (no TF32 for a tagged product) and ggml-0064 (a prefix-stable cumsum). Chatterbox's is the second

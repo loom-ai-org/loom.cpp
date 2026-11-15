@@ -100,8 +100,13 @@ public:
     GenerationStream(LoomLuaBridge& bridge, const GgufModel& model, std::vector<int32_t> prompt_tokens,
                      GenerateOptions options = {});
 
-    // Whether this file's driver can be streamed at all.
+    // Whether this file's driver can be streamed at all: it exports the stream functions, or it is a
+    // causal LM whose `infer` draws one token (the host's loop). The second needs the model: an
+    // encoder-decoder (`text2text-generation`) runs its whole loop inside `infer`, so the one-token loop
+    // would re-encode its own output as the source (ADR-130). The bridge-only form cannot tell and
+    // answers for a causal LM.
     static bool supported(const LoomLuaBridge& bridge);
+    static bool supported(const LoomLuaBridge& bridge, const GgufModel& model);
 
     // Up to `max_tokens` more generated ids; empty once finished. The stop token never comes back when
     // `strip_eos` is set, as with `generate`.
