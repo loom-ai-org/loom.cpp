@@ -378,7 +378,9 @@ int stream_pair(loom::GgufModel& lm, const loom::Backends& backends,
         pending.clear();
         ++pushes;
         const double at = std::chrono::duration<double>(clock::now() - t0).count();
-        if (first < 0) first = at;
+        // A push may hand back nothing yet: a codec decoded by windows holds its last frames for their
+        // lookahead (Dia's DAC, ADR-103), so the first audio is the first push that returns samples.
+        if (first < 0 && !wav.empty()) first = at;
         std::printf("  frame %zu: %.2f s of audio ready at %.3f s\n", frames,
                     rate ? static_cast<double>(audio.size()) / rate : 0.0, at);
         std::fflush(stdout);

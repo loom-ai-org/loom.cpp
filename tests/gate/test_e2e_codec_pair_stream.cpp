@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -33,7 +34,12 @@ namespace {
 
 constexpr int kSkipReturnCode = 77;
 constexpr double kOnePassTolerance = 1e-3;
-constexpr double kFrames = 12;
+// Frames per generation; LOOM_STREAM_FRAMES overrides it -- a codec decoded by windows (Dia's DAC, 16 frames of
+// lookahead) only crosses a seam in a generation longer than its lookahead.
+double frames_asked() {
+    const char* env = std::getenv("LOOM_STREAM_FRAMES");
+    return env ? std::atof(env) : 12.0;
+}
 
 using Inputs = loom::audio::SpeechStream::Inputs;
 
@@ -66,17 +72,31 @@ int main() {
     auto codec = loom::GgufModel::load(codec_path, backend.get());
     LOOM_CHECK(lm != nullptr && codec != nullptr);
     const uint32_t width = lm->hparam_u32("codec.n_codebooks");
-    LOOM_CHECK(width == codec->hparam_u32("codec.n_codebooks"));
-    auto vocab = loom::BpeVocab::load(*lm);
-    LOOM_CHECK(vocab != nullptr);
+    const uint32_t codec_width = codec->hparam_u32("codec.n_codebooks");
+    // An LM narrower than its codec (MOSS-TTS: 12 of 32) is widened with the codec's absent id (ADR-050).
+    LOOM_CHECK(width == codec_width || (width < codec_width && codec->has_kv("loom.codec.absent_code")));
+    const int32_t absent = codec->has_kv("loom.codec.absent_code")
+                               ? static_cast<int32_t>(codec->hparam_u32("codec.absent_code")) : 0;
+    const auto widen = [&](const std::vector<int32_t>& rows) {
+        std::vector<int32_t> out;
+        for (size_t f = 0; f < rows.size() / width; ++f) {
+            for (uint32_t c = 0; c < codec_width; ++c) out.push_back(c < width ? rows[f * width + c] : absent);
+        }
+        return out;
+    };
+    // The LM's own text front end, by its tag: a byte-level BPE (Qwen3-TTS, Audio8, MOSS-TTS) or bytes (Dia).
+    const std::string tag = lm->kv_str("tokenizer.ggml.model");
+    auto bpe = tag == "byt5" ? nullptr : loom::BpeVocab::load(*lm);
+    auto bytes = tag == "byt5" ? loom::ByteVocab::load(*lm) : nullptr;
+    LOOM_CHECK(bpe != nullptr || bytes != nullptr);
     loom::Session lm_session(*lm, backend.get());
     loom::Session codec_session(*codec, backend.get());
     loom::LoomLuaBridge& bridge = lm_session.bridge();
     LOOM_CHECK(loom::audio::SpeechStream::supported(bridge) && loom::audio::CodecStream::supported(codec_session.bridge()));
 
     const auto inputs_for = [&](const std::string& text, double seed) {
-        const std::vector<int32_t> ids = vocab->encode(text);
-        Inputs in{{"tokens", std::vector<double>(ids.begin(), ids.end())}, {"max_new_tokens", kFrames},
+        const std::vector<int32_t> ids = bpe ? bpe->encode(text) : bytes->encode(text);
+        Inputs in{{"tokens", std::vector<double>(ids.begin(), ids.end())}, {"max_new_tokens", frames_asked()},
                   {"seed", seed}};
         if (!ref.empty()) in["waveform"] = std::vector<double>(ref.begin(), ref.end());
         return in;
@@ -101,8 +121,9 @@ int main() {
 
     // 2. The pair.
     {
+        const std::vector<int32_t> wide_a = widen(want_a);
         const auto decoded = std::get<std::vector<double>>(
-            codec_session.bridge().call("infer", {{"codes", std::vector<double>(want_a.begin(), want_a.end())}}));
+            codec_session.bridge().call("infer", {{"codes", std::vector<double>(wide_a.begin(), wide_a.end())}}));
         loom::audio::SpeechStream codes(bridge, a);
         loom::audio::CodecStream audio(codec_session.bridge());
         std::vector<float> got;
@@ -112,14 +133,14 @@ int main() {
             const std::vector<float> piece = codes.next();
             pending.insert(pending.end(), piece.begin(), piece.end());
             if (!pending.empty() && pending.size() / width >= std::min<size_t>(8, size_t{1} << std::min<size_t>(pushes, 3))) {
-                const std::vector<float> w = audio.push(pending);
+                const std::vector<float> w = audio.push(widen(pending));
                 got.insert(got.end(), w.begin(), w.end());
                 pending.clear();
                 ++pushes;
             }
         }
         if (!pending.empty()) {
-            const std::vector<float> w = audio.push(pending);
+            const std::vector<float> w = audio.push(widen(pending));
             got.insert(got.end(), w.begin(), w.end());
         }
         const std::vector<float> tail = audio.finish();

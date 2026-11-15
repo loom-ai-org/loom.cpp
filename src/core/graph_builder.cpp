@@ -224,13 +224,17 @@ int64_t GraphBuilder::real_n_kv(const DynamicAxes& axes) const {
     if (kv_cache_ == nullptr || !kv_cache_->ring() || n_kv == 0) return n_kv;
     // A RING holds the last `kv_size` positions (ADR-066), so a step past its capacity reads all of it.
     // A call of several tokens that WRAPS cannot be served: its later rows would overwrite cells its
-    // earlier queries still attend to, since every row is written before any is read.
+    // earlier queries still attend to, since every row is written before any is read -- unless the
+    // ring is larger than its WINDOW by at least the call (ADR-103): then the cells overwritten hold
+    // positions every query in the call has already left behind.
     const auto capacity = static_cast<int64_t>(kv_cache_->kv_size());
-    if (n_kv > capacity && axes.count("n_tokens") && axes.at("n_tokens") > 1.0) {
+    const int64_t room = kv_cache_->window() > 0 ? capacity - kv_cache_->window() : 1;
+    if (n_kv > capacity && axes.count("n_tokens") && axes.at("n_tokens") > static_cast<double>(room)) {
         throw SchemaError("GraphBuilder::build: " + std::to_string(std::llround(axes.at("n_tokens"))) +
                            " tokens at n_past " + std::to_string(std::llround(axes.at("n_past"))) +
                            " would wrap this model's " + std::to_string(capacity) +
-                           "-cell ring KV cache; past its capacity a ring takes one token per call");
+                           "-cell ring KV cache; past its capacity a ring takes " + std::to_string(room) +
+                           " token(s) per call");
     }
     return std::min(n_kv, capacity);
 }
