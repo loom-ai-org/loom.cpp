@@ -8,6 +8,11 @@ positions' values for a ring (ADR-066), the mean of all of them for a linear cac
 could not reach step 4 at all. `prefill` writes several tokens in one call, which is legal while the
 ring has room and refused once it would wrap.
 
+`attn_w` declares a cache of its OWN (ADR-103): a 6-cell ring serving a window of 3, so a call of up to
+6 - 3 = 3 tokens may wrap -- the cells it overwrites hold positions outside every query's window. `windowed`
+pushes calls of the sizes it is given and returns every row's output, each the mean of its last
+min(p + 1, 3) positions' values when the cell mask is right.
+
 Requires: pip install gguf numpy
 """
 import json
@@ -25,6 +30,22 @@ function stepwise(inputs)
         loom.run_subgraph_and_retain('attn', {n_tokens = 1, n_past = p},
             {q = {1, 0}, k = {0, 0}, v = {p + 1, p + 1}, kq_mask = loom.causal_mask(1, math.min(p, 3))})
         out[#out + 1] = loom.get_output('attn', 1)[1]
+    end
+    return out
+end
+
+-- Calls of `pushes[i]` tokens through `attn_w`'s 6-cell, window-3 ring; returns every row's output.
+function windowed(inputs)
+    local out, at = {}, 0
+    for _, n in ipairs(inputs.pushes) do
+        local q, k, v = {}, {}, {}
+        for i = 0, n - 1 do q[#q + 1] = 1; q[#q + 1] = 0; k[#k + 1] = 0; k[#k + 1] = 0
+            v[#v + 1] = at + i + 1; v[#v + 1] = at + i + 1 end
+        loom.run_subgraph_and_retain('attn_w', {n_tokens = n, n_past = at},
+            {q = q, k = k, v = v, kq_mask = loom.causal_mask(n, at, 3, 6)})
+        local o = loom.get_output('attn_w', 1)
+        for i = 1, n do out[#out + 1] = o[2 * i - 1] end
+        at = at + n
     end
     return out
 end
@@ -65,6 +86,9 @@ def main() -> None:
                    "attrs": {"layer": 0, "scale": 1.0}}],
     }
     w.add_string("model.graph_topology.attn", json.dumps(attn))
+    # The same graph with a cache of its own: wider than its window, so short calls may wrap (ADR-103).
+    attn_w = dict(attn, kv_cache={"n_layer": 1, "n_embd_k": 2, "n_embd_v": 2, "size": 6, "ring": True, "window": 3})
+    w.add_string("model.graph_topology.attn_w", json.dumps(attn_w))
     w.add_string("model.driver_script", DRIVER)
     w.add_tensor("test.placeholder", np.zeros(4, dtype=np.float32))
     w.write_header_to_file()

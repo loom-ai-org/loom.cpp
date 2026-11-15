@@ -10,7 +10,7 @@
 namespace loom {
 
 ConvStateCache::ConvStateCache(uint32_t n_layer, uint32_t n_state, uint32_t n_embd_conv, ggml_backend_t backend)
-    : n_state_(n_state), n_embd_conv_(n_embd_conv) {
+    : backend_(backend), n_state_(n_state), n_embd_conv_(n_embd_conv) {
     // n_layer slots plus the one permanently-zero slot read_zeros() hands out.
     const size_t mem_size = static_cast<size_t>(n_layer + 1) * ggml_tensor_overhead() + 4096;
     store_ctx_.reset(ggml_init(ggml_init_params{mem_size, nullptr, /*no_alloc=*/true}));
@@ -52,6 +52,25 @@ ggml_tensor* ConvStateCache::write(ggml_context* ctx, ggml_tensor* src, uint32_t
     ggml_tensor* base = layers_.at(layer);
     ggml_tensor* dst = ggml_view_2d(ctx, base, n_state_, n_embd_conv_, base->nb[1], 0);
     return ggml_cpy(ctx, src, dst);
+}
+
+std::unique_ptr<ConvStateCache> ConvStateCache::make_like() const {
+    return std::make_unique<ConvStateCache>(n_layer(), n_state_, n_embd_conv_, backend_);
+}
+
+void ConvStateCache::park(std::vector<float>& out) const {
+    const size_t per_layer = static_cast<size_t>(n_state_) * n_embd_conv_;
+    out.resize(per_layer * n_layer());
+    for (uint32_t il = 0; il < n_layer(); ++il) {
+        ggml_backend_tensor_get(layers_[il], out.data() + il * per_layer, 0, per_layer * sizeof(float));
+    }
+}
+
+void ConvStateCache::restore(const std::vector<float>& in) {
+    const size_t per_layer = static_cast<size_t>(n_state_) * n_embd_conv_;
+    for (uint32_t il = 0; il < n_layer(); ++il) {
+        ggml_backend_tensor_set(layers_[il], in.data() + il * per_layer, 0, per_layer * sizeof(float));
+    }
 }
 
 void ConvStateCache::reset() {

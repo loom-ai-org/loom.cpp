@@ -85,6 +85,14 @@ bool conv_kernel_is_packed(const ggml_tensor* kernel) {
     return ggml_is_quantized(kernel->type);
 }
 
+// Whether the graph's primary backend keeps its tensors in memory of its own -- a discrete GPU -- rather
+// than in host memory beside the CPU (`backend_can_run`'s P4.44 case: BLAS, the Pi Zero's QPUs). A lowering
+// composed for a device belongs on the first; the second runs the CPU's own tuned kernels.
+bool primary_is_device(const PrimitiveContext& pc) {
+    return pc.backends.primary != nullptr &&
+           !ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(pc.backends.primary));
+}
+
 // The dtype the im2col patch matrix is materialised in, which is what decides whether the kernel can
 // stay in mul_mat's SECOND operand. ggml converts src1 to `vec_dot_type[src0->type]` and asserts src1
 // is F32 while doing it -- so an F16 kernel is legal in src1 exactly when src0 is also F16, because
@@ -271,9 +279,18 @@ Outputs conv_1d_grouped(PrimitiveContext& pc, ggml_tensor* kernel, ggml_tensor* 
     const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
     const int64_t K = kernel->ne[0], N = data->ne[2];
     const int64_t OL = (data->ne[0] + 2 * p0 - d0 * (K - 1) - 1) / s0 + 1;
+    //
+    // The bound is the CPU's. On a device the per-group loop is the slow side at any size: CosyVoice3's DiT
+    // has two K = 31 convolutions at groups = 16 over 1024 channels, and on an RTX 5090 they ran as 32
+    // direct CONV_2Ds and 30 CONCATs per estimator call, ~15% of the flow (2026-11-12) -- where a 79 MB
+    // im2col and one batched product is a few hundred microseconds. A device primary takes this path up
+    // to 64M im2col elements (256 MB): the DiT's guided batch of two is 39M (ADR-113).
+    const bool host_primary = pc.backends.primary == nullptr ||
+        ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(pc.backends.primary));
+    const int64_t im2col_limit = host_primary ? (int64_t{1} << 20) : (int64_t{1} << 26);
     if (!folded && !conv_kernel_is_packed(kernel) &&
         (kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16) && data->type == GGML_TYPE_F32 &&
-        data->ne[3] == 1 && ic * K * OL * N <= (int64_t{1} << 20)) {
+        data->ne[3] == 1 && ic * K * OL * N <= im2col_limit) {
         // The kernel as im2col's shape carrier: [K, IC, OC/G] has exactly its element count.
         ggml_tensor* carrier = ggml_reshape_3d(pc.ctx, kernel, K, ic, oc_per_group);
         ggml_tensor* im2col = ggml_im2col(pc.ctx, carrier, data, s0, 0, p0, 0, d0, 0, /*is_2D=*/false,
@@ -337,6 +354,30 @@ Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // straight into a pointwise/depthwise conv (confirmed on Conformer-CTC's GLU-split conv module: the
     // first half of a channel-split tensor is a genuinely strided view, not a fresh contiguous buffer).
     if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
+
+    // A POINTWISE CONVOLUTION ON A DEVICE IS ONE MATRIX PRODUCT. With K == 1, stride 1, no padding and no
+    // dilation, `out[t, oc] = sum_ic x[t, ic] * W[oc, ic]`: transpose the activation to [IC, IL] and
+    // `ggml_mul_mat` it against the kernel read as [IC, OC], which gives [IL, OC] -- the layout the next op
+    // already reads, so one CONT is the whole cost. FOUND ON CANARY on an RTX 5090: its FastConformer has two
+    // such convolutions per layer (1024 -> 2048 and 1024 -> 1024 over 176 frames, 64 a pass), and ggml's
+    // CUDA direct CONV_2D took 0.9 ms each, 43% of a 14 s encoder pass that its 160 matrix products of the
+    // same size did in less. Every FastConformer (Parakeet, Canary, Nemotron, Conformer-CTC) and Citrinet's
+    // pointwise stacks have them.
+    //
+    // A DEVICE only: a primary whose tensors live in host memory (the CPU behind BLAS, the Pi Zero's QPUs)
+    // keeps the direct sweep below, which the CPU paths are tuned and bit-pinned against. One batch item
+    // only: `ggml_mul_mat` broadcasts its second operand, not its first, so N > 1 would need a reshape
+    // that interleaves the batch into the time axis.
+    if (!fold.folded && kernel->ne[0] == 1 && s0 == 1 && p0 == 0 && d0 == 1 && data->ne[2] == 1 &&
+        primary_is_device(pc) && !conv_kernel_is_packed(kernel) && ggml_is_contiguous(kernel) &&
+        (kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16)) {
+        const int64_t IL = data->ne[0], IC = kernel->ne[1], OC = kernel->ne[2];
+        GGML_ASSERT(data->ne[1] == IC && data->ne[3] == 1);
+        ggml_tensor* xt = ggml_cont(pc.ctx, ggml_transpose(pc.ctx, ggml_reshape_2d(pc.ctx, data, IL, IC)));  // [IC, IL]
+        ggml_tensor* w = ggml_reshape_2d(pc.ctx, kernel, IC, OC);                                           // [IC, OC]
+        ggml_tensor* out = ggml_mul_mat(pc.ctx, xt, w);                                                     // [IL, OC]
+        if (backend_can_run(pc, out)) return {ggml_reshape_3d(pc.ctx, out, IL, OC, 1)};                    // [OL, OC, N]
+    }
 
     // ON aarch64, LOWER TO ggml's SINGLE CONV OP INSTEAD, because materialising the whole patch matrix
     // is the wrong trade there. The recipe below writes an [IC*K, OL] im2col matrix to memory and then
@@ -1024,6 +1065,41 @@ Outputs op_stft(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     if (!ggml_is_contiguous(x)) x = ggml_cont(pc.ctx, x);
     if (!ggml_is_contiguous(win)) win = ggml_cont(pc.ctx, win);
     const int64_t F = (x->ne[0] - n_fft) / hop + 1, bins = n_fft / 2 + 1, B = x->ne[1];
+
+    // ON A DEVICE, THE TRANSFORM AS A PRODUCT WITH A WINDOWED DFT BASIS, built in the graph. The FFT below is
+    // a CPU custom op, so a GPU graph split around it and sent the signal to the host and both halves back
+    // on every call: on Canary's 14 s buffer (an RTX 5090) that was a quarter of the encoder's 30 ms, and a
+    // buffered stream pays it every step. Framing is `im2col` (the window doubles as its shape carrier),
+    // and `re = frames . (w cos)`, `im = -frames . (w sin)` are two matrix products the device runs.
+    //
+    // The basis is the exporter's exact one (torch_patches.py item 4): the phase `j*k mod n` is formed in
+    // integers before the angle, so no angle exceeds 2*pi. Here the integers are F32 -- exact while
+    // `j*k < 2^24` -- and `floor(j*k / n)` is exact while n^2 < 2^24 (the quotient's rounding error,
+    // under n/2 ulps of 2^-23, stays below the 1/n a non-multiple sits from the next integer). So only
+    // the angle's product and the cos/sin round, and the two transforms agree to a few ulps. Batch 1 only:
+    // `ggml_mul_mat` broadcasts its second operand, and the frames are the first.
+    if (primary_is_device(pc) && B == 1 && n_fft <= 4096) {
+        ggml_context* c = pc.ctx;
+        ggml_tensor* j = ggml_reshape_2d(c, ggml_arange(c, 0.0f, static_cast<float>(n_fft), 1.0f), n_fft, 1);
+        ggml_tensor* k = ggml_reshape_2d(c, ggml_arange(c, 0.0f, static_cast<float>(bins), 1.0f), 1, bins);
+        ggml_tensor* jk = ggml_mul(c, ggml_repeat_4d(c, j, n_fft, bins, 1, 1), k);                 // [n, bins]
+        ggml_tensor* q = ggml_floor(c, ggml_scale(c, jk, 1.0f / static_cast<float>(n_fft)));
+        ggml_tensor* r = ggml_sub(c, jk, ggml_scale(c, q, static_cast<float>(n_fft)));             // j*k mod n
+        ggml_tensor* angle = ggml_scale(c, r, static_cast<float>(2.0 * M_PI / static_cast<double>(n_fft)));
+        ggml_tensor* w = ggml_reshape_2d(c, win, n_fft, 1);
+        ggml_tensor* basis_re = ggml_mul(c, ggml_cos(c, angle), w);                                // [n, bins]
+        ggml_tensor* basis_im = ggml_neg(c, ggml_mul(c, ggml_sin(c, angle), w));
+        ggml_tensor* frames = ggml_im2col(c, ggml_reshape_3d(c, win, n_fft, 1, 1), ggml_reshape_3d(c, x, x->ne[0], 1, 1),
+                                          static_cast<int>(hop), 0, 0, 0, 1, 0, /*is_2D=*/false, GGML_TYPE_F32);
+        ggml_tensor* frames_2d = ggml_reshape_2d(c, frames, n_fft, F);                             // [n, F]
+        ggml_tensor* re = ggml_mul_mat(c, frames_2d, basis_re);                                    // [F, bins]
+        ggml_tensor* im = ggml_mul_mat(c, frames_2d, basis_im);
+        if (backend_can_run(pc, re) && backend_can_run(pc, frames) && backend_can_run(pc, q) &&
+            backend_can_run(pc, angle) && backend_can_run(pc, basis_re)) {
+            return {ggml_reshape_3d(c, re, F, bins, 1), ggml_reshape_3d(c, im, F, bins, 1)};
+        }
+    }
+
     ggml_tensor* args[] = {x, win};
     void* params = const_cast<StftParams*>(stft_params(n_fft, hop));
     ggml_tensor* both = ggml_custom_4d(pc.ctx, GGML_TYPE_F32, F, bins, B, 2, args, 2, stft_custom_op,

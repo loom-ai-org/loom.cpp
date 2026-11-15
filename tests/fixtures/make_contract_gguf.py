@@ -468,7 +468,8 @@ end
 
 
 def _audio_classifier(path: Path, arch: str, task: str, kind: str, granularity: str, driver: str,
-                      labels=None, frame_rate=None, frame_offset=None, embedding_dim=None) -> None:
+                      labels=None, frame_rate=None, frame_offset=None, embedding_dim=None,
+                      stream_labels=None) -> None:
     w = _base(path, arch)
     w.add_string("loom.task", task)
     w.add_string("loom.input.kind", "audio")
@@ -478,6 +479,8 @@ def _audio_classifier(path: Path, arch: str, task: str, kind: str, granularity: 
     w.add_int32("loom.sample_rate", 16000)
     if labels:
         w.add_array("loom.labels", labels)
+    if stream_labels:
+        w.add_array("loom.stream.labels", stream_labels)
     if frame_rate is not None:
         w.add_float32("loom.output.frame_rate", frame_rate)
     if frame_offset is not None:
@@ -493,6 +496,10 @@ def write_audio_classifiers(out_dir: Path) -> None:
     _audio_classifier(out_dir / "audio_frame_classifier.gguf", "frame_classifier_test",
                       "audio-classification", "class", "frame", FRAME_CLASSIFY_DRIVER,
                       labels=["non_speech", "speech"], frame_rate=4.0, frame_offset=0.5)
+    # A stream that answers other rows than `infer` (ADR-129: pyannote's speech score, not its classes).
+    _audio_classifier(out_dir / "audio_frame_classifier_stream_labels.gguf", "frame_classifier_stream_test",
+                      "audio-classification", "class", "frame", FRAME_CLASSIFY_DRIVER,
+                      labels=["a", "b", "c"], frame_rate=4.0, frame_offset=0.5, stream_labels=["speech"])
     _audio_classifier(out_dir / "audio_clip_classifier.gguf", "clip_classifier_test",
                       "audio-classification", "class", "clip", CLIP_CLASSIFY_DRIVER,
                       labels=["en", "de", "fr"])
