@@ -84,6 +84,15 @@ endfunction()
 # version-compared, for the reason in this file's header.
 function(loom_vulkan_headers_are_usable RESULT_VAR)
     set(CMAKE_REQUIRED_QUIET TRUE)
+    # The probe compiles against the headers ggml will be given, so it has to look where
+    # `find_package(Vulkan)` looks. On Linux that is /usr/include, which every compile line has anyway;
+    # on Windows it is the SDK's `%VULKAN_SDK%\Include`, which none has -- so without this the probe
+    # could not open <vulkan/vulkan_core.h>, reported a current SDK (1.4.321.1) as "too old", and
+    # fetched the same headers from GitHub.
+    find_package(Vulkan QUIET)
+    if(Vulkan_INCLUDE_DIRS)
+        set(CMAKE_REQUIRED_INCLUDES ${Vulkan_INCLUDE_DIRS})
+    endif()
     check_cxx_source_compiles("
         #include <vulkan/vulkan_core.h>
         int main() {

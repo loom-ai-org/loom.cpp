@@ -7,6 +7,7 @@
 // whatever the box underneath is.
 
 #include "test_util.h"
+#include "posix_env.h"
 #include "cpu_backend.h"
 
 #include "loom/loom.h"
