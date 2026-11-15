@@ -97,7 +97,10 @@ Option **3**.
   * Three more caught only by the threshold-20 set: the rewind off, the trim's frame shift added
     instead of subtracted, and the special-previous-token rule flipped.
 * **Speed** (100 ms pushes): 12.8x real time on the RTX 5090 over the 15 cases (RTF 0.078); 7-10x at
-  0.5 s chunks, 19-27x at 2 s. 0.07x on the dev-box CPU. Every update encodes the whole 30 s window, as
+  0.5 s chunks, 19-27x at 2 s. On the dev-box CPU 0.13x real time (RTF 7.7): `loom_cli --stream 100` on jfk,
+  alone, at the engine's 2 threads, 85.6 s for 11 updates, each about one one-pass transcription (8.5 s with
+  the model load). The gate first measured 0.07x, at the test helper's old 4 threads and maybe beside
+  other runs. Every update encodes the whole 30 s window, as
   SimulStreaming does, and re-reads everything it forces.
 * `tests/ci/test_whisper_simul_stream.py` checks three things:
   * the second output equals HF's eager `cross_attentions` for the heads, with the logits unchanged;

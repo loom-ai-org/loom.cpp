@@ -442,10 +442,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   Kit on the workstation: `/mnt/datasets/loom-chatterbox-prof/` (the English checkpoint, `torch_baseline.py`,
   `timer_patch.py` for per-module wall times in the bridge, `mm_bench.cpp`); a re-export takes ~100 s.
 
-* [ ] **x86 without AVX2 runs loom's own kernels scalar.** The conv1d direct tile and friends are AVX2-only;
-  on an SSE4.2 CPU (Celeron N4100) the build limited to that variant is 1.5x (Zipformer) to 2.5x (VITS) slower
-  than the AVX2 one on the same Linux box, and MSVC auto-vectorises less than GCC. Two levers: SSE4.2 arms for
-  the hottest tiles, and a clang-cl Windows build (ADR-096 Option 2). *Context: [ADR-096](../adrs/adr-096-windows-builds-with-msvc-and-luajit-is-built-by-cmake.md)*
 * [ ] **P4.35/P4.36 follow-ups.** P4.35-P4.39 are merged (#89-#93, 2026-10-23), and their record is
   [Epic-05](../epics/epic-05-edge-performance.md#p435-p439-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22), ADR-082 and ADR-083. Two things are still open. (1) A job owning
   all 64 `A@V` rows, with narrow column blocks, measured 1.08x more on the op on the Pi 4 and is not built. (2) Moonshine
