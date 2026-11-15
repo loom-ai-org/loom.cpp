@@ -317,7 +317,8 @@ private:
     static void cell_sweep(LoomLuaBridge* self, const std::string& module_name,
                             const SequenceSource& src, uint32_t seq_len, uint32_t input_dim,
                             uint32_t hidden_dim, bool reverse, const char* fname,
-                            const std::function<void(uint32_t, const std::vector<float>&)>& emit);
+                            const std::function<void(uint32_t, const std::vector<float>&)>& emit,
+                            std::vector<float>& h, std::vector<float>& c);
     // `mod`'s store, holding exactly one `[ne0, ne1]` f32 slot and returning it. Shaped from a
     // no-alloc template because `reshape` reads only type and `ne` -- a retained SEQUENCE is not any
     // single build's output, so nothing else declares its geometry.

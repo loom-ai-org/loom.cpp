@@ -13,7 +13,10 @@
 //
 // LOOM_STREAM_CODEC_GGUF: a codec exported with the stream functions (qwen3-tts-tokenizer-12hz,
 // audio8-tts-codec and moss-audio-tokenizer-v2 -- whose `infer` is one call at any length, so their streams
-// are checked to the end -- and dac-44khz, whose windows match one call to f32 rounding).
+// are checked to the end -- dac-44khz and snac-24khz, whose windows match one call to f32 rounding (SNAC's
+// noise drawn per frame from the stream's own generator), and encodec-32khz, windows round a carried LSTM;
+// ADR-103/104). Past 300 frames only the first 300 are checked, for Qwen3's chunked `infer`; the whole clip's
+// difference is printed for every codec.
 // LOOM_STREAM_CODES_NPY: `[frames, width]` codes, F32, from the codec's own LM -- random ids decode to noise
 // that clips at +-1, where a difference can hide.
 
