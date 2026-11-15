@@ -154,7 +154,7 @@ and the join is within 1.2e-06 of `infer`, which still decodes a chunk per call.
 **Codec pairs: two doors, the codec carrying its state** ([ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md)).
 A pair streams as its two files do one pass: the LM's `SpeechStream` hands back each frame of codes as it is
 drawn, and the codec's `CodecStream` decodes pushes as they arrive, with the decoder's state carried by a
-`codec_step` graph beside the unchanged one-pass decode. Qwen3-TTS first: the talker's stream is its one pass
+`codec_step` graph beside the unchanged one-pass decode. Qwen3-TTS and Audio8-TTS are built. For Qwen3-TTS the talker's stream is its one pass
 bit for bit, the pair's audio is within 1.2e-06 of decoding the same codes in one pass, and the first audio
 comes a frame after the talker draws it (1.58 s on the dev box, where the whole 30-frame generation took 28 s).
 
@@ -216,7 +216,7 @@ the text classifiers distilbert-ner and punctuate-all (whole text in, labels out
 |---|---|---|
 | pocket-tts, pocket-tts-18m / -7m / -2m | exact: AR latents, causal Mimi decoder (`generate_audio_stream`) | **per frame: built** (ADR-101; a sentence chunk per piece with `piece_frames = 0`, ADR-100), after a re-export |
 | qwen3-tts-12hz-0.6b + qwen3-tts-tokenizer-12hz | exact: AR frames, causal codec | **built** (ADR-102): the talker hands back a frame per pull, the codec decodes pushes with its state carried; after a re-export of both |
-| audio8-tts-realistic-0.6b + audio8-tts-codec | exact by construction: AR frames; codec all causal (convs, transposed convs, window-128 transformer) | driver: decode with ≥ receptive-field left context, or a state-carrying codec re-export. Upstream's own code has no streaming entry point; the README's SGLang-Omni adapter does, unbenchmarked |
+| audio8-tts-realistic-0.6b + audio8-tts-codec | exact by construction: AR frames; codec all causal (convs, transposed convs, window-128 transformer) | **built** (ADR-102): the talker hands back a frame per pull, the codec decodes pushes with its state carried; after a re-export of both. Upstream's own code has no streaming entry point |
 | voxcpm2 | exact: `generate_streaming`, the AudioVAE's `streaming_decode` carries causal-conv state per patch | re-export: the VAE decoder step with its state |
 | moss-tts-local-transformer-v1.5 + moss-audio-tokenizer-v2 | exact: causal-transformer codec with streaming encode/decode (ring KV per layer) | re-export: codec step with its ring caches; a context-window chunk loop was 48% wrong here |
 | voxtral-4b-tts-2603 | exact: chunked codec equals one call | driver: emit each `codec_chunk` as it is made |

@@ -11,7 +11,8 @@
 //   4. With LOOM_STREAM_CODEC_OLD_GGUF, a file exported before the step: its one-pass decode is this
 //      file's, bit for bit (the decode graph did not move), and the stream door refuses it.
 //
-// LOOM_STREAM_CODEC_GGUF: a codec exported with the stream functions (qwen3-tts-tokenizer-12hz).
+// LOOM_STREAM_CODEC_GGUF: a codec exported with the stream functions (qwen3-tts-tokenizer-12hz,
+// audio8-tts-codec -- whose `infer` is one call at any length, so its stream is checked to the end).
 // LOOM_STREAM_CODES_NPY: `[frames, width]` codes, F32, from the codec's own LM -- random ids decode to noise
 // that clips at +-1, where a difference can hide.
 
