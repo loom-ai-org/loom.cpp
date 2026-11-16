@@ -38,8 +38,26 @@ already compatible, because at that point there is nothing to fix and a guess ca
   `tests/test_broadcast_axis_collision.cpp`, which sweeps `n_tokens` *across* the head count at the
   primitive level in milliseconds — and was confirmed to fail with the guards reverted.
 * **Still open:** the guards make the guessing unreachable for correct graphs; they do not remove it.
-  `op_repeat` remains unguarded. Tracked in
-  [the backlog](../backlog/active-index.md#engine--correctness).
+  Tracked in [the backlog](../backlog/active-index.md#engine--correctness).
+* **Addendum, 2026-11-16: `op_repeat` was the one left unguarded, and it hit the same collision one axis
+  over.** Grouped-query attention repeats K/V as `[head_dim, n_tokens, 1, n_head_kv] -> [head_dim,
+  n_tokens, rep, n_head_kv]`; the "axis 0 and 1 swapped" branch fired at `n_tokens == head_dim` and
+  transposed both. lfm2-350m-modular's unfused attention was 0.4 off HF at exactly 64 tokens and exact at
+  63 and 65, and its re-feeding generation wrote "twinkle malice" where HF wrote "twinkle above": the
+  same one-length fingerprint, found the same way (an HF comparison past a length the gate never used),
+  bisected per layer with a probe. Guarded like the others: no heal when the input already repeats to
+  its target. `test_repeat` in `test_primitive_registry` covers the case and failed before the guard.
+  Three published models met it too, each at its own head dim, measured on an engine differing only by
+  the guard (each causal graph checked against itself: a run of n against a run of n + 1, or a prefill
+  of n against n - 1 plus one cached step):
+  * Audio8's codec at 64 frames: 0.73 off on a waveform of about 1, exact at 62, 63 and 65; 7e-7 after.
+  * LFM2.5-Audio's detokenizer at 32 rows, which its stream's windows can reach (its `infer` sends
+    multiples of 6): 0.17, exact at 30, 31 and 33; 4e-8 after.
+  * Qwen3-TTS's talker at a 128-token prefill, which voice cloning reaches (the plain prompt is 10):
+    its `[128, n_tokens, 16, 1]` REPEAT of q is the identity, and the guess transposed q. 45 off,
+    2e-4 at 126, 127 and 130; 9e-5 after.
+  * Audio8's talker repeats K/V too, in a stack never longer than its ten codebooks, so it cannot meet 64.
+  The 26 gates with fixtures on the dev box, these models' among them, pass with the guard.
 
 ---
 
