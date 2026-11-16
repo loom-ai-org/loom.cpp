@@ -2284,6 +2284,28 @@ void test_repeat() {
     set_f32(b, {7.0f});
     s2.compute(gf2);
     LOOM_CHECK((get_f32(out2) == std::vector<float>{7, 7, 7, 7, 7}));
+
+    // A tensor that already repeats to its target is repeated, never "healed" first. Grouped-query
+    // attention's K/V reach here as [head_dim, n_tokens, 1, n_head_kv] -> [head_dim, n_tokens, rep,
+    // n_head_kv], and at n_tokens == head_dim the axis-0/1 guess below used to fire on that square and
+    // transpose K and V: lfm2-350m's unfused attention was 0.4 off HF at exactly 64 tokens and right at
+    // 63 and 65. Same trap as op_add's and op_mul_mat's, at the head_dim collision.
+    GgmlScratch s3;
+    ggml_tensor* kv = ggml_new_tensor_4d(s3.ctx.get(), GGML_TYPE_F32, 4, 4, 1, 2);
+    ggml_set_input(kv);
+    loom::PrimitiveContext pc3{s3.ctx.get(), env, nullptr};
+    ggml_tensor* out3 = op("REPEAT")(pc3, {kv}, {{"shape", {4, 4, 2, 2}}})[0];
+    LOOM_CHECK(out3->ne[0] == 4 && out3->ne[1] == 4 && out3->ne[2] == 2 && out3->ne[3] == 2);
+    ggml_cgraph* gf3 = s3.expand(out3);
+    std::vector<float> kv_data(32);
+    for (size_t i = 0; i < kv_data.size(); ++i) kv_data[i] = static_cast<float>(i);
+    set_f32(kv, kv_data);
+    s3.compute(gf3);
+    std::vector<float> want3;
+    for (int h = 0; h < 2; ++h)
+        for (int r = 0; r < 2; ++r)
+            for (int t = 0; t < 16; ++t) want3.push_back(kv_data[h * 16 + t]);
+    LOOM_CHECK(get_f32(out3) == want3);
 }
 
 void test_interpolate_1d() {

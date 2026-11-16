@@ -264,6 +264,18 @@ from the submodule's identity is a real design question (the modular driver woul
 `n_past` through its chain), so `fuse_attention` is set for `Flattened` only and LFM2-modular keeps
 exporting exactly as before, prefill-only.
 
+*Answered 2026-11-16, by occurrence order rather than module identity.* The passes now take a
+`number_across_functions` flag, which a `Modular` export sets: the slot count carries through the
+program's functions in insertion order, which `export_modular` makes the chain's order (prefix, aux,
+layer_0..N-1, suffix), so each block gets the slot the flattened trace gives it -- LFM2-350M's six
+attention blocks 0-5 and ten conv blocks 0-9, in both exports. The geometry needed nothing: it already
+enumerates every function's fused nodes. The driver is `PrefillDecodeLoop` with a `chain` of the same
+`ChainStage`s `infer` runs, the mask and positions rebuilt once per step at `n_past` and every stage
+called at it, which also gives the modular form the stream functions (ADR-099). The fresh export matches
+HF's greedy text on three prompts to 96 tokens. The published re-feeding file did not: its unfused
+attention was wrong at exactly 64 tokens, `op_repeat`'s unguarded heal transposing the GQA repeat at
+`n_tokens == head_dim` ([Retro-001](retros/retro-001-layout-healing-heuristics.md)).
+
 **2.3 — strip the GQA repeat.** Walk back through `fuse_gqa_repeat_kv`'s `reshape → tile → reshape`
 triple to reach the true `n_head_kv` K/V, halving the cache for Qwen3 and letting `op_attention`'s own
 `ggml_mul_mat` broadcast do the GQA. Correctness does not depend on this — attending with the repeat
