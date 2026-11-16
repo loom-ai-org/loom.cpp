@@ -96,8 +96,9 @@ one-token driver (`infer` only) is streamed by the door's own loop, with no re-e
 * Not covered yet: the loops that carry per-call context (`bound` encoder output, a built prompt, a
   transcript marker), which are Whisper's, T5's and the speech LMs'. `PrefillDecodeLoop.stream_supported`
   names the field, and those loops export `infer_with_past` alone until a stream state holds it.
-* lfm2-350m-modular's per-layer export carries no caches, so its one-token loop re-feeds the whole
-  sequence every step. It streams, but each token costs more than the last.
+* lfm2-350m-modular's per-layer export carried no caches, so its one-token loop re-fed the whole
+  sequence every step. Since 2026-11-16 it carries both, its slots numbered across the chain, and its
+  stream runs the chain per token like `infer_with_past` ([KV-CACHE.md 2.2b](../KV-CACHE.md)).
 
 ## Related
 
