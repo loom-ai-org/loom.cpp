@@ -102,6 +102,23 @@ Option **3**.
   the model load). The gate first measured 0.07x, at the test helper's old 4 threads and maybe beside
   other runs. Every update encodes the whole 30 s window, as
   SimulStreaming does, and re-reads everything it forces.
+* **Shorter encoder windows: measured, not built** (2026-11-15). Most of the 30 s window is padding while
+  the buffer is short. SimulStreaming's encoder slices its positions, so the experiment fed it only the buffered
+  audio plus a margin of the padding, and capped the buffer with its own `audio_max_len`. PyTorch, dev-box CPU,
+  2 threads, against the full window:
+  * **Margin alone**: 4-8x faster on clips of 3-11 s (jfk RTF 7.7 -> 1.9 at margin 0); only 1.3x on 60 s of
+    continuous speech, where the buffer grows to 30 s anyway.
+  * **Cap alone** (15 or 10 s, full padding): no faster, words unchanged (0-5% word differences, mostly names).
+  * **Cap 10 s + margin 1 s**: 3.0x on a 29 s dialog (RTF 7.4 -> 2.5), 2.8x on 60 s (RTF 8.0 -> 2.8). Still
+    not real time: mel and decode alone take about 1.5 s per 1.2 s chunk.
+  * **Words** barely move (1-9% once case and punctuation are ignored, mostly names; "quip" -> "quick" is a
+    fix). Words come out at the same update or one chunk earlier.
+  * **Style breaks**: margins under 10 s turned some clips lower-case without punctuation, carried on through
+    the prompt; a 10 s margin keeps style but gives only 1.3-1.4x. A punctuated `static_init_prompt` may fix
+    it; untested.
+  * **Capped runs dropped long60's last word** ("Hello" for "Hello, world."); unexplained.
+  * Scripts: `margin_experiment.py` and `analyse_margins.py`, built on `scripts/whisper_simulstreaming_reference.py`
+    and a `SIMUL_ENC_MARGIN_S` patch in SimulStreaming's `infer`; scratch only, not in the repo.
 * `tests/ci/test_whisper_simul_stream.py` checks three things:
   * the second output equals HF's eager `cross_attentions` for the heads, with the logits unchanged;
   * the driver's frame arithmetic, mirrored in Python, equals SimulStreaming's `std_mean` +
