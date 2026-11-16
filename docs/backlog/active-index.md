@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-15
+last_updated: 2026-11-16
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -1070,7 +1070,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   ([ADR-130](../adrs/adr-130-an-encoder-decoder-token-stream-keeps-its-per-call-context-in-the-state.md): the cross
   K/V and source length kept in the stream state; the published file, which the door took for a causal LM, is now
   refused). **Every row of the survey is built** (the user chose flan-t5 alone for the per-call-context loops,
-  2026-11-15). What is left: the user merges the stacks; each row publishes after a re-export on the rc21+ engine.
+  2026-11-15). Every stack is merged (2026-11-15). What is left: each row publishes after a re-export on the rc21+ engine.
   Not built unless asked: diart's full diarization (needs a speaker-embedding export), LFM2.5-Audio full duplex,
   the streaming checkpoints on disk outside the zoo
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
@@ -1078,6 +1078,15 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   after the native RSQRT, ggml-0063 (no TF32 for a tagged product) and ggml-0064 (a prefix-stable cumsum). Chatterbox's is the second
   (49/49, 2026-11-13); no other stream has been gated on one (Voxtral's ran there through `loom_cli`); the per-stream cache mode is what `Auto` picks there.
   The user asked that every model amenable to streaming gets it, name or no name (2026-11-08).
+
+* [ ] **Whisper's stream: an opt-in shorter encoder window and buffer cap.** Every update encodes a full 30 s
+  window, mostly padding. Measured in PyTorch (2026-11-15): encoding only the buffer plus a 1 s margin, with
+  a 10 s buffer cap, runs 2.8-3x faster on continuous speech and 4-8x on short clips. Words barely move, but
+  margins under 10 s can lose case and punctuation. To build: the exporter traces the encoder and the decoder's
+  cross-attention at a variable length (`n_samples` is fixed at 30 s); stream options for the margin and the cap,
+  the default staying SimulStreaming's 30 s; a gate against SimulStreaming run with the same cut. Try a
+  punctuated `static_init_prompt` for the style first.
+  [ADR-128](../adrs/adr-128-whisper-streams-the-way-simulstreaming-does.md#consequences)
 
 * [ ] **lfm2-350m-modular re-feeds the whole sequence every token.** Its per-layer export carries no KV
   or conv-state cache, so its only entry is `infer` and each token costs more than the last (the
