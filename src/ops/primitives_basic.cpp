@@ -1062,18 +1062,29 @@ Outputs op_repeat(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
                                : static_cast<int64_t>(std::llround(v.get<double>()));
     }
     ggml_tensor* a = in[0];
-    
-    // Dynamically heal transposed/permuted input layouts (axis 1 and 2 swapped) relative to repeat target
-    if (a->ne[0] == ne[0] && a->ne[1] != ne[1] && a->ne[2] != ne[2]) {
-        if (a->ne[1] == ne[2] / (ne[2] / a->ne[1]) && a->ne[2] == ne[1]) {
-            a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+
+    // The two heals below guess a layout from SIZES, so they run only when `a` does NOT already repeat
+    // to the target -- op_add's and op_mul_mat's rule. Unguarded, the axis-0/1 one fired on every square
+    // leading pair: grouped-query attention repeats K and V as [head_dim, n_tokens, 1, n_head_kv] ->
+    // [head_dim, n_tokens, rep, n_head_kv], and at n_tokens == head_dim it transposed both. lfm2-350m's
+    // unfused attention was 0.4 off HF at exactly 64 tokens, exact at 63 and 65, and the re-feeding
+    // modular export wrote "twinkle malice" for "twinkle above" (2026-11-16).
+    const bool repeats = a->ne[0] > 0 && a->ne[1] > 0 && a->ne[2] > 0 && a->ne[3] > 0 &&
+                         ne[0] % a->ne[0] == 0 && ne[1] % a->ne[1] == 0 &&
+                         ne[2] % a->ne[2] == 0 && ne[3] % a->ne[3] == 0;
+    if (!repeats) {
+        // Dynamically heal transposed/permuted input layouts (axis 1 and 2 swapped) relative to repeat target
+        if (a->ne[0] == ne[0] && a->ne[1] != ne[1] && a->ne[2] != ne[2]) {
+            if (a->ne[1] == ne[2] / (ne[2] / a->ne[1]) && a->ne[2] == ne[1]) {
+                a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+            }
         }
-    }
-    
-    // Dynamically heal transposed layouts where axis 0 and 1 are swapped
-    if (a->ne[0] == ne[1] && a->ne[1] == ne[0]) {
-        a = ggml_permute(pc.ctx, a, 1, 0, 2, 3);
-        a = ggml_cont(pc.ctx, a);
+
+        // Dynamically heal transposed layouts where axis 0 and 1 are swapped
+        if (a->ne[0] == ne[1] && a->ne[1] == ne[0]) {
+            a = ggml_permute(pc.ctx, a, 1, 0, 2, 3);
+            a = ggml_cont(pc.ctx, a);
+        }
     }
     
     // Guarantee memory contiguity for ggml_repeat
