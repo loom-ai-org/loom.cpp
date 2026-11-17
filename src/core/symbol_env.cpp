@@ -9,6 +9,11 @@ namespace loom {
 
 void SymbolEnv::set(const std::string& name, double value) {
     values_[name] = value;
+    unusable_.erase(name);
+}
+
+void SymbolEnv::set_unusable(const std::string& name, const std::string& why) {
+    if (values_.find(name) == values_.end()) unusable_[name] = why;
 }
 
 bool SymbolEnv::has(const std::string& name) const {
@@ -18,6 +23,10 @@ bool SymbolEnv::has(const std::string& name) const {
 double SymbolEnv::get(const std::string& name) const {
     auto it = values_.find(name);
     if (it == values_.end()) {
+        auto why = unusable_.find(name);
+        if (why != unusable_.end()) {
+            throw SchemaError("SymbolEnv: symbol '" + name + "' has no numeric value: " + why->second);
+        }
         throw SchemaError("SymbolEnv: unbound symbol '" + name + "'");
     }
     return it->second;

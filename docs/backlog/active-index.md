@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-16
+last_updated: 2026-11-17
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -1095,14 +1095,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   the default staying SimulStreaming's 30 s; a gate against SimulStreaming run with the same cut. Try a
   punctuated `static_init_prompt` for the style first.
   [ADR-128](../adrs/adr-128-whisper-streams-the-way-simulstreaming-does.md#consequences)
-
-* [ ] **Expose the compute-buffer controls in loom-py.** `LoomLuaBridge::hold_compute_buffers`,
-  `release_compute_buffers` and `compute_buffer_bytes` exist in the engine, but a Python host cannot
-  reach them yet. The LM-server case needs `hold`, because each request otherwise refaults its prefill
-  buffer. Do it with the next submodule bump.
-  *Context: [ADR-072](../adrs/adr-072-the-compute-buffer-shrinks-after-a-window-of-under-use.md)*
-* [ ] **`GgufModel::hparam_env()` surfaces only numeric scalar KVs** into the `SymbolEnv`; string, bool
-  and array-typed `loom.*` KVs are silently skipped.
 
 ## Packaging & release
 
