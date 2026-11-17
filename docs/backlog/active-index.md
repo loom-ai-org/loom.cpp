@@ -160,6 +160,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   quality/speed against F32; `loom_cli` has no translate flag yet (loom-py's `text2text.translate` is the
   door); a long-context run past the 2,048 window (the gate's prompts are under 100 ids). *Context:
   [ADR-132](../adrs/adr-132-plamo-translates-through-a-prompt-its-driver-builds.md)*
+* [ ] **tiny-voca: publish after rc21 (F32 + Q8_0_PC, with `phonemizer/` beside the GGUF); its F32 gap on
+  the Pi 4 (0.77x onnxruntime, int8 at parity) and its STFT precision** (the waveform is 2.1e-3 from
+  upstream at f64 where upstream's own f32 is 5.7e-4: 512-tap convolutions summed in f32). Time the
+  phases without the per-node profiler first; the rotary respelling is measured out (ADR-133).
+  *Context: [ADR-133](../adrs/adr-133-tiny-voca-renders-its-pulse-train-in-the-driver-and-speaks-a-sentence-at-a-time.md)*
 * [ ] **Audit the other uses of `log_softmax` in traced wrappers.** coremltools lowers it as
   `log(softmax)`, which is -inf for a token whose probability underflows. That is harmless before an
   argmax and NaN the moment two such rows are subtracted. *Context:

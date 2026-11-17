@@ -28,8 +28,9 @@ the Pi 4 row were re-measured on the night of 2026-10-23 on one engine build not
 (P4.39, `ggml-0049`) and the direct convolution on per-thread staged slices (P4.40, `ggml-0053`, #97). Same protocol as the
 [three-machine table](#three-tasks-on-three-machines): 4 threads (the board's default), each engine launched once per arm, 5 paired rounds in ABBA order, cooled to
 60 C before every arm, median per engine; onnxruntime is the 1.28.0 PyPI wheel. The ratio is onnx/loom, so **`>1.00x`
-means loom is faster**, and **eleven of the twelve cells resolve**: each one's paired p10 and p90 sit on the same side
-of 1.00x. whisper-small's F32 cell does not (p10 0.99, p90 1.01), so read it as parity.
+means loom is faster**, and **twelve of the fourteen cells resolve**: each one's paired p10 and p90 sit on the same side
+of 1.00x. whisper-small's F32 cell does not (p10 0.99, p90 1.01), so read it as parity, and neither, per second of
+audio, does tiny-voca's int8 (footnote 4).
 
 **Each time is followed by its real-time factor (RTF) in brackets:** the time divided by the length of the audio, which
 for ASR, VAD and wake word is the input clip and for TTS is the audio the model produced. Below 1.00 is faster than real
@@ -46,6 +47,7 @@ time. The LM row has no audio, so its time stands alone.
 | Pocket TTS 18m refl (TTS, 4.80 s of audio)³ | 2.412 s (0.50) | — | — | 1.439 s (0.30) | — | — |
 | Pocket TTS 7m refl (TTS, 4.80 s of audio)³ | 1.275 s (0.27) | — | — | 1.067 s (0.22) | — | — |
 | Pocket TTS 2m refl (TTS, 4.80 s of audio)³ | 0.619 s (0.13) | — | — | 0.593 s (0.12) | — | — |
+| tiny-voca (TTS, 5.39 s of audio)⁴ | 0.668 s (0.12) | 0.516 s (0.10) | 0.77x | 0.630 s (0.12) | 0.643 s (0.12) | 1.01x |
 
 ¹ onnxruntime is timed from NeMo's mel features, computed outside the timer; loom's time includes its front end.
 ² Measured with the rest of each half, and each launch is the mean of 3
@@ -57,6 +59,16 @@ thread and attends over a fixed 1000-position cache. Both sides run exactly 60 f
 the same 28 text ids and a 126-row `alba` voice.
 ³ Kyutai's distilled `english_{18m,7m,2m}_refl_2026-10` (ADR-084), timed like the Pocket TTS row. There is no ONNX export
 of them, so they have no onnxruntime cells. Their own F32/Q8_0_PC ratios are in the last bullet below.
+⁴ Measured on 2026-11-17, in its own session, with the same protocol: 5 paired rounds, cooled to 60 C before every arm,
+each launch the mean of 3 syntheses after an untimed one, median per engine (`scripts/bench_driver.cpp` against
+`scripts/bench_tiny_voca_onnx.py`). The engine is loom.cpp `e2819b9` (main plus the OmniVoice and PLaMo commits, no
+engine change for tiny-voca). The onnxruntime side is upstream's own `onnx/model.onnx` and a `quantize_dynamic`
+(QInt8) of it. One utterance, the 82 dizione tokens of "On a quiet morning, the old fisherman pushed his boat into the
+grey water and waited for the tide.", voice F2. At F32 both engines produced the same 129 280 samples. At int8 each
+engine's quantized duration head moved a few frames: loom made 130 048 samples, onnxruntime 131 584. So that ratio is
+per second of audio; the time ratio is 1.02x (p10-p90 1.00-1.03), parity. The F32 cell resolves (p10-p90 0.766-0.780).
+whisper-small hears all four outputs as the sentence, word for word.
+The GGUFs are md5 `207320a3`/`3ba30c37`, F32/Q8_0_PC.
 
 * **Both engines did the same work in every pair**, checked by one untimed launch of each arm: the same 73 216 VITS
   samples, the same 24 tokens, and the same transcript at each precision except one word each of Citrinet (loom Q8_0_PC
@@ -123,11 +135,17 @@ Seconds, RTF in brackets; each device's faster precision in bold, and the speedu
 | Pocket TTS 18m (TTS, 4.80 s of audio) | 31.10 s (6.48) | **23.27 s (4.85)** | 24.98 s (5.20) | **18.33 s (3.82)** | 1.27x |
 | Pocket TTS 7m (TTS, 4.80 s of audio) | 20.70 s (4.31) | **18.91 s (3.94)** | 14.91 s (3.11) | **14.04 s (2.92)** | 1.35x |
 | Pocket TTS 2m (TTS, 4.80 s of audio) | **8.85 s (1.84)** | 9.07 s (1.89) | **6.66 s (1.39)** | 7.08 s (1.48) | 1.33x |
+| tiny-voca (TTS, 5.39 s of audio)¹ | 16.97 s (3.15) | **16.15 s (2.99)** | **13.85 s (2.57)** | 14.14 s (2.61) | 1.16x |
 | Citrinet-256-ls (ASR, jfk 11.0 s) | 9.81 s (0.89) | **7.14 s (0.65)** | **3.38 s (0.31)** | 3.49 s (0.32) | 2.11x |
 | Moonshine tiny (ASR, jfk 11.0 s) | 25.50 s (2.32) | **19.77 s (1.80)** | 16.66 s (1.51) | **12.90 s (1.17)** | 1.53x |
 | Conformer-CTC small (ASR, 3.0 s of jfk) | 5.88 s (1.96) | **5.70 s (1.90)** | 4.23 s (1.41) | **4.16 s (1.39)** | 1.37x |
 | Silero VAD (jfk 11.0 s) | 2.36 s (0.21) | **1.99 s (0.18)** | 2.12 s (0.19) | **1.74 s (0.16)** | 1.15x |
 | WakeHuBERT tiny (wake word, jfk 11.0 s) | 2.08 s (0.19) | **1.83 s (0.17)** | **1.36 s (0.12)** | 1.41 s (0.13) | 1.34x |
+
+¹ Measured on 2026-11-17, with the same protocol and the Pi 4 row's sentence and GGUFs (md5 `207320a3`/`3ba30c37`), on
+an ARMv6 build of loom-py's `feat/tiny-voca` (engine `e2819b9`). Q8_0_PC's quantized duration head made 129 792
+samples (5.41 s) where F32 made 129 280, so the speedup is per second of audio. The VC4's F32 output is at 26.7 dB SNR
+against the CPU's, the same length, and whisper-small hears all four arms' outputs as the sentence, word for word.
 
 * **Every arm's output hashed the same in all three rounds**, and the CPU+VC4 arms' outputs against the CPU's are
   [ADR-093](adrs/adr-093-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md)'s: transcripts
