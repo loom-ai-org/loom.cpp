@@ -34,16 +34,16 @@
 <text x="219.4" y="176.0" fill="#1f2328" font-size="11" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.16</text>
 <text x="188.0" y="161.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">Silero VAD</text>
 <text x="188.0" y="175.0" fill="#59636e" font-size="11" text-anchor="end" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">VAD</text>
-<rect x="200" y="192.0" width="18.5" height="15" rx="3" fill="#59636e"/>
-<text x="224.5" y="204.0" fill="#1f2328" font-size="11" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.22</text>
-<rect x="200" y="210.0" width="16.0" height="15" rx="3" fill="#1a7f37"/>
-<text x="222.0" y="222.0" fill="#1f2328" font-size="11" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.19</text>
+<rect x="200" y="192.0" width="15.1" height="15" rx="3" fill="#59636e"/>
+<text x="221.1" y="204.0" fill="#1f2328" font-size="11" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.18</text>
+<rect x="200" y="210.0" width="14.3" height="15" rx="3" fill="#1a7f37"/>
+<text x="220.3" y="222.0" fill="#1f2328" font-size="11" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.17</text>
 <text x="188.0" y="207.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">sanoTTS heartnano</text>
 <text x="188.0" y="221.0" fill="#59636e" font-size="11" text-anchor="end" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">TTS</text>
-<rect x="200" y="238.0" width="45.4" height="15" rx="3" fill="#59636e"/>
-<text x="251.4" y="250.0" fill="#1f2328" font-size="11" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.54</text>
-<rect x="200" y="256.0" width="24.4" height="15" rx="3" fill="#1a7f37"/>
-<text x="230.4" y="268.0" fill="#1f2328" font-size="11" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.29</text>
+<rect x="200" y="238.0" width="43.7" height="15" rx="3" fill="#59636e"/>
+<text x="249.7" y="250.0" fill="#1f2328" font-size="11" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.52</text>
+<rect x="200" y="256.0" width="22.7" height="15" rx="3" fill="#1a7f37"/>
+<text x="228.7" y="268.0" fill="#1f2328" font-size="11" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.27</text>
 <text x="188.0" y="253.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">sanoTTS heart</text>
 <text x="188.0" y="267.0" fill="#59636e" font-size="11" text-anchor="end" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">TTS</text>
 <rect x="200" y="284.0" width="54.6" height="15" rx="3" fill="#59636e"/>

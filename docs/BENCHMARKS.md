@@ -129,8 +129,8 @@ Seconds, RTF in brackets; each device's faster precision in bold, and the speedu
 |---|---|---|---|---|---|
 | sanoTTS amy en 1.46M (TTS, 5.90 s of audio) | **13.54 s (2.30)** | 13.62 s (2.31) | 4.10 s (0.70) | **4.08 s (0.69)** | 3.32x |
 | sanoTTS de thorsten 0.51M (TTS, 4.40 s of audio) | 3.19 s (0.72) | **3.17 s (0.72)** | **1.53 s (0.35)** | 1.55 s (0.35) | 2.07x |
-| sanoTTS heart (TTS, 3.18 s of audio) | 1.98 s (0.62) | **1.71 s (0.54)** | **0.92 s (0.29)** | 0.96 s (0.30) | 1.85x |
-| sanoTTS heartnano (TTS, 3.06 s of audio) | 0.67 s (0.22) | **0.67 s (0.22)** | 0.57 s (0.19) | **0.57 s (0.19)** | 1.17x |
+| sanoTTS heart (TTS, 3.18 s of audio)² | 1.79 s (0.56) | **1.65 s (0.52)** | **0.87 s (0.27)** | 0.91 s (0.29) | 1.89x |
+| sanoTTS heartnano (TTS, 3.06 s of audio)² | **0.56 s (0.18)** | 0.57 s (0.19) | **0.53 s (0.17)** | 0.55 s (0.18) | 1.06x |
 | VITS piper en-GB miro (TTS, 3.39 s of audio) | 19.78 s (5.83) | **19.77 s (5.83)** | **5.88 s (1.74)** | 6.20 s (1.83) | 3.36x |
 | Pocket TTS 18m (TTS, 4.80 s of audio) | 31.10 s (6.48) | **23.27 s (4.85)** | 24.98 s (5.20) | **18.33 s (3.82)** | 1.27x |
 | Pocket TTS 7m (TTS, 4.80 s of audio) | 20.70 s (4.31) | **18.91 s (3.94)** | 14.91 s (3.11) | **14.04 s (2.92)** | 1.35x |
@@ -148,6 +148,16 @@ at `2667740`. The first measurement, the driver rendering both in Lua, was 16.15
 Q8_0_PC's quantized duration head made 129 792 samples (5.41 s) where F32 made 129 280, so the speedup is per second
 of audio. The VC4's output is at 26.7 dB SNR against the CPU's at F32 and 23.7 dB at Q8_0_PC, the same lengths, and
 whisper-small hears all four arms' outputs as the sentence, word for word.
+² Re-measured on 2026-11-17 with today's exports, which draw their noise with `loom.aten_randn` (ADR-134), on an ARMv6
+build of loom.cpp `7ff50b1` plus the VC4 fix of [Retro-109](retros/retro-109-a-cropped-view-passed-the-vc4-fusion-matcher.md):
+the exporter's channel padding (ADR-081) had made heart-nano's published file abort on the VC4. Each arm was run
+three ways in one session, 3 rounds, order reversed every other round: the rc18-era file the first rows measured, today's
+export with its noise drawn in Lua, and today's export. The engine's noise saves 17 to 36 ms per arm (heart F32 on the
+CPU 1.823 s to 1.789 s, heart-nano 0.584 s to 0.557 s). The rest of the change from the first rows is the padding:
+heart-nano's CPU time fell from 0.661 s to 0.584 s with the noise still in Lua, and its Q8_0_PC export now quantizes
+(it was the F32 file before), so its speedup is smaller. heart's Q8_0_PC duration head made 76 544 samples where F32
+made 76 288, so its speedup is per second of audio. Every arm hashed the same in every round; the VC4 is 59 dB (heart)
+and 73-81 dB (heart-nano) from the CPU; whisper-small hears all 24 outputs as the sentence.
 
 * **Every arm's output hashed the same in all three rounds**, and the CPU+VC4 arms' outputs against the CPU's are
   [ADR-093](adrs/adr-093-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md)'s: transcripts
