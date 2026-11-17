@@ -189,6 +189,11 @@ set_tests_properties(test_e2e_cosyvoice3_stream PROPERTIES SKIP_RETURN_CODE 77)
 
 # Chatterbox's live stream (ADR-117) against the same re-run loop in PyTorch: its mel, its distance from the
 # one pass, its vocoder's streaming, reset and interleaving. LOOM_CHATTERBOX_STREAM_GGUF + _REF_DIR.
+add_executable(test_e2e_tiny_voca gate/test_e2e_tiny_voca.cpp)
+target_link_libraries(test_e2e_tiny_voca PRIVATE loom::engine)
+add_test(NAME test_e2e_tiny_voca COMMAND test_e2e_tiny_voca)
+set_tests_properties(test_e2e_tiny_voca PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_tiny_voca PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_e2e_plamo gate/test_e2e_plamo.cpp)
 target_link_libraries(test_e2e_plamo PRIVATE loom::engine)
 add_test(NAME test_e2e_plamo COMMAND test_e2e_plamo)

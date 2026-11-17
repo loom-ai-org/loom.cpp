@@ -38,6 +38,10 @@ as a plain DP ([ADR-132](../adrs/adr-132-plamo-translates-through-a-prompt-its-d
 driver's `loom.tokenize` reaches it too. Its chat template carries arguments (`target_lang`, a
 glossary), which role tags cannot, so the file ships a `translation_prompt` driver function instead.
 
+**A phoneme style may bring its own front end.** tiny-voca declares `dizione`: loom-py's door runs
+dizione itself when it is installed, cut into sentences as the reference cuts them, and otherwise folds
+the default G2P's IPA into dizione's inventory ([ADR-133](../adrs/adr-133-tiny-voca-renders-its-pulse-train-in-the-driver-and-speaks-a-sentence-at-a-time.md)).
+
 **A family the table does not cover raises a named error rather than mis-tokenizing.** That is what
 turns "add a tokenizer" into a bounded job instead of a mystery, and it is the pattern to keep.
 
