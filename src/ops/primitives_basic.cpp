@@ -9,12 +9,6 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <mutex>
-#include <set>
-#include <string>
 #include <vector>
 
 namespace loom {
@@ -134,54 +128,6 @@ using Json = nlohmann::json;
 using Inputs = std::vector<ggml_tensor*>;
 using Outputs = std::vector<ggml_tensor*>;
 
-// ---------------------------------------------------------------------------------------------------
-// LOOM_HEAL_LOG: WHICH MODELS STILL LEAN ON THE LAYOUT GUESSES (hub: "Who still depends on the
-// layout-healing heuristics?", Retro-001)
-// ---------------------------------------------------------------------------------------------------
-// Every "heal" below permutes an operand because its SIZES look transposed against the other's. The
-// guards keep them off graphs that already combine, but each is still a silent-wrong-answer generator:
-// a graph the exporter got wrong is patched by a guess, rightly or not, instead of failing. Deleting
-// them needs a list of the models whose graphs still reach one, and this writes that list.
-//
-// Unset (the default) costs one cached branch per firing and writes nothing. `1` or `stderr` writes to
-// stderr; anything else is a file path, appended to, so one file per model run names the model. Each
-// distinct line is written once per process: a decode loop rebuilds its graph every token and would
-// otherwise repeat the same line thousands of times. Format, tab-separated:
-//
-//     loom-heal  <OP.branch>  <node>  a=[ne0,ne1,ne2,ne3]  b=[...]|target=[...]
-//
-// The shapes are the operands' BEFORE the heal, so a line is enough to find the node in the export.
-FILE* heal_log_sink() {
-    static FILE* const sink = []() -> FILE* {
-        const char* e = std::getenv("LOOM_HEAL_LOG");
-        if (e == nullptr || *e == '\0' || std::strcmp(e, "0") == 0) return nullptr;
-        if (std::strcmp(e, "1") == 0 || std::strcmp(e, "stderr") == 0) return stderr;
-        FILE* f = std::fopen(e, "a");
-        return f != nullptr ? f : stderr;
-    }();
-    return sink;
-}
-
-std::string ne_text(const int64_t* ne) {
-    return "[" + std::to_string(ne[0]) + "," + std::to_string(ne[1]) + "," + std::to_string(ne[2]) + "," +
-           std::to_string(ne[3]) + "]";
-}
-
-void note_heal(const PrimitiveContext& pc, const char* branch, const ggml_tensor* a, const char* other_key,
-               const int64_t* other_ne) {
-    FILE* sink = heal_log_sink();
-    if (sink == nullptr) return;
-    const std::string line = std::string("loom-heal\t") + branch + "\t" +
-                             (pc.node_label != nullptr ? *pc.node_label : std::string("?")) + "\ta=" +
-                             ne_text(a->ne) + "\t" + other_key + "=" + ne_text(other_ne) + "\n";
-    static std::mutex mu;
-    static std::set<std::string> seen;
-    std::lock_guard<std::mutex> lock(mu);
-    if (!seen.insert(line).second) return;
-    std::fputs(line.c_str(), sink);
-    std::fflush(sink);
-}
-
 void expect_n_inputs(const char* op, const Inputs& in, size_t n) {
     if (in.size() != n) {
         throw SchemaError(std::string(op) + " expects " + std::to_string(n) + " input(s), got " + std::to_string(in.size()));
@@ -290,28 +236,10 @@ Outputs op_mul_mat(PrimitiveContext& pc, const Inputs& in, const Json&) {
         return x->ne[0] == y->ne[0] && y->ne[2] % x->ne[2] == 0 && y->ne[3] % x->ne[3] == 0;
     };
 
-    // Only guess at a layout when the operands do NOT already multiply -- see op_add's comment. With
-    // q/k both [head_dim, n_tokens, n_head], the first branch's `a->ne[1] == b->ne[2]` is
-    // `n_tokens == n_head`, true only at that collision, and the permute it then applies silently
-    // transposes attention's own operands. Same trap as the RoPE one, in the other half of attention:
-    // it is why the expanded (unfused) path stayed wrong at n_tokens == n_head after op_add/op_mul were
-    // guarded, while the fused ATTENTION path -- which never reaches this code -- came out clean.
-    if (!can_mul_mat(a, b)) {
-        // Dynamically heal transposed/permuted layouts in matrix multiplication (heads/seq swapped)
-        if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
-            note_heal(pc, "MUL_MAT.permute12(a)", a, "b", b->ne);
-            a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
-        } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
-            note_heal(pc, "MUL_MAT.permute12(b)", a, "b", b->ne);
-            b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
-        }
-
-        // Dynamically heal transposed/permuted input tensors by transposing on the fly
-        if (a->ne[0] != b->ne[0] && a->ne[0] == b->ne[1]) {
-            note_heal(pc, "MUL_MAT.transpose(b)", a, "b", b->ne);
-            b = ggml_transpose(pc.ctx, b);
-        }
-    }
+    // Operands that do not multiply are an export error, raised below. This op used to guess a layout
+    // from their SIZES instead, permuting or transposing one to make them fit (Retro-001), which made a
+    // wrong graph a silent wrong answer, and the guess fired wherever sizes collided (q and k at
+    // n_tokens == n_head). LOOM_HEAL_LOG found nothing published that still needed it (2026-11-16).
 
     // A product over K < 8 is run as the sum of K outer products (P4.51). ggml's GEMMs compute each
     // output as a dot product over K and tinyBLAS refuses K < 8 on AVX2, so Zipformer's relative-position
@@ -373,44 +301,13 @@ Outputs op_add(PrimitiveContext& pc, const Inputs& in, const Json&) {
         std::swap(a, b);
     }
 
-    // The healing heuristics below guess a layout from ambiguous SIZES, so none of them may run when
-    // the operands are ALREADY broadcast-compatible: at that point there is nothing to fix and a guess
-    // can only corrupt. This is exactly the reasoning the NOTE further down records for the "axis 0/1
-    // swapped" branch that was deleted -- the same trap, one heuristic further along, and it made every
-    // MIL-exported causal LM numerically wrong whenever n_tokens happened to equal n_head (or
-    // n_head_kv). See BACKLOG.md's entry: RoPE's cos [head_dim, n_tokens, 1] against q
-    // [head_dim, n_tokens, n_head] matched `a->ne[2] == b->ne[1]` only at that collision, and the
-    // resulting permute turned per-token rotation into per-head rotation.
-    if (!ggml_can_repeat(b, a)) {
-        // Dynamically heal heads/seq layout transpositions (axis 1 and 2 swapped)
-        if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
-            note_heal(pc, "ADD.permute12(b)", a, "b", b->ne);
-            b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
-        } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
-            note_heal(pc, "ADD.permute12(a)", a, "b", b->ne);
-            a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
-        }
-
-        // Dynamically heal heads/seq layout transpositions with broadcasting (axis 1 and 2 swapped)
-        if (a->ne[0] == b->ne[0] && a->ne[2] == b->ne[1] && b->ne[2] == 1) {
-            note_heal(pc, "ADD.permute12_bcast(b)", a, "b", b->ne);
-            b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
-        } else if (b->ne[0] == a->ne[0] && b->ne[2] == a->ne[1] && a->ne[2] == 1) {
-            note_heal(pc, "ADD.permute12_bcast(a)", a, "b", b->ne);
-            a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
-        }
-    }
-
-    // NOTE: an earlier revision of this function also had an "axis 0 and 1 swapped" healing branch here
-    // (permute+cont whichever operand looked transposed relative to the other, by ne[0]==other.ne[1] &&
-    // ne[1]==other.ne[0]). It was a band-aid for the attention-score MUL_MAT operand-order bug (see
-    // EXPORT-BACKLOG.md item 1): since ADD's operands here are the same fixed size in the common
-    // square-attention-mask case (n_tokens == n_tokens), that shape check can't actually distinguish
-    // "needs a swap" from "already correct", so once the exporter started emitting the correct MUL_MAT
-    // operand order/transposes directly (tools/loom_mil_compiler/exporter.py's "matmul" op_type
-    // handling), this heuristic started re-corrupting already-correct tensors instead of fixing broken
-    // ones. Removed rather than made smarter -- the real fix belongs at the exporter, which now knows
-    // the true layout instead of guessing from ambiguous shapes.
+    // Operands that do not broadcast are an export error, raised below -- never a layout guessed from
+    // their SIZES. ADD and MUL used to permute an operand whose axes 1/2 (or 0/1) looked swapped against
+    // the other's. Sizes cannot tell a swapped tensor from a correct one whose axes happen to be equal,
+    // so the guesses corrupted correct graphs at every collision: RoPE's cos against q at
+    // n_tokens == n_head turned per-token rotation into per-head rotation, and a square attention mask
+    // was transposed in place. The exporter knows the true layout; the engine no longer guesses
+    // (Retro-001; LOOM_HEAL_LOG found nothing published that still needed a guess, 2026-11-16).
     a = ensure_packed(pc.ctx, a);
     b = ensure_packed(pc.ctx, b);
 
@@ -471,39 +368,7 @@ Outputs op_mul(PrimitiveContext& pc, const Inputs& in, const Json&) {
         std::swap(a, b);
     }
     
-    // Same guard, same reason as op_add's -- see the comment there. A heuristic that reads a layout off
-    // ambiguous sizes must never fire on operands that already broadcast correctly.
-    if (!ggml_can_repeat(b, a)) {
-        // Dynamically heal heads/seq layout transpositions (axis 1 and 2 swapped)
-        if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
-            note_heal(pc, "MUL.permute12(b)", a, "b", b->ne);
-            b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
-        } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
-            note_heal(pc, "MUL.permute12(a)", a, "b", b->ne);
-            a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
-        }
-
-        // Dynamically heal heads/seq layout transpositions with broadcasting (axis 1 and 2 swapped)
-        if (a->ne[0] == b->ne[0] && a->ne[2] == b->ne[1] && b->ne[2] == 1) {
-            note_heal(pc, "MUL.permute12_bcast(b)", a, "b", b->ne);
-            b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
-        } else if (b->ne[0] == a->ne[0] && b->ne[2] == a->ne[1] && a->ne[2] == 1) {
-            note_heal(pc, "MUL.permute12_bcast(a)", a, "b", b->ne);
-            a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
-        }
-
-        // Dynamically heal transposed layouts where axis 0 and 1 are swapped
-        if (a->ne[0] == b->ne[1] && a->ne[1] == b->ne[0]) {
-            note_heal(pc, "MUL.swap01(a)", a, "b", b->ne);
-            a = ggml_permute(pc.ctx, a, 1, 0, 2, 3);
-            a = ggml_cont(pc.ctx, a);
-        } else if (b->ne[0] == a->ne[1] && b->ne[1] == a->ne[0]) {
-            note_heal(pc, "MUL.swap01(b)", a, "b", b->ne);
-            b = ggml_permute(pc.ctx, b, 1, 0, 2, 3);
-            b = ggml_cont(pc.ctx, b);
-        }
-    }
-
+    // Operands that do not broadcast are an export error, raised below; no layout is guessed (op_add).
     a = ensure_packed(pc.ctx, a);
     b = ensure_packed(pc.ctx, b);
 
@@ -1114,8 +979,8 @@ Outputs op_repeat(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // shape on every non-concat axis, so the broadcast has to happen as its own explicit step first.
     // `shape`'s entries follow RESHAPE's own convention (string symbols evaluated via SymbolEnv, or
     // plain numbers) but with NO -1 inference (repeat's target must always be fully explicit -- ggml
-    // itself requires each target dim to be an exact multiple of `a`'s own, checked by ggml_repeat_4d's
-    // own assertion).
+    // itself requires each target dim to be an exact multiple of `a`'s own; checked below, before
+    // ggml_repeat_4d's assert can be reached).
     expect_n_inputs("REPEAT", in, 1);
     if (!attrs.contains("shape") || !attrs.at("shape").is_array()) {
         throw SchemaError("REPEAT: 'shape' attribute must be an array");
@@ -1130,32 +995,25 @@ Outputs op_repeat(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     }
     ggml_tensor* a = in[0];
 
-    // The two heals below guess a layout from SIZES, so they run only when `a` does NOT already repeat
-    // to the target -- op_add's and op_mul_mat's rule. Unguarded, the axis-0/1 one fired on every square
-    // leading pair: grouped-query attention repeats K and V as [head_dim, n_tokens, 1, n_head_kv] ->
-    // [head_dim, n_tokens, rep, n_head_kv], and at n_tokens == head_dim it transposed both. lfm2-350m's
-    // unfused attention was 0.4 off HF at exactly 64 tokens, exact at 63 and 65, and the re-feeding
-    // modular export wrote "twinkle malice" for "twinkle above" (2026-11-16).
+    // A tensor that does not repeat to the target is an export error, raised here rather than at
+    // ggml_repeat_4d's assert, which takes down the host process. This op used to guess instead,
+    // permuting `a` when its axes 1/2 or 0/1 looked swapped against the target. Even guarded, that
+    // could only paper over a wrong graph, and unguarded it fired on every square leading pair:
+    // grouped-query attention's K and V, [head_dim, n_tokens, 1, n_head_kv] -> [.., rep, ..], were
+    // transposed at n_tokens == head_dim (lfm2-350m 0.4 off HF at exactly 64 tokens). Retro-001;
+    // LOOM_HEAL_LOG found nothing published that still needed a guess (2026-11-16).
     const bool repeats = a->ne[0] > 0 && a->ne[1] > 0 && a->ne[2] > 0 && a->ne[3] > 0 &&
                          ne[0] % a->ne[0] == 0 && ne[1] % a->ne[1] == 0 &&
                          ne[2] % a->ne[2] == 0 && ne[3] % a->ne[3] == 0;
     if (!repeats) {
-        // Dynamically heal transposed/permuted input layouts (axis 1 and 2 swapped) relative to repeat target
-        if (a->ne[0] == ne[0] && a->ne[1] != ne[1] && a->ne[2] != ne[2]) {
-            if (a->ne[1] == ne[2] / (ne[2] / a->ne[1]) && a->ne[2] == ne[1]) {
-                note_heal(pc, "REPEAT.permute12", a, "target", ne);
-                a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
-            }
-        }
-
-        // Dynamically heal transposed layouts where axis 0 and 1 are swapped
-        if (a->ne[0] == ne[1] && a->ne[1] == ne[0]) {
-            note_heal(pc, "REPEAT.swap01", a, "target", ne);
-            a = ggml_permute(pc.ctx, a, 1, 0, 2, 3);
-            a = ggml_cont(pc.ctx, a);
-        }
+        auto ne_str = [](const int64_t* n) {
+            return "[" + std::to_string(n[0]) + "," + std::to_string(n[1]) + "," + std::to_string(n[2]) +
+                   "," + std::to_string(n[3]) + "]";
+        };
+        throw SchemaError("REPEAT: " + ne_str(a->ne) + " does not repeat to " + ne_str(ne) +
+                          " (each target axis must be a multiple of the source's)");
     }
-    
+
     // Guarantee memory contiguity for ggml_repeat
     if (!ggml_is_contiguous(a)) {
         a = ggml_cont(pc.ctx, a);

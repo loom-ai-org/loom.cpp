@@ -55,11 +55,6 @@ struct PrimitiveContext {
     // keeps compiling and simply gets the "assume it is supported" answer, which is what a CPU-only
     // arrangement would have answered anyway.
     Backends backends;
-
-    // The topology node being built (its name, else its first output), for diagnostics that must say
-    // WHERE in a model they fired -- the LOOM_HEAL_LOG lines in primitives_basic.cpp. Set by
-    // GraphBuilder's build_node; null in a hand-built context.
-    const std::string* node_label = nullptr;
 };
 
 // ---------------------------------------------------------------------------------------------------
