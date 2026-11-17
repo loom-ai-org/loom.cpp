@@ -28,6 +28,11 @@ def main() -> None:
     w.add_string("loom.architecture", "minimal_test")
     w.add_uint32("loom.n_layer", 2)
     w.add_float32("loom.scale", 0.5)
+    # One loom.* KV of each non-numeric kind, for hparam_env(): flags read as 1/0, a string or an array
+    # stays unbound but named in the lookup's error.
+    w.add_bool("loom.uses_flag", True)
+    w.add_bool("loom.flag_off", False)
+    w.add_array("loom.strides", [2, 2, 1])
     w.add_string("model.graph_topology", TOPOLOGY_JSON)
     w.add_string("model.graph_topology.other", OTHER_TOPOLOGY_JSON)
 

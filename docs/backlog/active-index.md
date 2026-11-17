@@ -1095,14 +1095,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   punctuated `static_init_prompt` for the style first.
   [ADR-128](../adrs/adr-128-whisper-streams-the-way-simulstreaming-does.md#consequences)
 
-* [ ] **Expose the compute-buffer controls in loom-py.** `LoomLuaBridge::hold_compute_buffers`,
-  `release_compute_buffers` and `compute_buffer_bytes` exist in the engine, but a Python host cannot
-  reach them yet. The LM-server case needs `hold`, because each request otherwise refaults its prefill
-  buffer. Do it with the next submodule bump.
-  *Context: [ADR-072](../adrs/adr-072-the-compute-buffer-shrinks-after-a-window-of-under-use.md)*
-* [ ] **`GgufModel::hparam_env()` surfaces only numeric scalar KVs** into the `SymbolEnv`; string, bool
-  and array-typed `loom.*` KVs are silently skipped.
-
 ## Packaging & release
 
 * [ ] **rc21 release notes: the layout guesses.**

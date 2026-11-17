@@ -663,7 +663,18 @@ SymbolEnv GgufModel::hparam_env() const {
             case GGUF_TYPE_UINT64:  value = static_cast<double>(gguf_get_val_u64(gguf_ctx_.get(), i)); break;
             case GGUF_TYPE_INT64:   value = static_cast<double>(gguf_get_val_i64(gguf_ctx_.get(), i)); break;
             case GGUF_TYPE_FLOAT64: value = gguf_get_val_f64(gguf_ctx_.get(), i); break;
-            default: continue; // string/bool/array hparams aren't symbol-evaluable; skip
+            // A flag reads as 1 or 0, as it would in C, so an expression can scale or select by it.
+            case GGUF_TYPE_BOOL:    value = gguf_get_val_bool(gguf_ctx_.get(), i) ? 1.0 : 0.0; break;
+            // Not a number: left unbound, but named, so a topology that reads one says why it failed.
+            case GGUF_TYPE_STRING:
+                env.set_unusable(bare, "'" + key + "' is a string KV");
+                continue;
+            case GGUF_TYPE_ARRAY:
+                env.set_unusable(bare, "'" + key + "' is an array KV (" +
+                                           std::to_string(gguf_get_arr_n(gguf_ctx_.get(), i)) +
+                                           " elements); an expression reads scalars only");
+                continue;
+            default: continue;
         }
         env.set(bare, value);
     }
