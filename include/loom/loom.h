@@ -58,6 +58,7 @@
 #include "loom/core/pocket_tts_vocab.h"
 #include "loom/core/py_regex.h"
 #include "loom/core/soprano_vocab.h"
+#include "loom/core/plamo_vocab.h"
 #include "loom/core/voxcpm_vocab.h"
 #include "loom/core/cosyvoice3_vocab.h"
 #include "loom/core/voice_file.h"

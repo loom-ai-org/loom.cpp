@@ -1,6 +1,7 @@
 #include "loom/core/lua_bridge.h"
 
 #include "loom/core/bpe_vocab.h"
+#include "loom/core/plamo_vocab.h"
 #include "loom/core/duration_aligner.h"
 #include "loom/core/graph_builder.h"
 #include "loom/core/conv_state_cache.h"
@@ -2648,6 +2649,14 @@ void LoomLuaBridge::register_module(const std::string& name, GgufModel& model, G
     if (!text_model_) text_model_ = &model;
 }
 
+const PlamoVocab* LoomLuaBridge::plamo_vocab() {
+    if (!plamo_checked_) {
+        plamo_checked_ = true;
+        if (text_model_) plamo_vocab_ = PlamoVocab::load(*text_model_);
+    }
+    return plamo_vocab_.get();
+}
+
 const BpeVocab& LoomLuaBridge::text_vocab() {
     if (!text_vocab_) {
         if (!text_model_) throw Error("no model is registered, so there is no vocabulary to use");
@@ -2665,7 +2674,9 @@ int LoomLuaBridge::l_tokenize(lua_State* L) {
         auto* self = bridge_from_upvalue(L);
         size_t n = 0;
         const char* text = luaL_checklstring(L, 1, &n);
-        const std::vector<int32_t> ids = self->text_vocab().encode(std::string(text, n));
+        const PlamoVocab* plamo = self->plamo_vocab();
+        const std::vector<int32_t> ids = plamo ? plamo->encode(std::string(text, n))
+                                               : self->text_vocab().encode(std::string(text, n));
         push_number_array(L, std::vector<double>(ids.begin(), ids.end()));
         return 1;
     } catch (const std::exception& e) {
@@ -2680,7 +2691,8 @@ int LoomLuaBridge::l_detokenize(lua_State* L) {
         std::vector<int32_t> ids;
         ids.reserve(raw.size());
         for (double v : raw) ids.push_back(static_cast<int32_t>(v));
-        const std::string text = self->text_vocab().decode(ids);
+        const PlamoVocab* plamo = self->plamo_vocab();
+        const std::string text = plamo ? plamo->decode(ids) : self->text_vocab().decode(ids);
         lua_pushlstring(L, text.data(), text.size());
         return 1;
     } catch (const std::exception& e) {

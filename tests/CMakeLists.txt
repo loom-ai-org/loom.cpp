@@ -141,6 +141,10 @@ target_link_libraries(test_log_mel PRIVATE loom::engine)
 add_test(NAME test_log_mel COMMAND test_log_mel)
 set_tests_properties(test_log_mel PROPERTIES LABELS ci)
 
+add_executable(test_plamo_vocab ci/test_plamo_vocab.cpp)
+target_link_libraries(test_plamo_vocab PRIVATE loom::engine)
+add_test(NAME test_plamo_vocab COMMAND test_plamo_vocab)
+set_tests_properties(test_plamo_vocab PROPERTIES LABELS ci)
 add_executable(test_primitive_registry ci/test_primitive_registry.cpp)
 target_link_libraries(test_primitive_registry PRIVATE loom::engine)
 add_test(NAME test_primitive_registry COMMAND test_primitive_registry)
@@ -185,6 +189,11 @@ set_tests_properties(test_e2e_cosyvoice3_stream PROPERTIES SKIP_RETURN_CODE 77)
 
 # Chatterbox's live stream (ADR-117) against the same re-run loop in PyTorch: its mel, its distance from the
 # one pass, its vocoder's streaming, reset and interleaving. LOOM_CHATTERBOX_STREAM_GGUF + _REF_DIR.
+add_executable(test_e2e_plamo gate/test_e2e_plamo.cpp)
+target_link_libraries(test_e2e_plamo PRIVATE loom::engine)
+add_test(NAME test_e2e_plamo COMMAND test_e2e_plamo)
+set_tests_properties(test_e2e_plamo PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_plamo PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_e2e_omnivoice gate/test_e2e_omnivoice.cpp)
 target_link_libraries(test_e2e_omnivoice PRIVATE loom::engine)
 add_test(NAME test_e2e_omnivoice COMMAND test_e2e_omnivoice)
