@@ -156,6 +156,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   [TigreGotico/orthography2ipa#1721](https://github.com/TigreGotico/orthography2ipa/issues/1721). *Context:
   [Epic-03](../epics/epic-03-model-coverage.md#vaniq-edge-and-auroratts-100k-two-more-small-english-voices),
   [ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md)*
+* [ ] **Vaniq-Edge's card gate depends on the orthography2ipa version.** With 7.30.0 (the dev box's
+  python3, and what the released rc20 wheel resolved there), "Hello all." comes out "Kelewo" and the card
+  fails intelligibility. With PyPI's 7.123.9 the WER is 0.50, exactly the gate's limit. This is the text
+  front end, not the engine (found by the 2026-11-16 heal survey). Pin a minimum version, and decide
+  whether a card at its limit is a pass. *Context:
+  [Epic-03](../epics/epic-03-model-coverage.md#vaniq-edge-and-auroratts-100k-two-more-small-english-voices)*
 * [ ] **Nemotron-Labs-Unified-ASR 0.6B: publish** (built 2026-10-30, F32 + Q8_0,
   `nemotron-labs-unified-asr-0.6b-loom`, staged in `hf-models-rc20/`). Runs on the released rc19; exported
   from NeMo 3.0 (the `nemo3` venv), offline mode only. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
@@ -378,6 +384,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   link without a re-export.*
 * [ ] **P6 cleanup** — delete the `tools/convert_*` directories (~14,000 lines across 10), then the docs
   pass.
+* [ ] **Exporter: check every dialect op against the symbolic-axis walk.** `_UNARY_PASSTHROUGH_OPS` is a
+  hand-kept list, and an op missing from it fails silently with a literal axis. That has cost three
+  models: EnCodec, SenseVoice, and VoxCPM2 via `loom_rms_norm` (fixed on exporter branch
+  `fix/rms-norm-axis-walk`). A CI test should fail when a `loom_*` dialect op is neither known to the
+  walk nor declared opaque. Also: the rc21 VoxCPM2 re-export must come from an exporter with that fix.
+  *Context: [Retro-106](../retros/retro-106-a-wider-fusion-reached-a-walk-that-did-not-know-its-op.md)*
 
 ## Engine — correctness
 
@@ -406,9 +418,25 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   No re-export: the published files are right on an engine with the guard, so the fix ships with rc21
   and wants a line in its release notes.
   Every branch is a silent-wrong-answer generator with no error path.
-  *Work, in order:* (1) instrument each branch with a counter naming op and shapes, run all models, and
-  record which fire — that converts "some model probably needs these" into a list; (2) fix each real
-  firing at the **exporter**; (3) delete the branch. A branch that fires for nothing can go immediately.
+  **Step 1 (instrument and run everything) done 2026-11-16:** `LOOM_HEAL_LOG=1|stderr|<path>` logs each
+  firing (branch, node, shapes) once (branch `chore/heal-instrumentation`). **Nothing fires but a stale
+  fixture.** Coverage:
+  * all 27 runnable engine gates;
+  * all 71 published cards;
+  * every stream door of every stream model: 3 chunk sizes, VAD lines, cloning. Models whose stream
+    functions live in the file were re-exported, since no published file has them yet; host-side streams
+    ran on the published files. This covers MOSS-TTS, Voxtral and the Qwen3-TTS talker.
+
+  The one firing is `test_e2e_styletts2_mil_lua_driver` on the v5 fixture (`MUL_MAT.transpose(b)`,
+  diffusion `x_full_11_matmul`). The published `styletts2-ljspeech.gguf` fires nothing and passes that
+  gate 22209/22209.
+
+  *Left:*
+  1. Refresh the v5 StyleTTS2 fixture from the published file.
+  2. Delete the 9 branches, making a shape that does not combine a `SchemaError` rather than a ggml
+     assert.
+  3. Keep `LOOM_HEAL_LOG` until the branches are gone.
+
   *Context: [Retro-001](../retros/retro-001-layout-healing-heuristics.md)*
 * [ ] **Known bug: `make_lfm2_gguf.py`'s per-layer zero-RoPE placeholder produces NaN.** Each of the 16
   decoder layers is traced independently with `position_embeddings` as `torch.zeros(1,1,64)` — the
@@ -1079,7 +1107,8 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   K/V and source length kept in the stream state; the published file, which the door took for a causal LM, is now
   refused). **Every row of the survey is built** (the user chose flan-t5 alone for the per-call-context loops,
   2026-11-15). Every stack is merged (2026-11-15). What is left: each row publishes after a re-export on the rc21+ engine.
-  Not built unless asked: diart's full diarization (needs a speaker-embedding export), LFM2.5-Audio full duplex,
+  Not built unless asked: diart's full diarization (needs a speaker-embedding export), LFM2.5-Audio's
+  interleaved speech-to-speech mode (turn-based, not full duplex; its ASR and TTS halves already stream),
   the streaming checkpoints on disk outside the zoo
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,
