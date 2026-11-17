@@ -22,6 +22,7 @@ namespace loom {
 class KvCache;
 class ConvStateCache;
 class BpeVocab;
+class PlamoVocab;
 class StreamState;
 class GraphBuilder;
 class OutputStore;
@@ -242,6 +243,10 @@ private:
     // `loom.tokenize`'s vocabulary: the first registered module's model, read on first use.
     const GgufModel* text_model_ = nullptr;
     std::unique_ptr<BpeVocab> text_vocab_;
+    // ... or PLaMo's, which is no BPE (loom.cpp ADR-132): tried first, since a PLaMo file is not BPE.
+    std::unique_ptr<PlamoVocab> plamo_vocab_;
+    bool plamo_checked_ = false;
+    const PlamoVocab* plamo_vocab();
     std::normal_distribution<float> normal_dist_{0.0f, 1.0f};
     std::uniform_real_distribution<float> uniform_dist_{0.0f, 1.0f};
 
@@ -365,7 +370,7 @@ private:
     // the vocabulary is the one in the file whose modules this bridge runs, loaded on first use, so a
     // driver that never asks pays nothing. `detokenize` returns the vocabulary's bytes as they are, an
     // incomplete UTF-8 sequence included, so the driver can see where a character was cut. Byte-level BPE
-    // only for now; any other vocabulary is refused by name.
+    // and PLaMo's unigram (ADR-132); any other vocabulary is refused by name.
     static int l_tokenize(lua_State* L);
     static int l_detokenize(lua_State* L);
     const BpeVocab& text_vocab();

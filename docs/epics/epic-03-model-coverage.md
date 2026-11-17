@@ -63,6 +63,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **Text → codec tokens** | Dia-1.6B, Qwen3-TTS-12Hz-0.6B-Base, MOSS-TTS-Local-Transformer-v1.5, Audio8-TTS-Realistic-0.6B | `dia_export.py`, `qwen3_tts_export.py`, `moss_tts_export.py`, `audio8_tts_export.py` |
 | **Text → music codec tokens** | MusicGen Small (decodes through EnCodec-32kHz) | `musicgen_export.py` |
 | **Text encoder-decoder** | flan-t5-small (and every `model_type: t5`) | `t5_export.py` |
+| **Translation LM** | PLaMo 3 translate 0.8B (PFN; sliding-window + full layers, YaRN, MQA, its own unigram tokenizer, a PFML3 prompt built by the driver, [ADR-132](../adrs/adr-132-plamo-translates-through-a-prompt-its-driver-builds.md)) | `plamo_export.py` |
 
 The two LFM2 entries are the *same checkpoint exported two ways*, which is how the engine's two
 decomposition paths stay honest about producing the same model.

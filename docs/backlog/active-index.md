@@ -155,6 +155,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   arm, the 5090 (both guidance halves are one sequence, so it should batch well), `class_temperature > 0`
   sampling, and upstream's opt-in text normalization. *Context:
   [ADR-131](../adrs/adr-131-omnivoice-ships-as-one-file-and-streams-a-text-chunk-at-a-time.md)*
+* [ ] **PLaMo 3 translate 0.8B: publish after rc21, a Q8_0 arm, a loom_cli door** (built 2026-11-17, F32
+  3.3 GB, PLaMo Community License). Needs the engine's `PlamoVocab`. Open: a Q8_0 file and its
+  quality/speed against F32; `loom_cli` has no translate flag yet (loom-py's `text2text.translate` is the
+  door); a long-context run past the 2,048 window (the gate's prompts are under 100 ids). *Context:
+  [ADR-132](../adrs/adr-132-plamo-translates-through-a-prompt-its-driver-builds.md)*
 * [ ] **Audit the other uses of `log_softmax` in traced wrappers.** coremltools lowers it as
   `log(softmax)`, which is -inf for a token whose probability underflows. That is harmless before an
   argmax and NaN the moment two such rows are subtracted. *Context:
