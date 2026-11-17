@@ -107,14 +107,9 @@ void build_node(const TopologyNode& node, PrimitiveContext& pc, SymbolTable& sym
 
     const PrimitiveFn& fn = PrimitiveRegistry::instance().get(node.op);
     std::vector<ggml_tensor*> outputs;
-    const std::string label = !node.name.empty() ? node.name
-                              : !node.outputs.empty() ? node.outputs[0] : node.op;
-    pc.node_label = &label;
     try {
         outputs = fn(pc, inputs, node.attrs);
-        pc.node_label = nullptr;
     } catch (const Error& e) {
-        pc.node_label = nullptr;
         std::string ins;
         for (const auto& in : node.inputs) ins += in + ",";
         throw SchemaError("node '" + (node.name.empty() ? node.op : node.name) + "' (op=" + node.op +

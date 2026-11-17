@@ -2251,6 +2251,46 @@ void test_concat_rejects_mismatched_operands() {
     LOOM_CHECK(threw);
 }
 
+// Every shape below is one that a deleted layout guess used to "heal" by permuting or transposing an
+// operand (Retro-001): axes 1/2 swapped, 1/2 swapped against a broadcast, 0/1 swapped, and MUL_MAT's
+// K on the wrong axis of `b`. Each is now a SchemaError, which build_node names the node in, and the
+// REPEAT one no longer reaches ggml_repeat_4d's process-killing assert.
+void test_layout_guesses_are_gone() {
+    const auto throws = [](const char* name, std::vector<int64_t> a_ne, std::vector<int64_t> b_ne,
+                           const nlohmann::json& attrs) {
+        GgmlScratch s;
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        std::vector<ggml_tensor*> in;
+        for (const auto* ne : {&a_ne, &b_ne}) {
+            if (ne->empty()) continue;
+            int64_t n[4] = {1, 1, 1, 1};
+            for (size_t i = 0; i < ne->size(); ++i) n[i] = (*ne)[i];
+            in.push_back(ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, n[0], n[1], n[2], n[3]));
+        }
+        try {
+            op(name)(pc, in, attrs);
+        } catch (const loom::SchemaError&) {
+            return true;
+        }
+        return false;
+    };
+    const nlohmann::json none = nlohmann::json::object();
+    LOOM_CHECK(throws("MUL_MAT", {4, 3, 2}, {4, 2, 3}, none));   // was MUL_MAT.permute12
+    LOOM_CHECK(throws("MUL_MAT", {4, 3}, {5, 4}, none));         // was MUL_MAT.transpose(b)
+    LOOM_CHECK(throws("ADD", {4, 3, 2}, {4, 2, 3}, none));       // was ADD.permute12
+    LOOM_CHECK(throws("ADD", {4, 3, 2}, {4, 2, 1}, none));       // was ADD.permute12_bcast
+    LOOM_CHECK(throws("MUL", {4, 3, 2}, {4, 2, 3}, none));       // was MUL.permute12
+    LOOM_CHECK(throws("MUL", {3, 2}, {2, 3}, none));             // was MUL.swap01
+    LOOM_CHECK(throws("REPEAT", {2, 3}, {}, {{"shape", {3, 2}}}));        // was REPEAT.swap01
+    LOOM_CHECK(throws("REPEAT", {4, 3, 2}, {}, {{"shape", {4, 2, 3}}}));  // was REPEAT.permute12
+
+    // Shapes that already combine are untouched: the same operands, broadcasting the right way.
+    LOOM_CHECK(!throws("ADD", {4, 3, 2}, {4, 3, 1}, none));
+    LOOM_CHECK(!throws("MUL_MAT", {4, 3, 2}, {4, 5, 2}, none));
+    LOOM_CHECK(!throws("REPEAT", {2, 3}, {}, {{"shape", {4, 6}}}));
+}
+
 void test_repeat() {
     // ggml_repeat_4d wrapper (StyleTTS2's diffusion Transformer1d needs to broadcast a single per-batch
     // style vector [channels] up to [channels, T] before CONCAT-ing with a per-position context
@@ -3229,6 +3269,7 @@ int main() {
     test_pad_1d_reflect();
     test_concat();
     test_concat_rejects_mismatched_operands();
+    test_layout_guesses_are_gone();
     test_repeat();
     test_interpolate_1d();
     test_rq_spline_inverse();

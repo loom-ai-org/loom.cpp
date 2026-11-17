@@ -1,7 +1,8 @@
 // Regression test for the axis-collision bug (BACKLOG.md, found 2026-08-03).
 //
-// `op_add`/`op_mul`/`op_mul_mat` carry "dynamically heal transposed layouts" heuristics that infer an
-// operand's intended layout from its SIZES. Those are ambiguous whenever two axes happen to be equal,
+// `op_add`/`op_mul`/`op_mul_mat` carried "dynamically heal transposed layouts" heuristics that inferred an
+// operand's intended layout from its SIZES (deleted 2026-11-17, Retro-001; these checks stay as the
+// guard against any return). Those are ambiguous whenever two axes happen to be equal,
 // and the transformer case makes that happen for real: RoPE multiplies cos [head_dim, n_tokens, 1] into
 // q [head_dim, n_tokens, n_head], and attention multiplies q by k, both [head_dim, n_tokens, n_head].
 // When a prompt's length equals the head count, the heuristics fired on already-correct operands and

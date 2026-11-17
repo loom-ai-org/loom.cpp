@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-16
+last_updated: 2026-11-17
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -408,36 +408,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   and a fixed `[0,1)` mapping over it would make seeded output identical everywhere. Changes every seeded
   TTS output once, so it wants a release note. *Context: [ADR-096](../adrs/adr-096-windows-builds-with-msvc-and-luajit-is-built-by-cmake.md)*
 * [ ] **`RANGE_1D` with a negative step returns -1 elements, silently.** `op_range_1d` forces `end > start` so `ggml_arange` (which asserts it and has no negative steps) cannot abort, so `arange(T - 1, -T, -1)` becomes `arange(start, start + 1, -1)`; the first error is a downstream RESHAPE. Lower a negative step as `start + step * arange(0, n)` with `n = ceil((end - start) / step)`, and throw on an empty range rather than inventing one element. Nemotron ASR's export avoids it so its file runs on released wheels. *Context: [Retro-079](../retros/retro-079-the-references-default-path-was-the-broken-one.md)*
-* [ ] **Who still depends on the layout-"healing" heuristics?** The guards make size-guessing
-  *unreachable for already-correct graphs*; they do not remove it. `op_repeat`'s two branches were
-  **unguarded** until 2026-11-16, when the axis-0/1 one transposed grouped-query attention's K and V at
-  `n_tokens == head_dim` (lfm2-350m-modular, wrong at exactly 64 tokens; Retro-001's addendum). Measured on
-  the published files, before -> after the guard: Audio8's codec at 64 frames 0.73 -> 7e-7 off its own
-  65-frame decode; LFM2.5-Audio's detokenizer at 32 rows (a stream window) 0.17 -> 4e-8; Qwen3-TTS's
-  talker at a 128-token prefill (voice cloning) 45 -> 9e-5 off a 127-token prefill plus one cached step.
-  No re-export: the published files are right on an engine with the guard, so the fix ships with rc21
-  and wants a line in its release notes.
-  Every branch is a silent-wrong-answer generator with no error path.
-  **Step 1 (instrument and run everything) done 2026-11-16:** `LOOM_HEAL_LOG=1|stderr|<path>` logs each
-  firing (branch, node, shapes) once (branch `chore/heal-instrumentation`). **Nothing fires but a stale
-  fixture.** Coverage:
-  * all 27 runnable engine gates;
-  * all 71 published cards;
-  * every stream door of every stream model: 3 chunk sizes, VAD lines, cloning. Models whose stream
-    functions live in the file were re-exported, since no published file has them yet; host-side streams
-    ran on the published files. This covers MOSS-TTS, Voxtral and the Qwen3-TTS talker.
-
-  The one firing is `test_e2e_styletts2_mil_lua_driver` on the v5 fixture (`MUL_MAT.transpose(b)`,
-  diffusion `x_full_11_matmul`). The published `styletts2-ljspeech.gguf` fires nothing and passes that
-  gate 22209/22209.
-
-  *Left:*
-  1. Refresh the v5 StyleTTS2 fixture from the published file.
-  2. Delete the 9 branches, making a shape that does not combine a `SchemaError` rather than a ggml
-     assert.
-  3. Keep `LOOM_HEAL_LOG` until the branches are gone.
-
-  *Context: [Retro-001](../retros/retro-001-layout-healing-heuristics.md)*
 * [ ] **Known bug: `make_lfm2_gguf.py`'s per-layer zero-RoPE placeholder produces NaN.** Each of the 16
   decoder layers is traced independently with `position_embeddings` as `torch.zeros(1,1,64)` — the
   script's own comment calls them "placeholders that we will swap", and they never were. A NaN reaches
@@ -1134,6 +1104,17 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   and array-typed `loom.*` KVs are silently skipped.
 
 ## Packaging & release
+
+* [ ] **rc21 release notes: the layout guesses.**
+  1. `op_repeat`'s guard (loom.cpp #128) fixes grouped-query attention at `n_tokens == head_dim`, with
+     no re-export. Published files measured before -> after:
+     * Audio8's codec at 64 frames: 0.73 -> 7e-7;
+     * LFM2.5-Audio's detokenizer at 32 rows: 0.17 -> 4e-8;
+     * Qwen3-TTS's talker at a 128-token prefill: 45 -> 9e-5.
+  2. The 9 size-based layout guesses are gone: a graph whose operands do not combine now raises
+     `SchemaError` naming the node, instead of being permuted by a guess or aborting in ggml. No
+     published file reached one.
+  *Context: [Retro-001](../retros/retro-001-layout-healing-heuristics.md)*
 
 **Standing process, not an open item:** every engine change needs a `vendor/loom.cpp` bump in loom-py
 before loom-py's card gate can run against it — `git -C vendor/loom.cpp fetch origin <branch>` →
