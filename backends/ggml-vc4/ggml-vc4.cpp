@@ -1216,6 +1216,13 @@ Operand operand_kind(const ggml_tensor * x, const ggml_tensor * o) {
     return bias ? OPERAND_BIAS : mask ? OPERAND_MASK : OPERAND_NONE;
 }
 
+// Whether `x` is all of what it views, not a crop of it. The epilogue writes the convolution's whole
+// result, so a chain may only continue through a view of the WHOLE previous result: the exporter's
+// padding pass (ADR-081) computes a convolution at 32 channels, adds its bias at 32, then VIEWs 31 back
+// out for the residual ADD -- taken as the residual, that fused 31 channels' result onto 32 channels of
+// convolution, and sanoTTS heart-nano aborted on the size check in conv_f32_run (ADR-134 rerun).
+bool whole_of(const ggml_tensor * x) { return ggml_nelements(x) == ggml_nelements(producer(x)); }
+
 // For an ADD or MUL with one source a view of `prev`: the other source, and which kind it is.
 const ggml_tensor * operand_of(const ggml_tensor * node, const ggml_tensor * prev, Operand & kind) {
     kind = OPERAND_NONE;
@@ -1223,7 +1230,8 @@ const ggml_tensor * operand_of(const ggml_tensor * node, const ggml_tensor * pre
     for (int s = 0; s < 2; s++) {
         const ggml_tensor * x = node->src[s];
         const ggml_tensor * o = node->src[1 - s];
-        if (x == nullptr || o == nullptr || producer(x) != prev || ggml_nelements(x) != ggml_nelements(node)) continue;
+        if (x == nullptr || o == nullptr || producer(x) != prev || ggml_nelements(x) != ggml_nelements(node) ||
+            !whole_of(x)) continue;
         kind = operand_kind(x, o);
         if (kind != OPERAND_NONE) return o;
     }
@@ -1349,7 +1357,7 @@ Step step_of(const ggml_tensor * t, int depth = 0) {
             for (int s = 0; s < 2; s++) {
                 const ggml_tensor * x = t->src[s];
                 const ggml_tensor * o = t->src[1 - s];
-                if (x == nullptr || o == nullptr || ggml_nelements(x) != ggml_nelements(t)) continue;
+                if (x == nullptr || o == nullptr || ggml_nelements(x) != ggml_nelements(t) || !whole_of(x)) continue;
                 const Operand kind = operand_kind(x, o);
                 if (t->op == GGML_OP_ADD && kind == OPERAND_BIAS) {
                     const Step prev = step_of(x, depth + 1);
