@@ -376,6 +376,11 @@ private:
     const BpeVocab& text_vocab();
     static int l_gaussian_array(lua_State* L);
     static int l_uniform_array(lua_State* L);
+    // `loom.aten_randn(seed, n)`: PyTorch's CPU `randn` stream (ATen's scalar path, bit-identical). MEETS the
+    // binding criterion: it reads no model config, and it is per-task -- every family whose reference seeds
+    // its noise from torch (sanoTTS, vocetta2, Aurora, tiny-voca) needs the same stream; in Lua it was a
+    // third of tiny-voca's time on a Pi 4 (ADR-134).
+    static int l_aten_randn(lua_State* L);
     // `loom.expand_by_duration(rows_flat, T, C, durations)`: repeats row `t` of a (T, C) row-major array
     // `durations[t]` times, returning a flat (sum(durations), C) array. MEETS the binding criterion
     // above: it reads no model config -- T, C and the durations are all call arguments -- and it is in
