@@ -845,7 +845,11 @@ Outputs op_pool_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     const int k0 = static_cast<int>(resolve_attr_int(attrs, "k0", pc.symbols));
     const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
     const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
-    ggml_tensor* native = ggml_pool_1d(pc.ctx, in[0], op, k0, s0, p0);
+    // Contiguous first: ggml's CPU pool walks `src` row by row from its data pointer, ignoring `nb`,
+    // so a permuted view pools the wrong elements without complaint. OmniVoice's per-row max is the
+    // first producer of one (a reduce over the vocabulary after a [0,2,1,3] permute, ADR-131).
+    ggml_tensor* src = ggml_is_contiguous(in[0]) ? in[0] : ggml_cont(pc.ctx, in[0]);
+    ggml_tensor* native = ggml_pool_1d(pc.ctx, src, op, k0, s0, p0);
     // Not `pool_2d_fallback_is_equivalent` first: the question is what this backend can run, and the
     // fallback is only interesting when the answer is "not this". Where there is no equivalent fallback
     // (a padded average) the native op stays and the scheduler sends it to the CPU -- a correct
@@ -853,7 +857,7 @@ Outputs op_pool_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     if (backend_can_run(pc, native) || !pool_2d_fallback_is_equivalent(op, p0)) {
         return {native};
     }
-    return {ggml_pool_2d(pc.ctx, in[0], op, k0, /*k1=*/1, s0, /*s1=*/1,
+    return {ggml_pool_2d(pc.ctx, src, op, k0, /*k1=*/1, s0, /*s1=*/1,
                           static_cast<float>(p0), /*p1=*/0.0f)};
 }
 

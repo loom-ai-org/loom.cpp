@@ -149,6 +149,17 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Models
 
+* [ ] **OmniVoice: publish after rc21, then a GPU run and the rest of its door** (built 2026-11-17, F32,
+  CC-BY-NC weights). Its export needs exporter + engine changes from `feat/omnivoice` (dense ATTENTION,
+  last-axis max, POOL_1D on a permuted input), so the file needs the next engine. Open: a card, a Q8_0
+  arm, the 5090 (both guidance halves are one sequence, so it should batch well), `class_temperature > 0`
+  sampling, and upstream's opt-in text normalization. *Context:
+  [ADR-131](../adrs/adr-131-omnivoice-ships-as-one-file-and-streams-a-text-chunk-at-a-time.md)*
+* [ ] **Audit the other uses of `log_softmax` in traced wrappers.** coremltools lowers it as
+  `log(softmax)`, which is -inf for a token whose probability underflows. That is harmless before an
+  argmax and NaN the moment two such rows are subtracted. *Context:
+  [Retro-107](../retros/retro-107-log-softmax-lowered-as-log-of-softmax-made-a-nan-score.md)*
+
 * [ ] **Text door: contractions are split before the lexicon lookup.** orthography2ipa tokenizes
   "doesn't" as `doesn` + `t`, so a lexicon's `doesn't` entry is never read and the `t` is spelled as
   a letter; 5 of the 30 LibriSpeech door sentences have one. Every lexicon-backed card is affected
