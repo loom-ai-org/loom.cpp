@@ -87,7 +87,8 @@ and the host gets an explicit call instead.
 * **Negative:** an LM **server** pays the same per-request refault P4.0.16 always charged. A generation
   is longer than 8 calls, so each one shrinks after its prefill, and the next prompt grows the buffer
   back. For a large prompt that is the 513 MiB case. This is what `hold_compute_buffer(true)` is for,
-  and choosing it is the host's job. loom-py does not expose either control yet.
+  and choosing it is the host's job. loom-py exposes the controls as `model.hold_compute_buffers`,
+  `model.release_compute_buffers()` and `model.compute_buffer_bytes` (2026-11-17).
 * **Negative:** the decode-loop reuse test now counts one more build (4, not 3) for the 41-call loop.
   That is the shrink's rebuild, and its outputs still match the rebuild-every-step oracle bit for bit.
 * **Unchanged:** `reserve()` still wins over the shrink. A hybrid builder still never shrinks on its

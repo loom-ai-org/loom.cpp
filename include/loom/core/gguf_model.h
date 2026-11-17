@@ -87,9 +87,10 @@ public:
     // Convenience: "loom.architecture" string KV.
     std::string architecture() const { return hparam_str("architecture"); }
 
-    // Builds a SymbolEnv pre-populated with every scalar "loom.*" hparam this model exposes (u32/i32/f32
-    // KVs only), keyed by their bare name (e.g. "n_layer", not "loom.n_layer") -- used by GraphBuilder to
-    // resolve "$"-prefixed attribute expressions in the graph topology.
+    // Builds a SymbolEnv pre-populated with every scalar "loom.*" hparam this model exposes (any integer
+    // or float width, and a bool as 1 or 0), keyed by their bare name (e.g. "n_layer", not
+    // "loom.n_layer") -- used by GraphBuilder to resolve "$"-prefixed attribute expressions in the graph
+    // topology. A string or array KV has no value there, but a lookup of it names the KV and its type.
     SymbolEnv hparam_env() const;
 
     // Generic KV accessors, unlike hparam_*() these take the FULL key verbatim (no "loom." prefix) --

@@ -76,6 +76,28 @@ int main() {
     LOOM_CHECK(env.has("scale"));
     LOOM_CHECK_NEAR(env.get("scale"), 0.5, 1e-9);
     LOOM_CHECK(!env.has("architecture")); // string KV, not symbol-evaluable, must be skipped
+    // A bool reads as 1 or 0, so an expression can use it.
+    LOOM_CHECK_NEAR(env.eval("$uses_flag * 3"), 3.0, 1e-9);
+    LOOM_CHECK_NEAR(env.get("flag_off"), 0.0, 1e-9);
+    // A string or an array stays unbound, but its lookup names the KV and its type rather than saying
+    // "unbound symbol" as for a typo -- it used to be skipped without a trace.
+    LOOM_CHECK(!env.has("strides"));
+    const auto error_of = [&](const char* expr) -> std::string {
+        try {
+            env.eval(expr);
+        } catch (const loom::SchemaError& e) {
+            return e.what();
+        }
+        return "";
+    };
+    LOOM_CHECK(error_of("$architecture").find("'loom.architecture' is a string KV") != std::string::npos);
+    LOOM_CHECK(error_of("$strides + 1").find("'loom.strides' is an array KV (3 elements)") != std::string::npos);
+    LOOM_CHECK(error_of("$no_such_kv").find("unbound symbol 'no_such_kv'") != std::string::npos);
+    {
+        loom::SymbolEnv bound = env;   // a host value of the same name binds it as usual
+        bound.set("architecture", 7.0);
+        LOOM_CHECK_NEAR(bound.get("architecture"), 7.0, 1e-9);
+    }
 
     // -- SymbolEnv expression evaluation (independent of GgufModel, exercised here for convenience) --
     env.set("n_embd_head_k", 16.0);
