@@ -32,7 +32,13 @@ public:
     void set(const std::string& name, double value);
     bool has(const std::string& name) const;
 
-    // Throws loom::SchemaError if `name` isn't bound.
+    // Records why `name` has no value, for the error a lookup of it raises. GgufModel::hparam_env()
+    // names every `loom.*` KV that is not a number this way (a string or an array), so a topology that
+    // reads one fails on "the KV's type", not on an unbound name that looks like a typo. `has` stays
+    // false, and a later `set` of the same name binds it as usual.
+    void set_unusable(const std::string& name, const std::string& why);
+
+    // Throws loom::SchemaError if `name` isn't bound, with the set_unusable reason when there is one.
     double get(const std::string& name) const;
 
     // Evaluates a "$"-prefixed expression string (e.g. "$n_layer", "1/sqrt($n_embd_head_k)"). The
@@ -45,6 +51,7 @@ public:
 
 private:
     std::unordered_map<std::string, double> values_;
+    std::unordered_map<std::string, std::string> unusable_;
 };
 
 } // namespace loom
