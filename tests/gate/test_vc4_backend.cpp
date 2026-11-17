@@ -277,6 +277,18 @@ int main(int argc, char ** argv) {
              ggml_tensor * y = ggml_add(cg, ggml_conv_2d_direct(cg, k, x, 1, 1, 2, 0, 1, 1), b);
              return ggml_add(cg, ggml_relu(cg, ggml_add(cg, y, x)), y);
          }},
+        // ADR-081's channel padding, as sanoTTS heart-nano exports it: the convolution and its bias at 32
+        // channels, 31 viewed back out for the residual ADD. The residual must not fold (its result is
+        // 31 channels of a 32-channel convolution): it aborted on conv_f32_run's size check (ADR-134).
+        {"padded conv+bias, 31 of 32 viewed out, +residual", 1, [](ggml_context * cw, ggml_context * cx, ggml_context * cg) {
+             ggml_tensor * k = ggml_new_tensor_4d(cw, GGML_TYPE_F32, 5, 1, 32, 32);
+             ggml_tensor * b = ggml_new_tensor_4d(cw, GGML_TYPE_F32, 1, 1, 32, 1);
+             ggml_tensor * x = ggml_new_tensor_4d(cx, GGML_TYPE_F32, 700, 1, 32, 1);
+             ggml_tensor * r = ggml_new_tensor_4d(cx, GGML_TYPE_F32, 700, 1, 31, 1);
+             ggml_tensor * y = ggml_add(cg, ggml_conv_2d_direct(cg, k, x, 1, 1, 2, 0, 1, 1), b);
+             ggml_tensor * v = ggml_view_4d(cg, y, 700, 1, 31, 1, y->nb[1], y->nb[2], y->nb[3], 0);
+             return ggml_add(cg, v, r);
+         }},
         {"1x1 Q8_0 VC4_Q8 conv+bias+relu+mask", 1, nullptr, [](ggml_context * cw, ggml_context * cx, ggml_context * cg, ggml_context * cq) {
              ggml_tensor * w = ggml_new_tensor_2d(cq, GGML_TYPE_Q8_0, 256, 256);
              ggml_set_name(w, "pointwise.pc");
