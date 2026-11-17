@@ -146,6 +146,11 @@ target_link_libraries(test_primitive_registry PRIVATE loom::engine)
 add_test(NAME test_primitive_registry COMMAND test_primitive_registry)
 set_tests_properties(test_primitive_registry PROPERTIES LABELS ci)
 
+add_executable(test_heal_log ci/test_heal_log.cpp)
+target_link_libraries(test_heal_log PRIVATE loom::engine)
+add_test(NAME test_heal_log COMMAND test_heal_log)
+set_tests_properties(test_heal_log PROPERTIES LABELS ci)
+
 add_executable(test_e2e_sliding_window_attention gate/test_e2e_sliding_window_attention.cpp)
 target_link_libraries(test_e2e_sliding_window_attention PRIVATE loom::engine)
 add_test(NAME test_e2e_sliding_window_attention COMMAND test_e2e_sliding_window_attention)

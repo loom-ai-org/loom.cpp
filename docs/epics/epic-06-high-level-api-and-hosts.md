@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: host-api
-last_updated: 2026-11-15
+last_updated: 2026-11-16
 ---
 
 # Epic-06: The High-Level API and Its Hosts
@@ -160,7 +160,8 @@ transposed-conv overlaps carried, as upstream's `streaming_decode()` decodes eac
 stream run one loop, and each step brings the LMs up to the patch it was handed before drawing, so no graph
 output is read across a call. Pieces grow from one patch (160 ms) to eight. On the dev-box CPU the first
 audio is ready after 3.4 s instead of 49 s, and the join is within 7.0e-07 of `infer`. Unlike `infer`, the
-stream never retries a badcase, because upstream's stream does not.
+stream never retries a badcase, because upstream's stream does not. Exports from exporter 94416f4 until
+the fix lost `feat_encode`'s token axis and failed every call ([Retro-106](../retros/retro-106-a-wider-fusion-reached-a-walk-that-did-not-know-its-op.md)).
 
 **CosyVoice3 by re-running, as its reference does** ([ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md)).
 Upstream's `tts(stream=True)` carries no flow state: each hop of tokens (25 plus a prompt pad, then 50, then
@@ -371,9 +372,11 @@ it builds (`stream_context`: the encoder and its cross-attention K/V), which `st
 stream state. The AED and speech-LM ASRs' text side is not cut per token: each streams audio in instead
 (the user's choice, 2026-11-15).
 
-**Both directions:** LFM2.5-Audio's interleaved speech-to-speech mode is a full-duplex streamer upstream
-(its demo decodes each audio frame as generated). The zoo exports its ASR and TTS halves separately, and
-the interleaved mode is not exported.
+**Both directions:** LFM2.5-Audio's interleaved speech-to-speech mode is turn-based, not full duplex.
+liquid-audio's `generate_interleaved` prefills the whole user turn, then alternates 6 text tokens with
+12 audio frames, and it does not listen while it talks. Its demo decodes each audio frame as it is
+generated. The zoo exports the ASR and TTS halves separately, and those halves already cover the mode's
+streaming. The interleaved mode itself is not exported.
 
 What the rest of the tables need, now that the state, the hand-back and the caches exist (ADR-098,
 ADR-099):
@@ -410,7 +413,7 @@ fixture set is kept for exactly this reason; `v5` is the contract-declaring set.
 |---|---|
 | Authority | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) |
 | Decisions | [ADR-098](../adrs/adr-098-a-live-stream-keeps-its-state-in-the-engine.md) (the live door), [ADR-099](../adrs/adr-099-a-stream-leases-the-models-caches-or-owns-its-own.md) (the caches, tokens out), [ADR-100](../adrs/adr-100-a-tts-streams-the-pieces-its-reference-already-makes.md) (audio out), [ADR-101](../adrs/adr-101-pocket-tts-streams-a-frame-at-a-time-through-a-state-carrying-decoder-step.md) (Pocket-TTS per frame), [ADR-102](../adrs/adr-102-a-codec-pair-streams-as-two-doors-and-a-causal-codec-carries-its-state.md) (codec pairs), [ADR-103](../adrs/adr-103-a-module-may-declare-a-ring-kv-cache-of-its-own.md) (per-module ring caches; MOSS-TTS, Dia), [ADR-104](../adrs/adr-104-a-recurrence-carries-across-pushes-and-noise-belongs-to-its-frame.md) (a carried LSTM, per-frame noise; MusicGen, EnCodec, SNAC), [ADR-106](../adrs/adr-106-a-frame-model-streams-rows-through-a-door-of-its-own.md) (frame rows; Silero VAD), [ADR-107](../adrs/adr-107-a-re-decoding-asr-stream-keeps-its-hypothesis-in-the-state.md) (a re-decoding ASR; Moonshine streaming), [ADR-108](../adrs/adr-108-kyutai-stt-streams-its-encoder-with-moshis-state-carried.md) (Kyutai STT's encoder state carried), [ADR-109](../adrs/adr-109-nemotron-asr-streams-its-cache-aware-encoder-a-chunk-at-a-time.md) (Nemotron 3.5 ASR's cache-aware encoder), [ADR-110](../adrs/adr-110-the-unified-asr-streams-the-way-nemos-buffered-streaming-does.md) (the unified ASR's buffered streaming), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md), [ADR-111](../adrs/adr-111-voxcpm2-streams-a-patch-at-a-time-through-a-state-carrying-vae-step.md) (VoxCPM2 a patch at a time), [ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md) (CosyVoice3 a hop at a time), [ADR-114](../adrs/adr-114-soprano-streams-within-a-sentence-by-decoding-windows-of-hidden-rows.md) (Soprano within a sentence), [ADR-115](../adrs/adr-115-lfm25-audio-tts-streams-a-frame-at-a-time-by-detokenizing-windows.md) (LFM2.5-Audio a frame at a time), [ADR-116](../adrs/adr-116-voxtral-tts-streams-a-frame-at-a-time-through-its-chunked-causal-codec.md) (Voxtral-4B-TTS a frame at a time), [ADR-117](../adrs/adr-117-chatterbox-streams-a-hop-at-a-time-by-re-running-its-full-attention-flow.md) (Chatterbox a hop at a time), [ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md) (its guidance as one batch), [ADR-119](../adrs/adr-119-speecht5-streams-mel-frames-by-vocoding-windows.md) (SpeechT5 a few mel frames at a time), [ADR-120](../adrs/adr-120-a-frame-model-with-a-finite-reach-streams-by-windows-over-its-one-pass-graph.md) (WakeHuBERT and MarbleNet by windows over the one-pass graph), [ADR-121](../adrs/adr-121-qwen3-asr-streams-the-way-its-reference-does-re-encoding-only-what-changed.md) (Qwen3-ASR's re-feed loop, only changed windows re-encoded), [ADR-122](../adrs/adr-122-parakeet-streams-the-way-nemos-buffered-script-does.md) (Parakeet's buffered streaming, the loop shared with the unified ASR), [ADR-123](../adrs/adr-123-a-nemo-ctc-model-streams-the-way-framebatchasr-does.md) (the NeMo CTC models as FrameBatchASR runs them), [ADR-124](../adrs/adr-124-canary-streams-the-way-nemos-aed-streaming-script-does.md) (Canary, wait-k and AlignAtt), [ADR-125](../adrs/adr-125-a-buffered-stream-runs-on-the-gpu-without-host-round-trips.md) (the buffered streams on a GPU: pointwise convs and the STFT as products, stream-state arrays in place), [ADR-126](../adrs/adr-126-a-wav2vec2-style-ctc-model-streams-in-the-transformers-pipelines-strided-chunks.md) (HuBERT and data2vec in the transformers pipeline's strided chunks), [ADR-127](../adrs/adr-127-a-recogniser-without-a-streaming-mode-streams-in-moonshines-vad-lines.md) (`LineStream`: Moonshine's VAD lines for any recogniser), [ADR-128](../adrs/adr-128-whisper-streams-the-way-simulstreaming-does.md) (Whisper as SimulStreaming streams it), [ADR-129](../adrs/adr-129-pyannote-streams-the-way-diarts-voice-activity-detection-does.md) (pyannote as diart's voice activity detection streams it), [ADR-130](../adrs/adr-130-an-encoder-decoder-token-stream-keeps-its-per-call-context-in-the-state.md) (flan-t5's token stream, its per-call context in the state) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md), [Retro-104](../retros/retro-104-a-state-value-that-dropped-its-named-keys.md) (a stream's state value dropped its named keys), [Retro-105](../retros/retro-105-a-graph-laid-out-by-the-graph-before-it.md) (a graph laid out by the graph before it) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md), [Retro-104](../retros/retro-104-a-state-value-that-dropped-its-named-keys.md) (a stream's state value dropped its named keys), [Retro-105](../retros/retro-105-a-graph-laid-out-by-the-graph-before-it.md) (a graph laid out by the graph before it), [Retro-106](../retros/retro-106-a-wider-fusion-reached-a-walk-that-did-not-know-its-op.md) (a wider fusion cost VoxCPM2 its token axis) |
 | Active tasks | [Backlog → Host API](../backlog/active-index.md#host-api) |
 
 ## 4. The Record
