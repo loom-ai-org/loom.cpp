@@ -110,9 +110,30 @@ because the driver's `infer` entry returns an argmax — the resolution at which
 
 ---
 
-## Still open: who depends on these heuristics?
+## Who depended on these heuristics? Nobody (closed 2026-11-17)
 
-Follow-up to the fixed bug above, and the reason it is not fully closed. The guards added in `6c170a1`
+**Step 1, 2026-11-16.** `LOOM_HEAL_LOG` (loom.cpp #129) logged every firing with the branch, the node
+and the shapes. It covered:
+* every runnable engine gate (27);
+* all 71 published cards;
+* every stream door of every stream model, freshly re-exported where the stream lives in the file.
+
+Exactly one firing: `MUL_MAT.transpose(b)` in the **v5 StyleTTS2 test fixture**, at a diffusion matmul
+whose `b` was `[1, 1024]`. The fixture was stale. The published `styletts2-ljspeech.gguf` carries a
+RESHAPE to `[1024, 1]` after that MEAN, fires nothing, and passes the same gate 22209/22209. So step 2,
+fixing firings at the exporter, had nothing left to fix: the exporter had already fixed the one firing.
+
+**Step 3, 2026-11-17.** All 9 branches are deleted:
+* operands that do not combine raise `SchemaError`, which `build_node` names the node in;
+* REPEAT gained the check it lacked, so a tensor that does not repeat to its target no longer reaches
+  `ggml_repeat_4d`'s assert;
+* `test_layout_guesses_are_gone` feeds each deleted branch's shape and expects the error;
+* the v5 fixture is the published file.
+
+The lesson stands as written below: the guesses were never needed by a correct export, and every one of
+them could corrupt one. What follows is the plan as it stood before the survey.
+
+Follow-up to the fixed bug above, and the reason it was not fully closed at the time. The guards added in `6c170a1`
 make the size-guessing *unreachable for graphs that are already correct* — they do not remove the
 guessing. Any graph that genuinely fails the compatibility check still gets a layout inferred from
 ambiguous sizes, and **nobody currently knows which models that is**. The heuristics were added
