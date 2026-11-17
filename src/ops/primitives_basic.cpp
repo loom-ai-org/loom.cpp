@@ -9,6 +9,12 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <set>
+#include <string>
 #include <vector>
 
 namespace loom {
@@ -128,6 +134,54 @@ using Json = nlohmann::json;
 using Inputs = std::vector<ggml_tensor*>;
 using Outputs = std::vector<ggml_tensor*>;
 
+// ---------------------------------------------------------------------------------------------------
+// LOOM_HEAL_LOG: WHICH MODELS STILL LEAN ON THE LAYOUT GUESSES (hub: "Who still depends on the
+// layout-healing heuristics?", Retro-001)
+// ---------------------------------------------------------------------------------------------------
+// Every "heal" below permutes an operand because its SIZES look transposed against the other's. The
+// guards keep them off graphs that already combine, but each is still a silent-wrong-answer generator:
+// a graph the exporter got wrong is patched by a guess, rightly or not, instead of failing. Deleting
+// them needs a list of the models whose graphs still reach one, and this writes that list.
+//
+// Unset (the default) costs one cached branch per firing and writes nothing. `1` or `stderr` writes to
+// stderr; anything else is a file path, appended to, so one file per model run names the model. Each
+// distinct line is written once per process: a decode loop rebuilds its graph every token and would
+// otherwise repeat the same line thousands of times. Format, tab-separated:
+//
+//     loom-heal  <OP.branch>  <node>  a=[ne0,ne1,ne2,ne3]  b=[...]|target=[...]
+//
+// The shapes are the operands' BEFORE the heal, so a line is enough to find the node in the export.
+FILE* heal_log_sink() {
+    static FILE* const sink = []() -> FILE* {
+        const char* e = std::getenv("LOOM_HEAL_LOG");
+        if (e == nullptr || *e == '\0' || std::strcmp(e, "0") == 0) return nullptr;
+        if (std::strcmp(e, "1") == 0 || std::strcmp(e, "stderr") == 0) return stderr;
+        FILE* f = std::fopen(e, "a");
+        return f != nullptr ? f : stderr;
+    }();
+    return sink;
+}
+
+std::string ne_text(const int64_t* ne) {
+    return "[" + std::to_string(ne[0]) + "," + std::to_string(ne[1]) + "," + std::to_string(ne[2]) + "," +
+           std::to_string(ne[3]) + "]";
+}
+
+void note_heal(const PrimitiveContext& pc, const char* branch, const ggml_tensor* a, const char* other_key,
+               const int64_t* other_ne) {
+    FILE* sink = heal_log_sink();
+    if (sink == nullptr) return;
+    const std::string line = std::string("loom-heal\t") + branch + "\t" +
+                             (pc.node_label != nullptr ? *pc.node_label : std::string("?")) + "\ta=" +
+                             ne_text(a->ne) + "\t" + other_key + "=" + ne_text(other_ne) + "\n";
+    static std::mutex mu;
+    static std::set<std::string> seen;
+    std::lock_guard<std::mutex> lock(mu);
+    if (!seen.insert(line).second) return;
+    std::fputs(line.c_str(), sink);
+    std::fflush(sink);
+}
+
 void expect_n_inputs(const char* op, const Inputs& in, size_t n) {
     if (in.size() != n) {
         throw SchemaError(std::string(op) + " expects " + std::to_string(n) + " input(s), got " + std::to_string(in.size()));
@@ -245,13 +299,16 @@ Outputs op_mul_mat(PrimitiveContext& pc, const Inputs& in, const Json&) {
     if (!can_mul_mat(a, b)) {
         // Dynamically heal transposed/permuted layouts in matrix multiplication (heads/seq swapped)
         if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
+            note_heal(pc, "MUL_MAT.permute12(a)", a, "b", b->ne);
             a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
         } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
+            note_heal(pc, "MUL_MAT.permute12(b)", a, "b", b->ne);
             b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
         }
 
         // Dynamically heal transposed/permuted input tensors by transposing on the fly
         if (a->ne[0] != b->ne[0] && a->ne[0] == b->ne[1]) {
+            note_heal(pc, "MUL_MAT.transpose(b)", a, "b", b->ne);
             b = ggml_transpose(pc.ctx, b);
         }
     }
@@ -327,15 +384,19 @@ Outputs op_add(PrimitiveContext& pc, const Inputs& in, const Json&) {
     if (!ggml_can_repeat(b, a)) {
         // Dynamically heal heads/seq layout transpositions (axis 1 and 2 swapped)
         if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
+            note_heal(pc, "ADD.permute12(b)", a, "b", b->ne);
             b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
         } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
+            note_heal(pc, "ADD.permute12(a)", a, "b", b->ne);
             a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
         }
 
         // Dynamically heal heads/seq layout transpositions with broadcasting (axis 1 and 2 swapped)
         if (a->ne[0] == b->ne[0] && a->ne[2] == b->ne[1] && b->ne[2] == 1) {
+            note_heal(pc, "ADD.permute12_bcast(b)", a, "b", b->ne);
             b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
         } else if (b->ne[0] == a->ne[0] && b->ne[2] == a->ne[1] && a->ne[2] == 1) {
+            note_heal(pc, "ADD.permute12_bcast(a)", a, "b", b->ne);
             a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
         }
     }
@@ -415,23 +476,29 @@ Outputs op_mul(PrimitiveContext& pc, const Inputs& in, const Json&) {
     if (!ggml_can_repeat(b, a)) {
         // Dynamically heal heads/seq layout transpositions (axis 1 and 2 swapped)
         if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
+            note_heal(pc, "MUL.permute12(b)", a, "b", b->ne);
             b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
         } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
+            note_heal(pc, "MUL.permute12(a)", a, "b", b->ne);
             a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
         }
 
         // Dynamically heal heads/seq layout transpositions with broadcasting (axis 1 and 2 swapped)
         if (a->ne[0] == b->ne[0] && a->ne[2] == b->ne[1] && b->ne[2] == 1) {
+            note_heal(pc, "MUL.permute12_bcast(b)", a, "b", b->ne);
             b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
         } else if (b->ne[0] == a->ne[0] && b->ne[2] == a->ne[1] && a->ne[2] == 1) {
+            note_heal(pc, "MUL.permute12_bcast(a)", a, "b", b->ne);
             a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
         }
 
         // Dynamically heal transposed layouts where axis 0 and 1 are swapped
         if (a->ne[0] == b->ne[1] && a->ne[1] == b->ne[0]) {
+            note_heal(pc, "MUL.swap01(a)", a, "b", b->ne);
             a = ggml_permute(pc.ctx, a, 1, 0, 2, 3);
             a = ggml_cont(pc.ctx, a);
         } else if (b->ne[0] == a->ne[1] && b->ne[1] == a->ne[0]) {
+            note_heal(pc, "MUL.swap01(b)", a, "b", b->ne);
             b = ggml_permute(pc.ctx, b, 1, 0, 2, 3);
             b = ggml_cont(pc.ctx, b);
         }
@@ -1076,12 +1143,14 @@ Outputs op_repeat(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
         // Dynamically heal transposed/permuted input layouts (axis 1 and 2 swapped) relative to repeat target
         if (a->ne[0] == ne[0] && a->ne[1] != ne[1] && a->ne[2] != ne[2]) {
             if (a->ne[1] == ne[2] / (ne[2] / a->ne[1]) && a->ne[2] == ne[1]) {
+                note_heal(pc, "REPEAT.permute12", a, "target", ne);
                 a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
             }
         }
 
         // Dynamically heal transposed layouts where axis 0 and 1 are swapped
         if (a->ne[0] == ne[1] && a->ne[1] == ne[0]) {
+            note_heal(pc, "REPEAT.swap01", a, "target", ne);
             a = ggml_permute(pc.ctx, a, 1, 0, 2, 3);
             a = ggml_cont(pc.ctx, a);
         }
