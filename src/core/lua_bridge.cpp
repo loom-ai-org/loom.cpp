@@ -25,6 +25,7 @@ extern "C" {
 #include <limits>
 #include <new>
 #include <optional>
+#include <random>
 
 // IMPORTANT: LuaJIT (like PUC Lua 5.1, whose C API it implements) reports its own internal errors via
 // `longjmp`, which does NOT run C++ destructors -- throwing a C++ exception out of a function called BY
@@ -2126,6 +2127,46 @@ int LoomLuaBridge::l_seed_rng(lua_State* L) {
     }
 }
 
+// `loom.aten_randn(seed, n)`: `torch.randn(n, generator=torch.Generator().manual_seed(seed))` on the CPU,
+// float32 -- ATen's MT19937 (std::mt19937 is the same generator and seeding, low 32 bits of the seed), a
+// 24-bit uniform per draw, and the SCALAR `normal_fill_16` Box-Muller in blocks of 16, a size that is not
+// a multiple of 16 redrawing a fresh block for its last 16. Bit-identical to ATen's scalar path (checked
+// against torch 2.8 under ATEN_CPU_CAPABILITY=default: 5 seeds x 4 sizes, no value differs; ADR-134); ATen's x86
+// AVX2 path uses its own log/sincos and differs by <= 2e-6. The Lua helper `aten_randn` (exporter
+// lua/aten_randn.lua) computes the same thing in doubles at ~200 ms per 130k values on a Pi 4; this is
+// ~6 ms. Sizes under 16 take ATen's other (scalar-distribution) path, which this does not reproduce.
+int LoomLuaBridge::l_aten_randn(lua_State* L) {
+    try {
+        const double seed_d = luaL_checknumber(L, 1);
+        const auto n = static_cast<int64_t>(luaL_checknumber(L, 2));
+        if (n < 16) return luaL_error(L, "loom.aten_randn: ATen's vectorised path starts at 16 values, got %d", static_cast<int>(n));
+        std::mt19937 g(static_cast<uint32_t>(static_cast<uint64_t>(static_cast<int64_t>(seed_d))));
+        const auto uniform = [&g]() { return static_cast<float>(g() & ((1u << 24) - 1)) * (1.0f / (1u << 24)); };
+        const auto fill16 = [](float* d) {
+            for (int j = 0; j < 8; ++j) {
+                const float u1 = 1 - d[j], u2 = d[j + 8];
+                const float radius = std::sqrt(-2 * std::log(u1));
+                const float theta = 2.0f * 3.14159265358979323846 * u2;   // in double, as ATen's pi<double>
+                d[j] = radius * std::cos(theta);
+                d[j + 8] = radius * std::sin(theta);
+            }
+        };
+        std::vector<float> v(static_cast<size_t>(n));
+        for (float& x : v) x = uniform();
+        for (size_t i = 0; i + 16 <= v.size(); i += 16) fill16(&v[i]);
+        if (n % 16 != 0) {
+            float tail[16];
+            for (float& x : tail) x = uniform();
+            fill16(tail);
+            std::copy(tail, tail + 16, v.end() - 16);
+        }
+        push_number_array(L, std::vector<double>(v.begin(), v.end()));
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.aten_randn: %s", e.what());
+    }
+}
+
 int LoomLuaBridge::l_gaussian_array(lua_State* L) {
     try {
         auto* self = bridge_from_upvalue(L);
@@ -2621,6 +2662,7 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"sample_row", &LoomLuaBridge::l_sample_row},     {"seed_rng", &LoomLuaBridge::l_seed_rng},
         {"tokenize", &LoomLuaBridge::l_tokenize},         {"detokenize", &LoomLuaBridge::l_detokenize},
         {"gaussian_array", &LoomLuaBridge::l_gaussian_array},
+        {"aten_randn", &LoomLuaBridge::l_aten_randn},
         {"uniform_array", &LoomLuaBridge::l_uniform_array},
         {"expand_by_duration", &LoomLuaBridge::l_expand_by_duration},
         {"expand_by_duration_and_retain", &LoomLuaBridge::l_expand_by_duration_and_retain},
