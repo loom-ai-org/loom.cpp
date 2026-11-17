@@ -35,7 +35,8 @@ using Inputs = std::unordered_map<std::string, loom::LoomLuaBridge::Value>;
 // Measured against upstream run at f64 on `hello` (peak 0.8): upstream's own f32 is 5.7e-4 away, the
 // engine 2.1e-3 -- its STFTs are 512-tap convolutions summed in f32 where torch runs FFTs (the same graph
 // at f64 is 5.8e-8 from upstream, so the difference is precision, not structure). Against upstream's
-// f32 the cases measure 0.6e-3 to 2.6e-3.
+// f32 the cases measure 0.6e-3 to 2.6e-3, the same maxima with the pulse train in the graph (ADR-134:
+// it moves the waveform by 6e-5, under the STFTs' error).
 constexpr double kWaveTolerance = 4e-3;
 constexpr int kVocab = 76;
 constexpr int kHop = 256;
