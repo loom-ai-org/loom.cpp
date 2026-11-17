@@ -26,8 +26,8 @@ PI4 = [  # model, task, F32 vs onnxruntime FP32, Q8_0_PC vs onnxruntime int8
 PIZERO = [  # model, task, CPU RTF, CPU+VC4 RTF
     ("WakeHuBERT tiny", "wake word", 0.17, 0.12),
     ("Silero VAD", "VAD", 0.18, 0.16),
-    ("sanoTTS heartnano", "TTS", 0.22, 0.19),
-    ("sanoTTS heart", "TTS", 0.54, 0.29),
+    ("sanoTTS heartnano", "TTS", 0.18, 0.17),   # 2026-11-17 re-measure, footnote 2 of that section
+    ("sanoTTS heart", "TTS", 0.52, 0.27),       # 2026-11-17 re-measure, footnote 2 of that section
     ("Citrinet-256", "ASR", 0.65, 0.31),
     ("sanoTTS thorsten (de)", "TTS", 0.72, 0.35),
     ("sanoTTS amy", "TTS", 2.30, 0.69),

@@ -165,10 +165,14 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   precision** (the waveform is 2.1e-3 from upstream at f64 where upstream's own f32 is 5.7e-4: 512-tap
   convolutions summed in f32). *Context: [ADR-133](../adrs/adr-133-tiny-voca-renders-its-pulse-train-in-the-driver-and-speaks-a-sentence-at-a-time.md),
   [ADR-134](../adrs/adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md)*
-* [ ] **sanoTTS, vocetta2 and AuroraTTS draw their noise in the engine once re-exported for rc21** (the
-  shared `aten_randn` helper calls `loom.aten_randn`, ADR-134): re-run their gates on the re-exports --
-  the draw is ATen's scalar path bit for bit, where their Lua was doubles rounded to f32 (up to 2.4e-7 on
-  1.5% of values). *Context: [ADR-134](../adrs/adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md)*
+* [ ] **Re-publish sanoTTS, vocetta2 and AuroraTTS with rc21** so they draw their noise in the engine
+  (verified on re-exports: 8.2e-7 at most, the card gate passes; ADR-134). sanoTTS heart-nano's published
+  file aborts on a Pi Zero's VC4 with `device="auto"` until an engine with the Retro-109 fix ships; the
+  other published files the padding pass changed and the board kit could not run (Kokoro, StyleTTS2,
+  Moonshine-streaming-small) are untried on the VC4 -- WakeHuBERT's (F32, Q8_0) run there, unchanged by
+  the fix.
+  *Context: [ADR-134](../adrs/adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md),
+  [Retro-109](../retros/retro-109-a-cropped-view-passed-the-vc4-fusion-matcher.md)*
 * [ ] **Audit the other uses of `log_softmax` in traced wrappers.** coremltools lowers it as
   `log(softmax)`, which is -inf for a token whose probability underflows. That is harmless before an
   argmax and NaN the moment two such rows are subtracted. *Context:

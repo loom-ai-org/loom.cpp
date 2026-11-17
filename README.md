@@ -116,15 +116,15 @@ its 12 QPUs ([ggml-vc4](backends/ggml-vc4/)) and the rest on the CPU.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/charts/pi-zero-rtf-dark.svg">
-  <img alt="Raspberry Pi Zero W real-time factors, CPU then CPU plus VC4: WakeHuBERT 0.17, 0.12; Silero VAD 0.18, 0.16; sanoTTS heartnano 0.22, 0.19; sanoTTS heart 0.54, 0.29; Citrinet-256 0.65, 0.31; sanoTTS thorsten 0.72, 0.35; sanoTTS amy 2.30, 0.69; Moonshine tiny 1.80, 1.17; Conformer-CTC small 1.90, 1.39; Pocket TTS 2m 1.84, 1.39; VITS piper 5.83, 1.74; tiny-voca 2.44, 1.95; Pocket TTS 7m 3.94, 2.92; Pocket TTS 18m 4.85, 3.82." src="assets/charts/pi-zero-rtf-light.svg" width="760">
+  <img alt="Raspberry Pi Zero W real-time factors, CPU then CPU plus VC4: WakeHuBERT 0.17, 0.12; Silero VAD 0.18, 0.16; sanoTTS heartnano 0.18, 0.17; sanoTTS heart 0.52, 0.27; Citrinet-256 0.65, 0.31; sanoTTS thorsten 0.72, 0.35; sanoTTS amy 2.30, 0.69; Moonshine tiny 1.80, 1.17; Conformer-CTC small 1.90, 1.39; Pocket TTS 2m 1.84, 1.39; VITS piper 5.83, 1.74; tiny-voca 2.44, 1.95; Pocket TTS 7m 3.94, 2.92; Pocket TTS 18m 4.85, 3.82." src="assets/charts/pi-zero-rtf-light.svg" width="760">
 </picture>
 
 | Raspberry Pi Zero W | audio | CPU | CPU + VC4 | speedup |
 |---|---|---|---|---|
 | WakeHuBERT tiny · wake word | 11.0 s | 1.83 s | **1.36 s** | 1.34x |
 | Silero VAD | 11.0 s | 1.99 s | **1.74 s** | 1.15x |
-| sanoTTS heartnano · TTS | 3.06 s | 0.67 s | **0.57 s** | 1.17x |
-| sanoTTS heart · TTS | 3.18 s | 1.71 s | **0.92 s** | 1.85x |
+| sanoTTS heartnano · TTS | 3.06 s | 0.56 s | **0.53 s** | 1.06x |
+| sanoTTS heart · TTS | 3.18 s | 1.65 s | **0.87 s** | 1.89x |
 | Citrinet-256 · ASR | 11.0 s | 7.14 s | **3.38 s** | 2.11x |
 | sanoTTS thorsten (de) · TTS | 4.40 s | 3.17 s | **1.53 s** | 2.07x |
 | sanoTTS amy · TTS | 5.90 s | 13.54 s | **4.08 s** | 3.32x |

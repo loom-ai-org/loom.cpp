@@ -83,6 +83,14 @@ Option **4**, and the noise drawn by the engine:
 * Exporter CI `test_the_split_pulse_train_is_upstreams`: the wrapper fed by the driver's series against
   upstream's float64 formula on a 1200-frame low voice, with ggml's cumsum: centred 84.0 dB, and the
   [0, 2 pi) form must stay below 50 (it measures 31.4).
-* The other three families draw from the engine once re-exported; their published files run the Lua.
+* **The other three families, re-exported** (2026-11-17, the card builder into a scratch tree): the
+  engine's draw moves their output by at most 8.2e-7 (above 122 dB; sanoTTS heart and heart-nano,
+  vocetta2 with `noise_scale`, AuroraTTS, F32 and Q8_0_PC), and it is the only change: each new file
+  with its noise patched back to the Lua loop renders what the published rc20 file renders, sample for
+  sample. vocetta2's default (no noise) is bit-identical. The model-card gate passes all five cards
+  (whisper-small). On the Pi Zero (docs/BENCHMARKS.md, Pi Zero footnote 2) the engine's noise saves 17 to
+  36 ms a run on heart and heart-nano; that re-measure found heart-nano's published file aborting on the
+  VC4 ([Retro-109](../retros/retro-109-a-cropped-view-passed-the-vc4-fusion-matcher.md)), fixed in the same
+  stack. Their published files run the Lua until they are re-published.
 * 15 ms stays in Lua, the noise table's crossing included. A variant that leaves the draw in an output
   store, so it never becomes a table, was not built.
