@@ -1107,7 +1107,8 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   K/V and source length kept in the stream state; the published file, which the door took for a causal LM, is now
   refused). **Every row of the survey is built** (the user chose flan-t5 alone for the per-call-context loops,
   2026-11-15). Every stack is merged (2026-11-15). What is left: each row publishes after a re-export on the rc21+ engine.
-  Not built unless asked: diart's full diarization (needs a speaker-embedding export), LFM2.5-Audio full duplex,
+  Not built unless asked: diart's full diarization (needs a speaker-embedding export), LFM2.5-Audio's
+  interleaved speech-to-speech mode (turn-based, not full duplex; its ASR and TTS halves already stream),
   the streaming checkpoints on disk outside the zoo
   ([Epic-06 § Streaming](../epics/epic-06-high-level-api-and-hosts.md#streaming-which-other-models-can-and-how)).
   CosyVoice3's stream is the first to have run on a GPU (CUDA, RTX 5090, 2026-11-12): 44/44 at 7.3x real time,
