@@ -1742,6 +1742,28 @@ void test_pool_1d() {
     LOOM_CHECK((get_f32(avg_out) == std::vector<float>{1.5f, 3.5f}));
 }
 
+// A permuted (non-contiguous) input: ggml's CPU pool walks rows from the data pointer and ignores `nb`, so
+// op_pool_1d makes its input contiguous first. OmniVoice's per-row max over the vocabulary (ADR-131) is the
+// case that found it: a [0,2,1,3] permute ahead of the pool gave garbage in rows 2 and 3.
+void test_pool_1d_permuted_input() {
+    GgmlScratch s;
+    // ne = [3, 2, 2]: three rows of length... permuted to [3, 2, 2] with axes 1 and 2 swapped.
+    ggml_tensor* a = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, 3, 2, 2);
+    ggml_set_input(a);
+    ggml_tensor* permuted = ggml_permute(s.ctx.get(), a, 0, 2, 1, 3);
+    LOOM_CHECK(!ggml_is_contiguous(permuted));
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("POOL_1D")(pc, {permuted}, {{"op", "max"}, {"k0", 3}, {"s0", 3}, {"p0", 0}})[0];
+    ggml_cgraph* gf = s.expand(out);
+    // a's rows in memory order: (j=0,k=0) (j=1,k=0) (j=0,k=1) (j=1,k=1); the permute visits them as
+    // (j=0,k=0) (j=0,k=1) (j=1,k=0) (j=1,k=1).
+    set_f32(a, {1, 9, 2, 4, 3, 8, 7, 5, 6, 0, -1, 12});
+    s.compute(gf);
+    LOOM_CHECK((get_f32(out) == std::vector<float>{9, 7, 8, 12}));
+}
+
 void test_pool_2d() {
     GgmlScratch s;
     ggml_tensor* a = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 4, 4);
@@ -3252,6 +3274,7 @@ int main() {
     test_conv_transpose_1d();
     test_conv_transpose_2d();
     test_pool_1d();
+    test_pool_1d_permuted_input();
     test_pool_2d();
     test_gelu();
     test_attention_without_kv_cache();
