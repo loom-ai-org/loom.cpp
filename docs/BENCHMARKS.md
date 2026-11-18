@@ -159,7 +159,7 @@ Seconds, RTF in brackets; each device's faster precision in bold, and the speedu
 | Pocket TTS 7m (TTS, 4.80 s of audio) | 20.70 s (4.31) | **18.91 s (3.94)** | 14.91 s (3.11) | **14.04 s (2.92)** | 1.35x |
 | Pocket TTS 2m (TTS, 4.80 s of audio) | **8.85 s (1.84)** | 9.07 s (1.89) | **6.66 s (1.39)** | 7.08 s (1.48) | 1.33x |
 | tiny-voca (TTS, 5.39 s of audio)¹ | 13.53 s (2.51) | **13.20 s (2.44)** | **10.48 s (1.95)** | 10.82 s (2.00) | 1.25x |
-| Paradee 1.3 (TTS, 5.85 s of audio)⁴ | 16.82 s (2.88) | **15.73 s (2.69)** | 13.45 s (2.30) | **11.83 s (2.02)** | 1.33x |
+| Paradee 1.3 (TTS, 5.85 s of audio)⁴ | 15.90 s (2.72) | **14.88 s (2.54)** | 12.00 s (2.05) | **11.48 s (1.96)** | 1.30x |
 | Citrinet-256-ls (ASR, jfk 11.0 s) | 9.81 s (0.89) | **7.14 s (0.65)** | **3.38 s (0.31)** | 3.49 s (0.32) | 2.11x |
 | Moonshine tiny (ASR, jfk 11.0 s) | 25.50 s (2.32) | **19.77 s (1.80)** | 16.66 s (1.51) | **12.90 s (1.17)** | 1.53x |
 | Conformer-CTC small (ASR, 3.0 s of jfk) | 5.88 s (1.96) | **5.70 s (1.90)** | 4.23 s (1.41) | **4.16 s (1.39)** | 1.37x |
@@ -192,10 +192,12 @@ file's 19.43 s and 5.73 s. The rest of the change from the first row is the engi
 and 50.0 dB at Q8_0_PC, and whisper-small hears every arm as the sentence. One run of the 18 differs: round 2's
 Q8_0_PC on CPU+VC4, launched 3 s after round 1's, found the GPU pool short of a 33 MB buffer and kept the elementwise
 nodes on the CPU (ADR-093's fallback), taking 6.87 s; its output is 77 dB from the other two rounds', which match.
-⁴ Measured on 2026-11-18 with the same protocol, on the ARMv6 build of footnote ² (the one engine commit since adds a
-contract field nothing here reads): the Pi 4 row's sentence and GGUFs (md5 `30d19ce2`/`371c192a`). Every arm made
-140 400 samples (5.85 s) and hashed the same in each round, and whisper-small hears all four as the sentence, word for
-word. The VC4's output drifts from the CPU's over the utterance: 35 dB in the first second, 17 dB by the third, 18.7 dB
+⁴ Measured on 2026-11-18 with the same protocol, on an ARMv6 build of loom.cpp `a7554b2`: the Pi 4 row's sentence and
+GGUFs (md5 `9a26d78f`/`29bdfb7a`, each BiLSTM's input half one product before the sweep,
+[ADR-137](adrs/adr-137-a-bilstms-input-half-is-one-product-before-the-sweep.md)). The first measurement, the exports and
+build before it (`30d19ce2`/`371c192a` on footnote ²'s), was 16.82 / 15.73 / 13.45 / 11.83 s and 1.33x; ADR-136 changes
+nothing on a one-core board, which ran every graph on one thread already. Every arm made 140 400 samples (5.85 s) and
+hashed the same in each round, and whisper-small hears all four as the sentence, word for word. The VC4's output drifts from the CPU's over the utterance: 35 dB in the first second, 17 dB by the third, 18.7 dB
 over the whole at F32. The head's sine bank integrates the F0, so an F0 the VC4 computes a few ulp apart moves the phase.
 The spectra agree: log-mel L1 0.046, where Q8_0_PC against F32 on the CPU is 0.263.
 Every other arm hashed the same in all three rounds.

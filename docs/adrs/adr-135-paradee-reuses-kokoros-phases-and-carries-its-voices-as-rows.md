@@ -88,7 +88,7 @@ Kokoro's voices in four languages: one learned row per voice in each half's styl
   1.05x and 1.22x. It was 1.51 and 1.29 s until the recurrent sweep ran its cells on one thread
   ([ADR-136](adr-136-a-recurrent-sweep-runs-its-cells-on-one-thread.md)), Paradee's six BiLSTMs being about 1 480
   per-timestep graphs, and each BiLSTM's input half became one product before the sweep
-  ([ADR-137](adr-137-a-bilstms-input-half-is-one-product-before-the-sweep.md)). On the Pi Zero, CPU 15.73 s and CPU+VC4 11.83 s (Q8_0_PC both), 1.33x. The VC4's output drifts in phase from the CPU's (18.7 dB, spectra equal), and
+  ([ADR-137](adr-137-a-bilstms-input-half-is-one-product-before-the-sweep.md)). On the Pi Zero, CPU 14.88 s and CPU+VC4 11.48 s (Q8_0_PC both), 1.30x. The VC4's output drifts in phase from the CPU's (18.7 dB, spectra equal), and
   whisper hears every arm as the sentence.
 
 Word error rate through the door, whisper-small, 2026-11-18: 20 held-out English sentences (10 for
