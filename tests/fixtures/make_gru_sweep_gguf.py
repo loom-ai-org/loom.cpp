@@ -41,6 +41,11 @@ function bidirectional(inputs)
     return loom.get_output('gru_fwd', 1)
 end
 
+function paired(inputs)
+    loom.run_bi_recurrent_pair_and_retain('gru_fwd', 'gru_bwd', inputs.sequence, inputs.sequence2, {SEQ}, {INPUT}, {HIDDEN})
+    return loom.get_output('gru_fwd', 1)
+end
+
 local function rows(seq, from, to)
     local out = {{}}
     for i = from * {INPUT} + 1, to * {INPUT} do out[#out + 1] = seq[i] end
@@ -202,6 +207,9 @@ def main() -> None:
     weights.update({f"lstm.{k}": v for k, v in lstm.items()})
     seq = rng.normal(size=(SEQ, INPUT)).astype(np.float32).astype(np.float64)
     fwd, bwd = reference(seq, per_dir["fwd"], False), reference(seq, per_dir["bwd"], True)
+    # `loom.run_bi_recurrent_pair_and_retain` (ADR-137): each direction its own sequence.
+    seq2 = rng.normal(size=(SEQ, INPUT)).astype(np.float32).astype(np.float64)
+    bwd2 = reference(seq2, per_dir["bwd"], True)
     lstm_out = lstm_reference(seq, {k: v.astype(np.float64) for k, v in lstm.items()})
 
     bad = cell("fwd.")
@@ -219,6 +227,8 @@ def main() -> None:
     w.add_string("test.backward", json.dumps(bwd.reshape(-1).tolist()))
     w.add_string("test.lstm_forward", json.dumps(lstm_out.reshape(-1).tolist()))
     w.add_string("test.bidirectional", json.dumps(np.concatenate([fwd, bwd], 1).reshape(-1).tolist()))
+    w.add_string("test.sequence2", json.dumps(seq2.reshape(-1).tolist()))
+    w.add_string("test.paired", json.dumps(np.concatenate([fwd, bwd2], 1).reshape(-1).tolist()))
     for name, array in weights.items():
         w.add_tensor(name, array)
     w.write_header_to_file()
