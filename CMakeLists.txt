@@ -110,6 +110,18 @@ if(MSVC)
     target_compile_definitions(loom_engine PRIVATE _USE_MATH_DEFINES)
 endif()
 
+# **No floating-point contraction in the engine's own code** (Retro-110). The engine's host arithmetic is
+# meant to give the same bits on every machine: `aten_randn` reproduces torch's normal stream value for value
+# (ADR-134), `gaussian_array` is std::normal_distribution's, and the drivers' phases, durations and CTC
+# decode are compared bit for bit. GCC's default `-ffp-contract=fast` fuses `a + b * c` into an FMA whenever
+# the target CPU has one, so on an FMA-capable target the same source rounds differently, and differently
+# per inlining context: GitHub's Ubuntu 26.04 runners build that way, and `test_lua_bridge`'s gaussian check
+# failed there against the very same distribution compiled into the test (reproduced at -march=x86-64-v3).
+# PRIVATE: ggml's kernels keep their own flags, which is where the speed is; this code is orchestration.
+if(NOT MSVC)
+    target_compile_options(loom_engine PRIVATE -ffp-contract=off)
+endif()
+
 # `src/core/profile.cpp` includes ggml's PRIVATE `ggml-impl.h`, for the one declaration ggml does not
 # export: `ggml_graph_view`, which returns a `ggml_cgraph` by value and so needs the complete type.
 # PRIVATE and target-scoped on purpose -- exactly one translation unit may see ggml's internals, and a
