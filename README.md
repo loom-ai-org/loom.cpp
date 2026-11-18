@@ -97,12 +97,12 @@ output length. **A bar past the dashed line means loom is faster**:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/charts/pi4-vs-onnxruntime-dark.svg">
-  <img alt="Raspberry Pi 4: loom against onnxruntime. F32: VITS 1.34x, Pocket TTS 2.06x, Qwen3 1.06x, Moonshine 1.13x, whisper 1.00x, Citrinet 0.65x, tiny-voca 1.30x. Int8: VITS 5.03x, Pocket TTS 3.27x, Qwen3 3.45x, Moonshine 1.75x, whisper 1.17x, Citrinet 9.31x, tiny-voca 1.81x." src="assets/charts/pi4-vs-onnxruntime-light.svg" width="760">
+  <img alt="Raspberry Pi 4: loom against onnxruntime. F32: VITS 1.36x, Pocket TTS 2.06x, Qwen3 1.06x, Moonshine 1.13x, whisper 1.00x, Citrinet 0.65x, tiny-voca 1.30x. Int8: VITS 5.04x, Pocket TTS 3.27x, Qwen3 3.45x, Moonshine 1.75x, whisper 1.17x, Citrinet 9.31x, tiny-voca 1.81x." src="assets/charts/pi4-vs-onnxruntime-light.svg" width="760">
 </picture>
 
 | Raspberry Pi 4, 4 threads | loom F32 | onnxruntime FP32 | loom int8 | onnxruntime int8 |
 |---|---|---|---|---|
-| VITS Piper en-GB · TTS, 3.3 s of speech | **0.80 s** | 1.07 s | **0.82 s** | 4.12 s |
+| VITS Piper en-GB · TTS, 3.3 s of speech | **0.80 s** | 1.08 s | **0.82 s** | 4.14 s |
 | Pocket TTS · TTS, 4.8 s of speech¹ | **9.11 s** | 18.77 s | **4.25 s** | 13.88 s |
 | Qwen3-0.6B · 24 tokens | **16.6 s** | 17.6 s | **4.15 s** | 14.28 s |
 | Moonshine tiny · ASR, 11 s clip | **1.34 s** | 1.50 s | **0.85 s** | 1.49 s |

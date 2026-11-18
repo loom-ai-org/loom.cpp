@@ -12,7 +12,7 @@ OUT = Path(__file__).resolve().parent / "charts"
 
 # docs/BENCHMARKS.md, "Raspberry Pi 4": onnxruntime time / loom time, 4 threads, paired medians.
 PI4 = [  # model, task, F32 vs onnxruntime FP32, Q8_0_PC vs onnxruntime int8
-    ("VITS (piper)", "TTS", 1.34, 5.03),
+    ("VITS (piper)", "TTS", 1.36, 5.04),
     ("Pocket TTS", "TTS", 2.06, 3.27),
     ("Qwen3-0.6B", "LM", 1.06, 3.45),
     ("Moonshine tiny", "ASR", 1.13, 1.75),

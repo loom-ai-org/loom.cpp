@@ -37,7 +37,7 @@ time. The LM row has no audio, so its time stands alone.
 
 | Raspberry Pi 4B, 4 threads | loom F32 | onnxruntime FP32 | ratio | loom Q8_0_PC | onnxruntime int8 | ratio |
 |---|---|---|---|---|---|---|
-| VITS piper en-GB miro (TTS, 3.32 s of audio) | 0.802 s (0.24) | 1.072 s (0.32) | **1.34x** | 0.821 s (0.25) | 4.117 s (1.24) | **5.03x** |
+| VITS piper en-GB miro (TTS, 3.32 s of audio)⁵ | 0.796 s (0.24) | 1.084 s (0.33) | **1.36x** | 0.821 s (0.25) | 4.136 s (1.25) | **5.04x** |
 | Citrinet-256-ls (ASR, jfk 11.0 s) | 0.454 s (0.04) | 0.294 s (0.03)¹ | 0.65x | 0.459 s (0.04) | 4.300 s (0.39)¹ | **9.31x** |
 | Moonshine tiny (ASR, jfk 11.0 s) | 1.335 s (0.12) | 1.504 s (0.14) | **1.13x** | 0.848 s (0.08) | 1.485 s (0.13) | **1.75x** |
 | whisper-small (ASR, jfk 11.0 s) | 20.73 s (1.88) | 20.63 s (1.88) | 1.00x | 12.52 s (1.14) | 14.74 s (1.34) | **1.17x** |
@@ -69,6 +69,15 @@ samples (p10-p90 1.29-1.30x). At int8 each engine's quantized duration head move
 samples, onnxruntime 131 584. So that ratio is per second of audio (p10-p90 1.80-1.82x); the time ratio is 1.84x.
 whisper-small hears all four outputs as the sentence, word for word.
 The GGUFs are md5 `207320a3`/`3ba30c37`, F32/Q8_0_PC.
+⁵ Re-measured on 2026-11-18 on the Hub's F32 (md5 `84389cfc`, padded by the exporter, ADR-081) and the unchanged
+Q8_0_PC (`6e095a95`, which exports byte-identical today), with the first row's harness, onnxruntime models and protocol,
+on a Pi 4 build of loom.cpp `488dc2e` (on aarch64 its code is `2667740`'s: the commits between them touch only the
+VC4 backend). Both halves resolve: F32 p10-p90 1.35-1.38x, Q8_0_PC 4.99-5.07x. Every arm made the same 73 216 samples.
+The rc18-era F32 the first row measured (`3f25d02d`) ran against the Hub's file as a loom-only pair in the same session:
+the same audio bit for bit (fnv1a `096eb0d3...`), 0.795 s against 0.797 s, p10-p90 0.99-1.00x, so parity. The padding
+costs nothing here, and the move from 1.34x to 1.36x is within the session-to-session drift of both engines (loom 0.802 s
+to 0.796 s, onnxruntime 1.072 s to 1.084 s). The audio's hash is not October's (`ab001d8d...` at F32): the harness's
+source is October's byte for byte, so the engine has changed since, for the old file and the new alike.
 
 * **Both engines did the same work in every pair**, checked by one untimed launch of each arm: the same 73 216 VITS
   samples, the same 24 tokens, and the same transcript at each precision except one word each of Citrinet (loom Q8_0_PC
