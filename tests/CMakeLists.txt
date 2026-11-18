@@ -17,6 +17,12 @@
 # documents still work and still win when set -- see `support/fixtures.h` -- because pointing one test
 # at one file you just rebuilt is exactly what you do while working on it.
 
+# The references round each operation as written, like the engine they check (`-ffp-contract=off` on
+# loom_engine, Retro-110): a test's own `acc + w * v` must not become an FMA on an FMA-capable target.
+if(NOT MSVC)
+    add_compile_options(-ffp-contract=off)
+endif()
+
 # Where a GGML_BACKEND_DL build keeps its backend .so files, for `support/cpu_backend.h`.
 #
 # In such a build the registry starts EMPTY -- the CPU is a plugin too -- and ggml's own search covers
