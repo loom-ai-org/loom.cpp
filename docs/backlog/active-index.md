@@ -171,8 +171,8 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 * [ ] **1.0.0 release notes: the VC4 fix (Retro-109).** Nine published files aborted on a Pi Zero's VC4
   under `device="auto"` on every release up to 1.0.0rc20: sanoTTS heart-nano, the six vocetta2 files, VITS
   piper miro, Vaniq-edge F32. 1.0.0 runs them. Their cards say `GGML_VC4_FUSE=0` for rc20 and earlier
-  (Hub, 2026-11-18; the card builder's `vc4_fuse_off`). The README's Pi Zero VITS row names the rc18-era
-  files it measured (md5 `3f25d02d`/`6e095a95`), not the Hub's padded `84389cfc`.
+  (Hub, 2026-11-18; the card builder's `vc4_fuse_off`). The README's Pi Zero and Pi 4 VITS rows were
+  re-measured on the Hub's padded `84389cfc` the same day (3.37x on the Pi Zero, 1.36x/5.04x against onnxruntime on the Pi 4).
   *Context: [Retro-109](../retros/retro-109-a-cropped-view-passed-the-vc4-fusion-matcher.md)*
 * [ ] **Audit the other uses of `log_softmax` in traced wrappers.** coremltools lowers it as
   `log(softmax)`, which is -inf for a token whose probability underflows. That is harmless before an
