@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-17
+last_updated: 2026-11-18
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -166,13 +166,14 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   convolutions summed in f32). *Context: [ADR-133](../adrs/adr-133-tiny-voca-renders-its-pulse-train-in-the-driver-and-speaks-a-sentence-at-a-time.md),
   [ADR-134](../adrs/adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md)*
 * [ ] **Re-publish sanoTTS, vocetta2 and AuroraTTS with rc21** so they draw their noise in the engine
-  (verified on re-exports: 8.2e-7 at most, the card gate passes; ADR-134). sanoTTS heart-nano's published
-  file aborts on a Pi Zero's VC4 with `device="auto"` until an engine with the Retro-109 fix ships; the
-  other published files the padding pass changed and the board kit could not run (Kokoro, StyleTTS2,
-  Moonshine-streaming-small) are untried on the VC4 -- WakeHuBERT's (F32, Q8_0) run there, unchanged by
-  the fix.
-  *Context: [ADR-134](../adrs/adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md),
-  [Retro-109](../retros/retro-109-a-cropped-view-passed-the-vc4-fusion-matcher.md)*
+  (verified on re-exports: 8.2e-7 at most, the card gate passes; ADR-134).
+  *Context: [ADR-134](../adrs/adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md)*
+* [ ] **Nine published files abort on a Pi Zero's VC4 under `device="auto"` on every released engine,
+  until one with the Retro-109 fix ships (rc21)**: sanoTTS heart-nano, all six vocetta2 files, VITS piper
+  miro, Vaniq-edge F32. The files are fine and need no re-export; their cards could say
+  `GGML_VC4_FUSE=0` (or `LOOM_DEVICE=cpu`) meanwhile, which runs them on the unfixed engine. The README's
+  Pi Zero VITS row names the rc18-era files it measured (md5 `3f25d02d`/`6e095a95`), not the Hub's padded
+  `84389cfc`. *Context: [Retro-109](../retros/retro-109-a-cropped-view-passed-the-vc4-fusion-matcher.md)*
 * [ ] **Audit the other uses of `log_softmax` in traced wrappers.** coremltools lowers it as
   `log(softmax)`, which is -inf for a token whose probability underflows. That is harmless before an
   argmax and NaN the moment two such rows are subtracted. *Context:
