@@ -125,7 +125,7 @@ Option **3**.
     `median_filter` on 20 random cases;
   * every constant the fragment reads is bound.
 * The exporter's gate snapshot of whisper-small moves: a second decoder output and the stream constants.
-  Publishing needs a re-export on an engine with the door, rc21 or later.
+  Publishing needs a re-export on an engine with the door, 1.0.0 or later.
 
 ## Related
 

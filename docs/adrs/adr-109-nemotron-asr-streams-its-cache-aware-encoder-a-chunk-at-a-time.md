@@ -106,7 +106,7 @@ Option **3**. `infer` is unchanged.
   stream at 2, 4, 8 or 25 chunks per call is 0.148 off too, but at one chunk per call (4 rows) it is 0.376
   off. Some op is less accurate at 4 rows; both of ggml's CPU matmul paths quantize the activations the same
   way, so the op is not identified yet (hub item). The published file is F32.
-* Publishing needs a re-export (two new graphs and the stream functions) on an engine with the door, rc21 or
+* Publishing needs a re-export (two new graphs and the stream functions) on an engine with the door, 1.0.0 or
   later. The published file gives the same ids in one call, and the live door refuses it.
 
 ## Related

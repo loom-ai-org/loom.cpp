@@ -118,5 +118,5 @@ Option **2**, the user's choice.
   runs as the engine does: this gate takes 297 s alone, down from 943 s.
 * **`FrameUpdate::values` is float32**, so a host sees diart's scores to float32. Thresholding at 0.6
   could differ only for a score within float32 rounding of 0.6.
-* Publishes with the rc21+ engine, after a re-export.
+* Publishes with the 1.0.0+ engine, after a re-export.
 * **Out of scope:** diart's `SpeakerDiarization` (option 1). It needs an embedding model in the zoo first.

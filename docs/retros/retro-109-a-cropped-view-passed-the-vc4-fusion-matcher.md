@@ -77,5 +77,5 @@ eight. The board confirmed every one, and agreed with the emulation wherever bot
   Nemotron ASR files, Canary. Not run, as none fits a board with a VC4: LFM2.5-Audio ASR and TTS, Granite
   Speech, Qwen3-TTS, VoxCPM2, Voxtral TTS, Chatterbox. One slip on the way: the emulator's output was read through `tail -14`, which hid
   VITS's changed fusions until the board aborted on one; the counts above are `grep -c`.
-* Until the fix ships, `GGML_VC4_FUSE=0` runs these files on the unfixed engine, on the VC4 without fusion:
+* On 1.0.0rc20 and earlier, `GGML_VC4_FUSE=0` runs these files on the VC4 without fusion (their Hub cards say so):
   vocetta2 276k F32 80 dB, vocetta2 1m Q8 66 dB, VITS 62 dB, Vaniq-edge F32 69 dB from the CPU.

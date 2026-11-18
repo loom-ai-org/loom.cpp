@@ -81,7 +81,7 @@ there it is not the same waveform. This export has no prompt audio, so that case
   faster than the loop. The door only moves the first audio forward. A GPU run is still to do, as for
   every stream.
 * Re-export needed: a file exported before this has no `stream_open` and is refused by the door. Publishing
-  waits for an rc21+ engine like the other streamed re-exports.
+  waits for a 1.0.0+ engine like the other streamed re-exports.
 
 ## Related
 

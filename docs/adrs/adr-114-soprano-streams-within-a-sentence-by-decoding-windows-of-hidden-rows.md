@@ -72,7 +72,7 @@ centred ISTFT with `n_fft` 2048 at hop 512 (a sample reads the frames whose 2048
   ~14% longer than the one pass overall, growing to 16 ~7%, fixed 1-row pieces 2.1x. loom-py:
   `text2speech.stream()` 7.3 s of audio, first piece 0.25 s, whole stream 3.4 s against a 3.1 s one pass,
   max|d| = 0.
-* Re-export needed: the driver is in the GGUF. Publishing waits for an rc21+ engine like the other
+* Re-export needed: the driver is in the GGUF. Publishing waits for a 1.0.0+ engine like the other
   streamed re-exports. No engine change.
 
 ## Related

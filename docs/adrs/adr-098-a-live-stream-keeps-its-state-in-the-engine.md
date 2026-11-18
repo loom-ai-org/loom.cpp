@@ -58,7 +58,7 @@ working exactly as they do; the state belongs on the engine side, as output buff
 
 * **Backward compatible both ways.** A file without `stream_*` runs one-pass as before and is refused
   only by the live door. A new file on an older runtime still has `infer`, but Zipformer streaming's
-  calls `loom.keep_state`, so that file needs this runtime -- it publishes on rc21 anyway (ARGMAX).
+  calls `loom.keep_state`, so that file needs this runtime -- it publishes on 1.0.0 anyway (ARGMAX).
 * Streams on one loaded model are independent: weights and compute buffers are shared, state is not.
   The gate pushes two streams in alternation with a one-pass call between their pushes. Sabotaged to read
   the module's own retained outputs instead (`{from = ...}`), every single-stream check still passed and

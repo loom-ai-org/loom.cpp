@@ -81,7 +81,7 @@ Option **3**.
 * **The one pass gains too**: every NeMo encoder's pointwise convolutions and front end now run on the GPU.
 * Vulkan and Metal take the same lowerings (the conditions are about memory, not vendor) and were not
   measured.
-* Publishing needs re-exports (the drivers call the new bindings) on an rc21+ engine, which the streams needed
+* Publishing needs re-exports (the drivers call the new bindings) on a 1.0.0+ engine, which the streams needed
   anyway.
 
 ## Related

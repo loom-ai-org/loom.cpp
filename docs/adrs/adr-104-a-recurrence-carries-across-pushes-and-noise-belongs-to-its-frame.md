@@ -92,7 +92,7 @@ SNAC **2**, EnCodec **2**, and MusicGen cut as Dia is.
   `PAD_1D_REFLECT` on an input no longer than its pad aborted the process inside ggml; it now throws (EnCodec
   on under 4 frames). Three CI tests (`test_gru_sweep`, `test_spm_prefix_vocab`, `test_transcribe_wordpiece`)
   ended in `return 0` and passed with failed checks; they now report them.
-* Every file needs a re-export (rc21+). An older engine ignores the `carry` argument, and EnCodec's stream
+* Every file needs a re-export (1.0.0+). An older engine ignores the `carry` argument, and EnCodec's stream
   then gives wrong audio after its first push. Its `infer` is unaffected.
 
 ## Related

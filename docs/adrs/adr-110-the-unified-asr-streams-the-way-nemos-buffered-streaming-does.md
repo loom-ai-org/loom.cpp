@@ -94,7 +94,7 @@ Option **3**. `infer` is unchanged.
 
   None of it is live on this 2-core CPU; the card's own advice is a shorter left context (2 to 3 s) for speed.
   A GPU run has not been done.
-* Publishing needs a re-export on an engine with the door, rc21 or later. The published file gives the same
+* Publishing needs a re-export on an engine with the door, 1.0.0 or later. The published file gives the same
   text in one call, and the live door refuses it.
 
 ## Related

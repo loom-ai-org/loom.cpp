@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-11-17
+last_updated: 2026-11-18
 ---
 
 # Epic-05: Edge CPU Performance
@@ -4655,7 +4655,7 @@ showed why. The Vega 3 computes 1 / 4 / 8 rows in 2.17 / 2.35 / 2.56 ms, but dow
 logits a row for the host's argmax added ~1 ms a row (10.1 ms a call at 8 rows). The joint wrapper
 now ends in `argmax(-1)`, which lowers to a new engine primitive, `ARGMAX` (`ggml_argmax`: each row
 over ne[0], I32). A call downloads 4 ids. The exporter lowers MIL `reduce_argmax` over the last axis
-only, and refuses any other. `OP_FIRST_RUNTIME` marks `ARGMAX` as needing `loom-py-rt` 1.0.0rc21, so a
+only, and refuses any other. `OP_FIRST_RUNTIME` marks `ARGMAX` as needing `loom-py-rt` 1.0.0, so a
 republished Zipformer waits for that release.
 
 **Why 4.** About one frame in three emits (546 symbols, ~1500 frames), so a long block mostly computes

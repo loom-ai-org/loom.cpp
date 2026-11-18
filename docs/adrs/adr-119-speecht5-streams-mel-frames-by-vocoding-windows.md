@@ -70,7 +70,7 @@ The postnet and HiFi-GAN are both non-causal but local. A sample of frame t read
   ready after 1.7 s and the whole takes 24.8 s (RTF 1.18). The margins cost: each window carries 68 frames
   (1.1 s) beyond its piece, and the vocoder is ~30% of a one pass. Fixed pieces of 32, 64, 128 and 256
   frames streamed at RTF 1.69, 1.42, 1.20 and 1.09, so the growth stops at 256 rather than at Soprano's 1 s.
-* Re-export needed: the driver is in the GGUF. Publishing waits for an rc21+ engine, like the other
+* Re-export needed: the driver is in the GGUF. Publishing waits for a 1.0.0+ engine, like the other
   streamed re-exports. No engine change.
 
 ## Related
