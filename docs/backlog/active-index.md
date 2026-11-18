@@ -168,10 +168,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 * [ ] **Paradee-8M v1.3: publish after 1.0.0 (F32 + Q8_0_PC; voices by name and the `kokoro` text style
   need loom-py 1.0.0)** (built 2026-11-18; every duration upstream's, 56-67 dB from it; Q8_0_PC keeps ALBERT
   in float, which English needs).
-* [ ] **The recurrent sweep runs a graph per timestep on every CPU thread** (Paradee on the Pi 4: 0.49x
-  onnxruntime at F32; the synthesis takes 1.50 s at four threads, 1.14 s at two, 1.55 s at one). Options: run
-  the cell graphs on fewer threads than the rest, or take the input projection `W_ih x` for every timestep in
-  one GEMM before the sweep. Reaches every BiLSTM/GRU family (Kokoro, StyleTTS2, AuroraTTS, pyannote).
   *Context: [ADR-135](../adrs/adr-135-paradee-reuses-kokoros-phases-and-carries-its-voices-as-rows.md)*
 * [ ] **Re-publish sanoTTS, vocetta2 and AuroraTTS with 1.0.0** so they draw their noise in the engine
   (verified on re-exports: 8.2e-7 at most, the card gate passes; ADR-134).

@@ -617,6 +617,42 @@ int default_cpu_thread_count() {
     return physical_core_count();
 }
 
+int recurrent_cpu_thread_count() {
+    const char* env = std::getenv("LOOM_RECURRENT_THREADS");
+    if (env != nullptr && *env != '\0') {
+        const int n = std::atoi(env);
+        if (n > 0) return n;
+    }
+    return 1;
+}
+
+namespace {
+
+ggml_backend_set_n_threads_t cpu_thread_setter(ggml_backend_t backend) {
+    if (backend == nullptr) return nullptr;
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) return nullptr;
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) return nullptr;
+    return reinterpret_cast<ggml_backend_set_n_threads_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads"));
+}
+
+} // namespace
+
+ScopedCpuThreads::ScopedCpuThreads(ggml_backend_t backend, int n) {
+    auto set = cpu_thread_setter(backend);
+    if (set == nullptr || n <= 0) return;
+    set(backend, n);
+    backend_ = backend;
+}
+
+ScopedCpuThreads::~ScopedCpuThreads() {
+    if (backend_ == nullptr) return;
+    const int n = default_cpu_thread_count();
+    cpu_thread_setter(backend_)(backend_, n > 0 ? n : GGML_DEFAULT_N_THREADS);
+}
+
 void add_backend_search_path(const std::string& dir) {
     // An empty path is not a directory, and ggml would resolve it to one anyway -- it joins the search
     // path with the filename, so "" means the current directory rather than nothing. Dropping it here

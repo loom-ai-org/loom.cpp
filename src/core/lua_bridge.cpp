@@ -1073,6 +1073,13 @@ void LoomLuaBridge::cell_sweep(LoomLuaBridge* self, const std::string& module_na
     }
     std::vector<float> layer_input(src.by_ref ? 0 : input_dim);
 
+    // The cell graphs on `recurrent_cpu_thread_count()` threads (one by default), for the sweep only: each
+    // step's compute would otherwise create and join a thread pool for a matrix-vector product (see
+    // `recurrent_cpu_thread_count`). Both backends, because a cell on a GPU primary can still fall back
+    // to the CPU for an op the GPU lacks; the guard ignores anything that is not a CPU.
+    ScopedCpuThreads cell_threads(mod.backends.primary, recurrent_cpu_thread_count());
+    ScopedCpuThreads cell_threads_fallback(mod.backends.fallback, recurrent_cpu_thread_count());
+
     for (uint32_t step = 0; step < seq_len; ++step) {
         // `reverse` walks timesteps backward through the SAME (forward-ordered) sequence, writing each
         // result to its own real time index `t` -- mirroring BiLstmStepper::run's own backward pass
