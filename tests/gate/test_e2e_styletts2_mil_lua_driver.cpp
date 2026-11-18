@@ -87,7 +87,14 @@ int main() {
         // `duration_style_concat`: the style vector DurationEncoder concatenates into every row is a
         // graph now rather than Lua row surgery, and one phase serves all four of its call sites
         // (ADR-031's follow-up).
-        LOOM_CHECK(model_mil->topology_names().size() == 30);
+        // An export with projected BiLSTMs (ADR-137) also carries one `<name>_input` topology per BiLSTM,
+        // six; one from before has none. Either is a complete file, anything else is not.
+        size_t projections = 0;
+        for (const std::string& name : model_mil->topology_names()) {
+            if (name.size() > 6 && name.compare(name.size() - 6, 6, "_input") == 0) ++projections;
+        }
+        LOOM_CHECK(projections == 0 || projections == 6);
+        LOOM_CHECK(model_mil->topology_names().size() == 30 + projections);
 
         bridge.load_script(driver_script);
 

@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: text-frontend
-last_updated: 2026-11-17
+last_updated: 2026-11-18
 ---
 
 # Epic-07: Text Front-Ends and Tokenizers
@@ -41,6 +41,11 @@ glossary), which role tags cannot, so the file ships a `translation_prompt` driv
 **A phoneme style may bring its own front end.** tiny-voca declares `dizione`: loom-py's door runs
 dizione itself when it is installed, cut into sentences as the reference cuts them, and otherwise folds
 the default G2P's IPA into dizione's inventory ([ADR-133](../adrs/adr-133-tiny-voca-renders-its-pulse-train-in-the-driver-and-speaks-a-sentence-at-a-time.md)).
+Paradee declares `kokoro`, Kokoro's own pipeline's conventions: misaki for English when it is installed,
+Paradee's Apache-2.0 G2P for Hindi, French and Spanish when it is, and otherwise the default G2P run
+between punctuation marks (it drops them; the model reads them) and folded per language. Its voices each
+speak one language, declared beside them (`loom.tts.voice_languages`), so the voice picks the G2P
+([ADR-135](../adrs/adr-135-paradee-reuses-kokoros-phases-and-carries-its-voices-as-rows.md)).
 
 **A family the table does not cover raises a named error rather than mis-tokenizing.** That is what
 turns "add a tokenizer" into a bounded job instead of a mystery, and it is the pattern to keep.

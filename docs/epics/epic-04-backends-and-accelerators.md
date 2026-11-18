@@ -1413,7 +1413,7 @@ conv-state caches, retained outputs and inputs into the CPU's buffer type (`stat
 by the QPUs through per-call copies. A node the pool refuses at compute time runs on the CPU, a
 `VC4_Q8` weight as its Q8_0 copy in `CPU_ARMV6_I8`.
 
-**Measured** (Pi Zero W, fourteen models, [BENCHMARKS](../BENCHMARKS.md#raspberry-pi-zero-w-cpu-against-cpuvc4)):
+**Measured** (Pi Zero W, fifteen models, [BENCHMARKS](../BENCHMARKS.md#raspberry-pi-zero-w-cpu-against-cpuvc4)):
 1.06x (sanoTTS heart-nano) to 3.37x (VITS) over the CPU alone, Pocket TTS 1.27-1.35x; outputs as the CPU's
 within the QPUs' non-IEEE rounding.
 

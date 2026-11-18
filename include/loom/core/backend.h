@@ -136,6 +136,30 @@ std::vector<DeviceInfo> available_devices();
 // topology could not be read: a platform with no branch here, or a container with no sysfs.
 int default_cpu_thread_count();
 
+// How many CPU threads a recurrent sweep's per-timestep cell graphs run on: `$LOOM_RECURRENT_THREADS`, else 1.
+//
+// A sweep computes one small graph per timestep (an LSTM cell is a 4H x (in + H) matrix-vector product and
+// a few elementwise ops), and ggml's CPU backend, holding no threadpool, CREATES one for every compute and
+// joins it after (`ggml_graph_compute`'s disposable pool) -- so N threads cost N - 1 thread creations per
+// timestep for work one core does in microseconds. Paradee's six BiLSTMs are ~1480 such graphs: on the Pi 4
+// the whole synthesis took 1.50 s at four threads, 1.14 s at two and 1.55 s at one, before this. A thread
+// count changes no number here: ggml splits a product's ROWS across threads, never its reduction.
+int recurrent_cpu_thread_count();
+
+// The CPU backend's thread count set to `n` for this object's lifetime, then put back to the engine's own
+// (`default_cpu_thread_count()`, or ggml's default where that is 0). A no-op on any backend that is not a
+// CPU, or for n <= 0.
+class ScopedCpuThreads {
+public:
+    ScopedCpuThreads(ggml_backend_t backend, int n);
+    ~ScopedCpuThreads();
+    ScopedCpuThreads(const ScopedCpuThreads&) = delete;
+    ScopedCpuThreads& operator=(const ScopedCpuThreads&) = delete;
+
+private:
+    ggml_backend_t backend_ = nullptr;
+};
+
 // Owns the backends a `Backends` points at. One per host process is the intended shape: the backends it
 // initializes are process-wide resources (a Vulkan device and queue, a CPU thread pool), and every
 // GgufModel, cache and GraphBuilder built against it holds its handles without owning them, so it must
