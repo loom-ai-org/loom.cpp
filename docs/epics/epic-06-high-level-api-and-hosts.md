@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: host-api
-last_updated: 2026-11-16
+last_updated: 2026-11-17
 ---
 
 # Epic-06: The High-Level API and Its Hosts
@@ -75,6 +75,12 @@ clip's transcript to the text and passes the clip, the joined ids and the join
 (`waveform`/`text_ids`/`n_ref_text`): loom-py's `text2speech.infer(text, reference=, reference_text=)`
 and `loom_cli --wav --ref-text` build the same three. A model that does not declare it is refused
 rather than handed a clip it would ignore.
+
+OmniVoice declares `"transcript"` instead ([ADR-131](../adrs/adr-131-omnivoice-ships-as-one-file-and-streams-a-text-chunk-at-a-time.md)):
+the host passes the clip, the transcript's ids and the text's ids as three inputs (`waveform`, `ref_text`,
+`tokens`), and the driver joins them the reference's way. A voice is optional there, so no reference is
+not an error. It also declares `loom.tts.instruct`: loom-py's `instruct=` describes a voice in words
+("female, low pitch, british accent"), validated by the driver against the model's own list.
 
 ### Codec pairs in `loom_cli`
 
@@ -360,6 +366,7 @@ the text classifiers distilbert-ner and punctuate-all (whole text in, labels out
 | lfm2.5-audio-1.5b-tts | exact up to one ISTFT hop: detokenizer is LFM2 with a causal window of 30, then a 'same' ISTFT | **per frame: built** (ADR-115): the detokenizer over windows from its 97-row receptive field back, 480 samples held for the next frame's overlap; pieces of 1, 2, 4, then 8 frames; 1.6e-06 from `infer`; publishes on rc21+ |
 | fun-cosyvoice3-0.5b | reference's streaming mode: the flow re-run per hop under a chunk mask, HiFT over all the mel with the last 8 frames withheld | **per hop: built** (ADR-112): the estimator takes chunk ids, the stream joins to `infer` `streaming = 1` (mel 9.1e-4), not to the full-attention default (~5 apart); publishes on rc21+ |
 | chatterbox | generic: S3Gen keeps CosyVoice2's `finalize` look-ahead hook (broken as shipped: the mask is not trimmed), but no loop; the `S3GenStreamer` its docstring names is not shipped; flow attends over everything | **per hop: built** (ADR-117): CosyVoice2's re-run loop, hops of 25, 50, then 100 tokens with 3 of look-ahead; HiFT re-run over all the mel, its last 20 frames held; the mel 1.3e-05 from the same loop in PyTorch and a mean 0.085 from `infer` (another noise draw: 0.378); publishes on rc21+ |
+| omnivoice | reference: none; upstream generates a long text (estimated > 30 s) in 15 s chunks, each its own 32-step masked-diffusion run, decoded alone and cross-faded; no audio exists before a run's last step | **per chunk: built** (ADR-131): the one pass's chunk loop cut per chunk, so every code is the one pass's; each piece silence-trimmed and levelled on its own (the one pass does both once over the joined audio); `chunk_threshold`/`chunk_duration` for earlier pieces |
 | dia-1.6b, musicgen-small | generic: AR codes, non-causal codec (DAC, EnCodec 32 kHz `use_causal_conv: false`) | **built** (dia ADR-103, musicgen-small ADR-104): the talker hands back a frame once every delayed channel has reached it; DAC decodes windows with 16 frames of context each side, which its receptive field makes one call's result to f32 rounding; EnCodec windows its convolutions (3 frames before the LSTM, 1 after) and carries the LSTM's h and c |
 | speecht5-tts | generic: AR mel frames, HiFi-GAN over a window | **per few frames: built** (ADR-119): the postnet + HiFi-GAN over windows holding their 34-frame receptive field either side; pieces of 2, 4, ... then 256 frames; 9.7e-05 from `infer` on a 21 s text; publishes on rc21+ |
 | kokoro-82m, vits-piper-en-gb-miro, matcha-tts-ljspeech, styletts2-ljspeech, f5-tts-v1-base, supertonic-2, sanotts, vocetta2-276k, vocetta2-500k, vocetta2-1m, vaniq-edge, auroratts-100k | generic: non-AR, the whole utterance at once; sentence by sentence (Kokoro's own `KPipeline` yields per chunk) | host only: **built** in loom-py (`text2speech.stream`, `exact=False`): the text split, each sentence's audio yielded |

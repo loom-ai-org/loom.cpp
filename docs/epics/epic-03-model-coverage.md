@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-11-16
+last_updated: 2026-11-17
 ---
 
 # Epic-03: Model Coverage
@@ -52,6 +52,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **TTS — tiny distilled students** | sanoTTS: 26 piperlite voices (0.51M-1.83M, 14 languages) and 2 nano voices (heart, heart-nano), from upstream's GPL scripts in a pinned clone ([ADR-070](../adrs/adr-070-a-gpl-upstream-is-a-reference-not-a-dependency.md)); Vocetta2 276K / 500K / 1M (the nano line re-trained, MIT); AuroraTTS-100K (a BiGRU and a harmonic-plus-noise DSP synthesizer, no neural vocoder) | `sanotts_export.py`, `vocetta2_export.py`, `auroratts_export.py` |
 | **TTS — mel AR + HiFi-GAN** | SpeechT5 (`microsoft/speecht5_tts` + `speecht5_hifigan`) | `speecht5_export.py`, `speecht5_voices.py` |
 | **TTS — LM hidden rows + Vocos** | Soprano-1.1-80M (text front end: the reference's regexes run by `loom::PyRegex`, [ADR-067](../adrs/adr-067-a-regex-rule-table-ships-its-reference-patterns.md)) | `soprano_export.py` |
+| **TTS — masked diffusion over codec codes** | OmniVoice (k2-fsa, 600+ languages: a bidirectional Qwen3-0.6B unmasking eight HiggsAudio-v2 codebooks in 32 steps, the codec's decoder and its encoder in the same file; voice design and cloning; [ADR-131](../adrs/adr-131-omnivoice-ships-as-one-file-and-streams-a-text-chunk-at-a-time.md)) | `omnivoice_export.py` |
 | **TTS — LM + depthformer codes + LFM2 detokenizer** | LFM2.5-Audio-1.5B (text to speech, four voices as voice files) | `lfm25_audio_export.py`, `lfm25_audio_voices.py` |
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
 | **Audio classification / embedding** | TitaNet-large (speaker embedding), MarbleNet frame VAD, Silero VAD v6, ECAPA-TDNN VoxLingua107 (language id), pyannote segmentation-3.0 | `audio_classification_export.py` |
