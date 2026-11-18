@@ -45,7 +45,8 @@ synthesis (input 192-224, 4H = 384, ~1 480 steps), and 0.98 s of Kokoro's 18.2 s
 * Paradee on the Pi 4: F32 0.764 -> 0.709 s, Q8_0_PC 0.679 -> 0.667 s, so 1.05x and 1.22x onnxruntime
   ([BENCHMARKS](../BENCHMARKS.md#raspberry-pi-4), footnote 6). Kokoro on the Pi 4, the same export
   projected against unprojected: 18.24 -> 17.35 s (1.05x, 3 paired rounds). Dev box: Kokoro 7.5 -> 6.8 s,
-  Paradee 283 -> 261 ms.
+  Paradee 283 -> 261 ms. Paradee on the Pi Zero (one core, so ADR-136 did nothing there): CPU Q8_0_PC 15.73 ->
+  14.88 s, CPU+VC4 11.83 -> 11.48 s.
 * Outputs move by rounding only. Kokoro's audio is 89.8 dB from the unprojected export (the 16-bit WAV's
   floor), with the same length. Paradee's gate is 63.6-67.2 dB from upstream, as before, and its WER is
   unchanged at both precisions. StyleTTS2's driver gate RMS moved by 2e-5 relative.

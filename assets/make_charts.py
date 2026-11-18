@@ -37,7 +37,7 @@ PIZERO = [  # model, task, CPU RTF, CPU+VC4 RTF
     ("Pocket TTS 2m", "TTS", 1.84, 1.39),
     ("VITS piper (miro)", "TTS", 5.70, 1.69),
     ("tiny-voca", "TTS", 2.44, 1.95),   # 2026-11-17, ADR-134; footnote 1 of that section
-    ("Paradee 1.3", "TTS", 2.69, 2.02),   # 2026-11-18, ADR-135; footnote 4 of that section
+    ("Paradee 1.3", "TTS", 2.54, 1.96),   # 2026-11-18, ADR-135/137; footnote 4 of that section
     ("Pocket TTS 7m", "TTS", 3.94, 2.92),
     ("Pocket TTS 18m", "TTS", 4.85, 3.82),
 ]
