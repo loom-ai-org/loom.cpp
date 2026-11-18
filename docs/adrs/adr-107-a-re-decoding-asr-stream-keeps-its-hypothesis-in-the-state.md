@@ -86,4 +86,4 @@ Transcript **2**, encoder **2**.
 * `update_seconds` trades how fresh the partial text is against cost, and does not change the final
   transcript.
 * Publishing needs a re-export (the encoder's new input and the stream functions) on an engine with this
-  door, which is rc21 or later.
+  door, which is 1.0.0 or later.

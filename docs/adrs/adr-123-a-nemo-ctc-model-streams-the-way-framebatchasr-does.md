@@ -99,7 +99,7 @@ which writes one graph). Every phase reads the same weights, so the file grows b
   (RTF 0.129), Citrinet-256-ls 12.1x (RTF 0.083), Citrinet-1024 1.75x (RTF 0.572). Each buffer is 2.5x its
   chunk at the default, so each second of audio is encoded 2.5 times.
 * The exporter's gate snapshots of these three files move: new graphs, and the one pass renamed. Publishing
-  needs a re-export on an engine with the door, rc21 or later. The published files give the same text in one
+  needs a re-export on an engine with the door, 1.0.0 or later. The published files give the same text in one
   call, and the live door refuses them.
 
 ## Related

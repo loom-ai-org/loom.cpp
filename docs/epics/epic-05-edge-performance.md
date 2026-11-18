@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-11-15
+last_updated: 2026-11-18
 ---
 
 # Epic-05: Edge CPU Performance
@@ -30,7 +30,11 @@ three plausible explanations, each argued convincingly from the source, were eac
 percent or less. Reasoning from code lost three times in a row before anything was built.
 
 **What it cannot see:** fusion (fusion changes a convolution's *neighbours*, not the convolution), and
-anything inside a single op. When the op is the suspect, phase-time inside it.
+anything inside a single op. When the op is the suspect, phase-time inside it. **Nor the driver:** it
+times graphs only, so a per-sample Lua loop is invisible to it. tiny-voca spent 44% of a Pi 4 run in two
+such loops while its gap was being chased in the graph
+([Retro-108](../retros/retro-108-a-node-profile-cannot-see-the-driver.md)): wrap the driver's `loom.*`
+calls in a wall clock first.
 
 ### Where the time actually went
 
@@ -1636,8 +1640,8 @@ else is on it**, and to about 9% when it is not. The dev box (Ryzen 3 3250U, AVX
 
 | | |
 |---|---|
-| Decisions | [ADR-014](../adrs/adr-014-patch-ggml-rather-than-write-kernels.md), [ADR-017](../adrs/adr-017-no-k-quants.md), [ADR-075](../adrs/adr-075-quantized-weights-reach-ggmls-repack-by-placement-and-routing.md), [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md), [ADR-077](../adrs/adr-077-static-int8-for-citrinet-256-on-the-pi-zero.md), [ADR-078](../adrs/adr-078-runfast-on-armv6-compute-threads.md), [ADR-105](../adrs/adr-105-x86-without-avx2-sse-paths-and-runfast.md), [ADR-079](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md), [ADR-081](../adrs/adr-081-the-exporter-pads-weight-axes-to-what-the-kernels-need.md), [ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md) (a guidance pair as one batch of two) |
-| Retros | [Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md), [Retro-011](../retros/retro-011-chasing-the-gemm-and-convolution-gap.md), [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md), [Retro-014](../retros/retro-014-the-text-encoder-was-in-the-graph-twice.md), [Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md), [Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md), [Retro-019](../retros/retro-019-a-patch-measured-on-one-isa.md), [Retro-020](../retros/retro-020-a-knob-measured-at-one-thread.md), [Retro-025](../retros/retro-025-the-arm-that-ran-second-paid-for-the-first.md), [Retro-085](../retros/retro-085-the-f32-card-was-slow-because-of-its-dead-channels.md), [Retro-086](../retros/retro-086-qemu-matches-the-board-only-where-the-vfp-never-bounces.md), [Retro-087](../retros/retro-087-a-worst-error-check-passed-a-nan.md) |
+| Decisions | [ADR-014](../adrs/adr-014-patch-ggml-rather-than-write-kernels.md), [ADR-017](../adrs/adr-017-no-k-quants.md), [ADR-075](../adrs/adr-075-quantized-weights-reach-ggmls-repack-by-placement-and-routing.md), [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md), [ADR-077](../adrs/adr-077-static-int8-for-citrinet-256-on-the-pi-zero.md), [ADR-078](../adrs/adr-078-runfast-on-armv6-compute-threads.md), [ADR-105](../adrs/adr-105-x86-without-avx2-sse-paths-and-runfast.md), [ADR-079](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md), [ADR-081](../adrs/adr-081-the-exporter-pads-weight-axes-to-what-the-kernels-need.md), [ADR-118](../adrs/adr-118-chatterbox-runs-each-guidance-pair-as-one-batch-of-two.md) (a guidance pair as one batch of two), [ADR-134](../adrs/adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md) (per-sample driver loops into the graph and the engine) |
+| Retros | [Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md), [Retro-011](../retros/retro-011-chasing-the-gemm-and-convolution-gap.md), [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md), [Retro-014](../retros/retro-014-the-text-encoder-was-in-the-graph-twice.md), [Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md), [Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md), [Retro-019](../retros/retro-019-a-patch-measured-on-one-isa.md), [Retro-020](../retros/retro-020-a-knob-measured-at-one-thread.md), [Retro-025](../retros/retro-025-the-arm-that-ran-second-paid-for-the-first.md), [Retro-085](../retros/retro-085-the-f32-card-was-slow-because-of-its-dead-channels.md), [Retro-086](../retros/retro-086-qemu-matches-the-board-only-where-the-vfp-never-bounces.md), [Retro-087](../retros/retro-087-a-worst-error-check-passed-a-nan.md), [Retro-108](../retros/retro-108-a-node-profile-cannot-see-the-driver.md), [Retro-109](../retros/retro-109-a-cropped-view-passed-the-vc4-fusion-matcher.md) |
 | Active tasks | [Backlog → Performance](../backlog/active-index.md#engine--performance) |
 
 ## 4. The Record
@@ -4651,7 +4655,7 @@ showed why. The Vega 3 computes 1 / 4 / 8 rows in 2.17 / 2.35 / 2.56 ms, but dow
 logits a row for the host's argmax added ~1 ms a row (10.1 ms a call at 8 rows). The joint wrapper
 now ends in `argmax(-1)`, which lowers to a new engine primitive, `ARGMAX` (`ggml_argmax`: each row
 over ne[0], I32). A call downloads 4 ids. The exporter lowers MIL `reduce_argmax` over the last axis
-only, and refuses any other. `OP_FIRST_RUNTIME` marks `ARGMAX` as needing `loom-py-rt` 1.0.0rc21, so a
+only, and refuses any other. `OP_FIRST_RUNTIME` marks `ARGMAX` as needing `loom-py-rt` 1.0.0, so a
 republished Zipformer waits for that release.
 
 **Why 4.** About one frame in three emits (546 symbols, ~1500 frames), so a long block mostly computes

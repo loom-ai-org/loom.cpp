@@ -130,7 +130,7 @@ What a stream must equal was measured in PyTorch before choosing:
   first run fed the LM text ids that were int32 bytes read as floats (denormals near 1e-43). The first
   sign was a flow grid four tokens short, 30 lines of driver later.
 * Re-export needed: the estimator gains an input, and a file exported before this has no `stream_open`.
-  Publishing waits for an rc21+ engine like the other streamed re-exports.
+  Publishing waits for a 1.0.0+ engine like the other streamed re-exports.
 
 ## Amendment 2026-11-12: a seed is the same take both ways
 

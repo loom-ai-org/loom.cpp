@@ -79,4 +79,4 @@ Door **3**, Silero **2**.
 * **The door is ready for the other frame rows.** MarbleNet and WakeHuBERT need only a driver, and pyannote
   needs its windows. Each one is a re-export.
 * A file exported before this ADR keeps its one-pass doors. Publishing the live path means a re-export on an
-  engine that has `FrameStream`, which is rc21 or later.
+  engine that has `FrameStream`, which is 1.0.0 or later.

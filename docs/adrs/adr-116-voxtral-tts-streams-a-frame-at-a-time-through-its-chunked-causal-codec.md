@@ -59,7 +59,7 @@ of it before the first sample.
   file's load: the first 80 ms after 0.19-0.22 s; the whole 5.44 s clip 4.7 s streamed against 4.5-4.8 s in
   one pass, so the stream costs nothing measurable there and runs faster than real time.
 * Re-export needed: the driver is in the GGUF (85 s and 32 GB of RAM on the workstation). Publishing waits
-  for an rc21+ engine like the other streamed re-exports. No engine change.
+  for a 1.0.0+ engine like the other streamed re-exports. No engine change.
 
 ## Related
 
