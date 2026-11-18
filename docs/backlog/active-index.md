@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **Republish Zipformer small, and publish Zipformer small streaming, after 1.0.0rc21 (P4.53 needs `ARGMAX`)** | `zipformer-small-streaming` is built and verified (2026-11-08, [Epic-03](../epics/epic-03-model-coverage.md#zipformer-small-streaming-the-chunk-loop-in-the-driver)); its joint is the same block-4 `ARGMAX` one, so it publishes with the republish.  P4.49-P4.54 are merged (loom.cpp #112, loom-exporter #74, 2026-11-06). The published `zipformer-small-loom` is the rc20 export: it still runs the joint once per frame. A fresh export has the block-4 joint ending in `ARGMAX`, which no runtime before `loom-py-rt` 1.0.0rc21 has (`OP_FIRST_RUNTIME`). Full 60 s transcription with it: dev-box CPU 7.39 -> 6.61 s, Vega 3 8.00 -> 5.66 s, Intel iGPU 2.70 -> 1.62 s, M1 CPU 1.36 -> 1.09 s, Metal 1.44 -> 1.09 s. After rc21: export, gate, republish. [Epic-05](../epics/epic-05-edge-performance.md#p449-p453--zipformers-encoder-is-slower-than-pytorchs--scoped-2026-11-05) |
+| **Republish Zipformer small, and publish Zipformer small streaming, after 1.0.0 (P4.53 needs `ARGMAX`)** | `zipformer-small-streaming` is built and verified (2026-11-08, [Epic-03](../epics/epic-03-model-coverage.md#zipformer-small-streaming-the-chunk-loop-in-the-driver)); its joint is the same block-4 `ARGMAX` one, so it publishes with the republish.  P4.49-P4.54 are merged (loom.cpp #112, loom-exporter #74, 2026-11-06). The published `zipformer-small-loom` is the rc20 export: it still runs the joint once per frame. A fresh export has the block-4 joint ending in `ARGMAX`, which no runtime before `loom-py-rt` 1.0.0 has (`OP_FIRST_RUNTIME`). Full 60 s transcription with it: dev-box CPU 7.39 -> 6.61 s, Vega 3 8.00 -> 5.66 s, Intel iGPU 2.70 -> 1.62 s, M1 CPU 1.36 -> 1.09 s, Metal 1.44 -> 1.09 s. After 1.0.0: export, gate, republish. [Epic-05](../epics/epic-05-edge-performance.md#p449-p453--zipformers-encoder-is-slower-than-pytorchs--scoped-2026-11-05) |
 | **Republish lfm2-350m-modular with its caches** | The published file re-feeds the whole sequence every token, and its unfused attention went wrong at exactly 64 tokens (the `op_repeat` heal, fixed 2026-11-16). The fresh export decodes against the KV and conv-state caches like the monolithic one: HF's greedy text on three prompts to 96 tokens, the stream gate's 75 checks on it, 3.3 s where the published file takes 8.9 s for 18 tokens on the dev box. It has no REPEAT and no op newer than the monolithic file's, so it runs on rc20 too. Export, gate, republish with the release. [KV-CACHE.md 2.2b](../KV-CACHE.md) |
 | **LiteRT thread (2026-10-11): int8 is where XNNPACK's case is. The queue, in the user's order** | Results: Engine — performance, the XNNPACK item. ~~**(1) Q4 arm**~~ **DONE 2026-10-11** (the XNNPACK item's "4-bit" block): Q4_0 is slower than Q8_0 in ggml except on ARMv6; ggml's own Q4_0 repack matches XNNPACK `qb4w` on the M1; `qb4w` wins 1.5-1.9x only where no repack applies (A72); XNNPACK's 4-bit is slower than its int8 everywhere; `qb4w` cannot take Q4_0 blocks as-is (positive BF16 scales only). ~~**(2) `CPU_REPACK` in the engine**~~ **DONE 2026-10-11, opt-in** ([ADR-075](../adrs/adr-075-quantized-weights-reach-ggmls-repack-by-placement-and-routing.md), `LOOM_CPU_REPACK=1|kleidiai`): on the M1, whisper-small 1.24-1.54x and Qwen3-0.6B decode 1.34-1.56x at one thread, 1.02-1.07x at 8 (memory-bound); KleidiAI best for Q8_0 prefill (1.53x) but 0.83x on Q8_0 decode at one thread. Whether it becomes the default is the open item under Engine — performance. ~~**(3) ADR: the XNNPACK microkernel bridge**~~ **WRITTEN 2026-10-11, proposed** ([ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md)): a ggml patch adding a `CPU_XNNPACK` buffer type built like KleidiAI's, with only the selected per-ISA `qd8` kernels vendored and run on ggml's own threads; weights as row-uniform Q8_0 (`--quantize Q8_0_PC`), which every backend still reads as plain Q8_0 and the bridge packs losslessly; first cut `mul_mat` on Q8_0 only; main case the A72 (2.4-2.7x at the GEMM), then x86 Q8_0. ~~**(4) ADR: static int8 (qs8)**~~ **WRITTEN 2026-10-11, proposed** ([ADR-077](../adrs/adr-077-static-int8-for-citrinet-256-on-the-pi-zero.md)): the RTF ~1.5 estimate was taken against the wrong baseline and is withdrawn. Against the F32 conv sweep Citrinet actually runs (0.22 GOP/s), XNNPACK `qs8` (0.54-0.62 on ARMv6) gives RTF ~1.8; even an infinitely fast GEMM leaves 0.82. So real time needs the non-GEMM 24% faster too, and an ARMv6 int8 GEMM ~2x XNNPACK's. Its four gates in order: split the 24% by op on the board; an ARMv6 int8 GEMM >= 1.2 GOP/s; WER; jfk on the board. ~~**(5) Port XNNPACK's softmax**~~ **PORTED 2026-10-13 as `ggml-0029`** (the `SOFT_MAX` item): one thread, dense/causal, x86 1.45x/2.05x, Pi 4 2.10x/2.14x, M1 1.54x/1.71x, Pi Zero 1.46x/1.15x; accuracy kept by a grouped f64 sum. CosyVoice3's free-running gate failed on it; a control showed it measures chaos, mel and ASR held on two more fixtures, and its bound is now 6e-2. ~~**(6) Fix ggml's F32 GEMM throughput at large K**~~ **PATCHED 2026-10-13 as `ggml-0030`, aarch64 only, bit-identical** (the large-K item): Pi 4 K=3072 1.35x at 1 thread, 1.41x at 4. Original: (whisper `fc2`, K=3072, runs at half the rate of K=768 on the Pi 4 and the Pi Zero, not on the M1). Find where the drop starts by sweeping K, then fix the K blocking. It also hits Qwen3-0.6B's `down_proj` (the large-K item). The gemma-3 "KV leak" was not one ([Retro-084](../retros/retro-084-a-sampler-was-logged-as-a-leaking-cache.md)). The LiteRT steps 1-2 (ADR-072, ADR-073), the T5 encoder bias (ADR-074) and the pad_crop retirement are released in 1.0.0-rc18 (loom.cpp #77/#78, loom-exporter #57). |
 | **Raspberry Pi 4 after P4.35-P4.40 (merged 2026-10-24)** | The Pi 4 table ([BENCHMARKS.md](../BENCHMARKS.md#raspberry-pi-4)), re-run on main `159f4cb` + `ggml-0053`, has VITS F32 against onnxruntime at **1.34x** (was 1.03x) and 5.03x `Q8_0_PC` (was 3.90x), Citrinet F32 0.65x (was 0.61x), whisper-small 1.00x F32 (unresolved) and 1.17x `Q8_0_PC`, and rows for the distilled Pocket TTS models (18m/7m/2m at RTF 0.50/0.27/0.13 F32, Q8_0_PC 1.68x/1.21x/1.03x faster). The largest shares of a VITS synthesis left on the board (profile after P4.40, 2.49 s of node time): the flow and text encoder's im2col convolutions at 286 positions, 17%; the vocoder's staged convolutions, 27% over three stages; and the resblock-sum ADDs at 73 216 x 32 and 18 304 x 64, 13% at memory speed. [Epic-05](../epics/epic-05-edge-performance.md#p440-vitss-vocoder-convolutions-on-the-raspberry-pi-4-2026-10-23) |
@@ -149,31 +149,31 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Models
 
-* [ ] **OmniVoice: publish after rc21, then a GPU run and the rest of its door** (built 2026-11-17, F32,
+* [ ] **OmniVoice: publish after 1.0.0, then a GPU run and the rest of its door** (built 2026-11-17, F32,
   CC-BY-NC weights). Its export needs exporter + engine changes from `feat/omnivoice` (dense ATTENTION,
   last-axis max, POOL_1D on a permuted input), so the file needs the next engine. Open: a card, a Q8_0
   arm, the 5090 (both guidance halves are one sequence, so it should batch well), `class_temperature > 0`
   sampling, and upstream's opt-in text normalization. *Context:
   [ADR-131](../adrs/adr-131-omnivoice-ships-as-one-file-and-streams-a-text-chunk-at-a-time.md)*
-* [ ] **PLaMo 3 translate 0.8B: publish after rc21, a Q8_0 arm, a loom_cli door** (built 2026-11-17, F32
+* [ ] **PLaMo 3 translate 0.8B: publish after 1.0.0, a Q8_0 arm, a loom_cli door** (built 2026-11-17, F32
   3.3 GB, PLaMo Community License). Needs the engine's `PlamoVocab`. Open: a Q8_0 file and its
   quality/speed against F32; `loom_cli` has no translate flag yet (loom-py's `text2text.translate` is the
   door); a long-context run past the 2,048 window (the gate's prompts are under 100 ids). *Context:
   [ADR-132](../adrs/adr-132-plamo-translates-through-a-prompt-its-driver-builds.md)*
-* [ ] **tiny-voca: publish after rc21 (F32 + Q8_0_PC, with `phonemizer/` beside the GGUF; the files need
+* [ ] **tiny-voca: publish after 1.0.0 (F32 + Q8_0_PC, with `phonemizer/` beside the GGUF; the files need
   an engine with `loom.aten_randn` to draw the noise in C++, an older one runs the Lua), and its STFT
   precision** (the waveform is 2.1e-3 from upstream at f64 where upstream's own f32 is 5.7e-4: 512-tap
   convolutions summed in f32). *Context: [ADR-133](../adrs/adr-133-tiny-voca-renders-its-pulse-train-in-the-driver-and-speaks-a-sentence-at-a-time.md),
   [ADR-134](../adrs/adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md)*
-* [ ] **Re-publish sanoTTS, vocetta2 and AuroraTTS with rc21** so they draw their noise in the engine
+* [ ] **Re-publish sanoTTS, vocetta2 and AuroraTTS with 1.0.0** so they draw their noise in the engine
   (verified on re-exports: 8.2e-7 at most, the card gate passes; ADR-134).
   *Context: [ADR-134](../adrs/adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md)*
-* [ ] **Nine published files abort on a Pi Zero's VC4 under `device="auto"` on every released engine,
-  until one with the Retro-109 fix ships (rc21)**: sanoTTS heart-nano, all six vocetta2 files, VITS piper
-  miro, Vaniq-edge F32. The files are fine and need no re-export; their cards could say
-  `GGML_VC4_FUSE=0` (or `LOOM_DEVICE=cpu`) meanwhile, which runs them on the unfixed engine. The README's
-  Pi Zero VITS row names the rc18-era files it measured (md5 `3f25d02d`/`6e095a95`), not the Hub's padded
-  `84389cfc`. *Context: [Retro-109](../retros/retro-109-a-cropped-view-passed-the-vc4-fusion-matcher.md)*
+* [ ] **1.0.0 release notes: the VC4 fix (Retro-109).** Nine published files aborted on a Pi Zero's VC4
+  under `device="auto"` on every release up to 1.0.0rc20: sanoTTS heart-nano, the six vocetta2 files, VITS
+  piper miro, Vaniq-edge F32. 1.0.0 runs them. Their cards say `GGML_VC4_FUSE=0` for rc20 and earlier
+  (Hub, 2026-11-18; the card builder's `vc4_fuse_off`). The README's Pi Zero VITS row names the rc18-era
+  files it measured (md5 `3f25d02d`/`6e095a95`), not the Hub's padded `84389cfc`.
+  *Context: [Retro-109](../retros/retro-109-a-cropped-view-passed-the-vc4-fusion-matcher.md)*
 * [ ] **Audit the other uses of `log_softmax` in traced wrappers.** coremltools lowers it as
   `log(softmax)`, which is -inf for a token whose probability underflows. That is harmless before an
   argmax and NaN the moment two such rows are subtracted. *Context:
@@ -418,7 +418,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   hand-kept list, and an op missing from it fails silently with a literal axis. That has cost three
   models: EnCodec, SenseVoice, and VoxCPM2 via `loom_rms_norm` (fixed on exporter branch
   `fix/rms-norm-axis-walk`). A CI test should fail when a `loom_*` dialect op is neither known to the
-  walk nor declared opaque. Also: the rc21 VoxCPM2 re-export must come from an exporter with that fix.
+  walk nor declared opaque. Also: the 1.0.0 VoxCPM2 re-export must come from an exporter with that fix.
   *Context: [Retro-106](../retros/retro-106-a-wider-fusion-reached-a-walk-that-did-not-know-its-op.md)*
 
 ## Engine — correctness
@@ -1106,7 +1106,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   ([ADR-130](../adrs/adr-130-an-encoder-decoder-token-stream-keeps-its-per-call-context-in-the-state.md): the cross
   K/V and source length kept in the stream state; the published file, which the door took for a causal LM, is now
   refused). **Every row of the survey is built** (the user chose flan-t5 alone for the per-call-context loops,
-  2026-11-15). Every stack is merged (2026-11-15). What is left: each row publishes after a re-export on the rc21+ engine.
+  2026-11-15). Every stack is merged (2026-11-15). What is left: each row publishes after a re-export on the 1.0.0+ engine.
   Not built unless asked: diart's full diarization (needs a speaker-embedding export), LFM2.5-Audio's
   interleaved speech-to-speech mode (turn-based, not full duplex; its ASR and TTS halves already stream),
   the streaming checkpoints on disk outside the zoo
@@ -1127,7 +1127,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Packaging & release
 
-* [ ] **rc21 release notes: the layout guesses.**
+* [ ] **1.0.0 release notes: the layout guesses.**
   1. `op_repeat`'s guard (loom.cpp #128) fixes grouped-query attention at `n_tokens == head_dim`, with
      no re-export. Published files measured before -> after:
      * Audio8's codec at 64 frames: 0.73 -> 7e-7;

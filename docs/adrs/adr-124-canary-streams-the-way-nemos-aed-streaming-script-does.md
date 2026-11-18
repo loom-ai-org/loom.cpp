@@ -113,7 +113,7 @@ Option **3**. `infer` and its 10-id prompt are unchanged.
   same. AlignAtt at 10/1/0.5 emits from 6.1 s, a phrase per chunk.
 * **Speed** (dev box CPU, F32): about 0.3 to 0.55x real time on jfk. Every step re-runs the 14 s encoder for
   1 to 2 s of audio. A GPU run has not been done.
-* Publishing needs a re-export on an engine with the door, rc21 or later. The published file gives the same
+* Publishing needs a re-export on an engine with the door, 1.0.0 or later. The published file gives the same
   text in one call, and the live door refuses it.
 
 ## Related

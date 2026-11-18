@@ -111,7 +111,7 @@ Option **3**, chosen by the user over a VAD-cut or local-agreement scheme for th
 * The gated exports predate one comment fix in the fragment (a stale constant name); the driver's code is
   byte-for-byte the committed one.
 * The exporter's gate snapshots of these two files move: the driver script only. Publishing needs a
-  re-export on an engine with the door, rc21 or later.
+  re-export on an engine with the door, 1.0.0 or later.
 
 ## Related
 

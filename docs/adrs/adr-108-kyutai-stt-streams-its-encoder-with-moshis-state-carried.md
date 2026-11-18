@@ -81,7 +81,7 @@ Encoder **2**, RVQ **2**. `infer` is unchanged.
   Before the fused RVQ, the 34 RVQ calls cost 80-98 ms per push, more than a frame lasts, and the F32 stream was
   RTF 5.05. Neither file is live on this 2-core CPU.
 * Publishing needs a re-export (three new graphs and the stream functions) on an engine with ARGMAX and the door,
-  which is rc21 or later. The published rc11 file gives the same ids in one call, and the live door refuses it.
+  which is 1.0.0 or later. The published rc11 file gives the same ids in one call, and the live door refuses it.
 
 ## Related
 
