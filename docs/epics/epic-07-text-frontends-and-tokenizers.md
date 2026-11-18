@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: text-frontend
-last_updated: 2026-10-25
+last_updated: 2026-11-17
 ---
 
 # Epic-07: Text Front-Ends and Tokenizers
@@ -30,6 +30,13 @@ case-transition shape: its letter alternatives split "HelloWorld" at the case ch
 rank of the merged bytes with no merge list, and it neither NFC-normalizes nor splits on its markers --
 all three tiktoken's ([ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md);
 12000/12000 against `mistral_common`).
+
+`loom::PlamoVocab` (`"plamo"`, PLaMo 3) is no BPE at all: a unigram with integer-rounded scores
+decoded by Viterbi, the longer piece winning a tie, byte fallback, and hard boundaries around
+`<|plamo:...|>` tags and long runs of spaces or of one character -- the reference's Aho-Corasick walk,
+as a plain DP ([ADR-132](../adrs/adr-132-plamo-translates-through-a-prompt-its-driver-builds.md)). A
+driver's `loom.tokenize` reaches it too. Its chat template carries arguments (`target_lang`, a
+glossary), which role tags cannot, so the file ships a `translation_prompt` driver function instead.
 
 **A family the table does not cover raises a named error rather than mis-tokenizing.** That is what
 turns "add a tokenizer" into a bounded job instead of a mystery, and it is the pattern to keep.
