@@ -19,7 +19,7 @@ PI4 = [  # model, task, F32 vs onnxruntime FP32, Q8_0_PC vs onnxruntime int8
     ("whisper-small", "ASR", 1.00, 1.17),
     ("Citrinet-256", "ASR", 0.65, 9.31),
     ("tiny-voca", "TTS", 1.30, 1.81),   # 2026-11-17, ADR-134; int8 per second of audio (footnote 4)
-    ("Paradee 1.3", "TTS", 0.97, 1.20),   # 2026-11-18, ADR-135/136 (footnote 6)
+    ("Paradee 1.3", "TTS", 1.05, 1.22),   # 2026-11-18, ADR-135/136/137 (footnote 6)
 ]
 
 # docs/BENCHMARKS.md, "Raspberry Pi Zero W: CPU against CPU+VC4": real-time factor of each device's

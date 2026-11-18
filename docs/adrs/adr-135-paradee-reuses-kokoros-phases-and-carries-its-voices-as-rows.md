@@ -84,10 +84,11 @@ Kokoro's voices in four languages: one learned row per voice in each half's styl
   Quantized F0 moves the running phase, so the Q8 waveform is judged by ASR, not by SNR.
 * A file needs loom-py 1.0.0 for the `kokoro` style and for voices by name. Its ops are all rc18's.
 * **On the boards** ([BENCHMARKS](../BENCHMARKS.md#raspberry-pi-4), 2026-11-18, 5.85 s of speech): on the Pi 4,
-  loom takes 0.76 s (F32) and 0.68 s (Q8_0_PC), and upstream's ONNX files in onnxruntime take 0.74 and 0.81 s, so
-  0.97x and 1.20x. It was 1.51 and 1.29 s until the recurrent sweep ran its cells on one thread
-  ([ADR-136](adr-136-a-recurrent-sweep-runs-its-cells-on-one-thread.md)); Paradee's six BiLSTMs are about 1 480
-  per-timestep graphs. On the Pi Zero, CPU 15.73 s and CPU+VC4 11.83 s (Q8_0_PC both), 1.33x. The VC4's output drifts in phase from the CPU's (18.7 dB, spectra equal), and
+  loom takes 0.71 s (F32) and 0.67 s (Q8_0_PC), and upstream's ONNX files in onnxruntime take 0.74 and 0.82 s, so
+  1.05x and 1.22x. It was 1.51 and 1.29 s until the recurrent sweep ran its cells on one thread
+  ([ADR-136](adr-136-a-recurrent-sweep-runs-its-cells-on-one-thread.md)), Paradee's six BiLSTMs being about 1 480
+  per-timestep graphs, and each BiLSTM's input half became one product before the sweep
+  ([ADR-137](adr-137-a-bilstms-input-half-is-one-product-before-the-sweep.md)). On the Pi Zero, CPU 15.73 s and CPU+VC4 11.83 s (Q8_0_PC both), 1.33x. The VC4's output drifts in phase from the CPU's (18.7 dB, spectra equal), and
   whisper hears every arm as the sentence.
 
 Word error rate through the door, whisper-small, 2026-11-18: 20 held-out English sentences (10 for
