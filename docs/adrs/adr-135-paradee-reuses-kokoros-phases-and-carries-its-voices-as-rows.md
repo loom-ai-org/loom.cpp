@@ -40,7 +40,10 @@ Kokoro's voices in four languages: one learned row per voice in each half's styl
    each end, which is upstream's interpolation between frame centres with no slice of a dynamic axis.
    Outer products are K = 1 matmuls, since ggml broadcasts only the second operand. STFTs are
    convolutions with upstream's own constant bases. The noise is `aten_randn` (ADR-134), and its reverse
-   feeds the 3 ms path.
+   feeds the 3 ms path. The harmonics are tiny-voca's closed form, `sin(K t/2) sin((K+1) t/2) / sin(t/2)`
+   with theta centred, K counted per F0 frame by upstream's own `k * f0 < 11000` test. Against upstream's
+   sum in f64 it is 1.5e-4 off where the 64-row f32 sum was 2.7e-4. It took a dev-box synthesis of 5.85 s
+   from 470 to 362 ms (1.30x), and the gate's SNRs did not move.
 3. **The voices are rows the file carries.** The two style tables go into the GGUF. The driver's `voice`
    input is the row, and `loom.tts.voices` names the rows. Each voice speaks one language, so
    `loom.tts.voice_languages` (new, engine contract and binding) declares it beside the voice.
@@ -63,8 +66,8 @@ Kokoro's voices in four languages: one learned row per voice in each half's styl
   are not.
 * **Reusing `misaki` as the declared style.** Vocetta2 declares it and the fold is English-only: it turns
   `r` into `ɹ` and drops `ʰ` and `ː`, which are Spanish's trill and Hindi's aspiration and length.
-* **The closed-form harmonic sum** tiny-voca uses. It is cheaper, but upstream sums 64 sines with a
-  per-harmonic mute, and the direct sum is upstream's arithmetic. It is left as a speed item.
+* **Upstream's 64-row sine sum.** It was the first export, and it cost a [64, samples] SIN, outer product
+  and reduction (~15% of a profiled synthesis). It was replaced by the closed form (decision 2).
 
 ## Consequences
 

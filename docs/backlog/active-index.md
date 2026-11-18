@@ -168,8 +168,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 * [ ] **Paradee-8M v1.3: publish after 1.0.0 (F32 + Q8_0_PC; voices by name and the `kokoro` text style
   need loom-py 1.0.0), then its speed** (built 2026-11-18; every duration upstream's, 56-67 dB from it;
   Q8_0_PC keeps ALBERT in float, which English needs).
-  Open: the 64-sine bank is summed directly, as upstream does, where tiny-voca's closed form would be
-  cheaper; Pi rows were not measured. *Context: [ADR-135](../adrs/adr-135-paradee-reuses-kokoros-phases-and-carries-its-voices-as-rows.md)*
+  *Context: [ADR-135](../adrs/adr-135-paradee-reuses-kokoros-phases-and-carries-its-voices-as-rows.md)*
 * [ ] **Re-publish sanoTTS, vocetta2 and AuroraTTS with 1.0.0** so they draw their noise in the engine
   (verified on re-exports: 8.2e-7 at most, the card gate passes; ADR-134).
   *Context: [ADR-134](../adrs/adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md)*
