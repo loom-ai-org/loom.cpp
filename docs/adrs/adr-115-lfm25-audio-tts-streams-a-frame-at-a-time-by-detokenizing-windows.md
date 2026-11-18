@@ -74,7 +74,7 @@ library to match beyond that.
   34.6 s against 33.9 s for the one pass (the windows cost ~2%), 8.3e-07 from `infer` (9.3e-07 at
   `piece_frames=3`). The stream cannot be faster than the LM, so it is live only on faster hardware; no GPU run
   yet, as for most streams.
-* Re-export needed: the driver is in the GGUF. Publishing waits for an rc21+ engine like the other streamed
+* Re-export needed: the driver is in the GGUF. Publishing waits for a 1.0.0+ engine like the other streamed
   re-exports. No engine change; the speech-stream gate learned the BPE text front end.
 
 ## Related

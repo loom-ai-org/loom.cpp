@@ -99,7 +99,7 @@ How the stream reaches a single-graph file:
   front ends); f64 windows cut as the driver cuts equal one call to 1e-12; one frame less context on
   either side moves rows; the toy WakeHuBERT export carries the stream beside the old `infer`.
 * Re-export needed: the driver is in the GGUF. Publishing (all four WakeHuBERT precisions) waits for an
-  rc21+ engine.
+  1.0.0+ engine.
 
 ## Related
 

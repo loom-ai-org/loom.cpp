@@ -28,9 +28,9 @@ checkpoint and it runs everywhere loom does.
 
 ## Highlights
 
-* 🚀 **Faster than onnxruntime on a Raspberry Pi 4.** loom's int8 beats onnxruntime's int8 on six of
-  the seven models measured, by **1.2x to 9.3x**, and matches it on tiny-voca. At F32 it is ahead on four,
-  level on whisper and behind on Citrinet and tiny-voca ([charts below](#performance)).
+* 🚀 **Faster than onnxruntime on a Raspberry Pi 4.** loom's int8 beats onnxruntime's int8 on all
+  seven models measured, by **1.2x to 9.3x**. At F32 it is ahead on five, level on whisper and behind
+  on Citrinet ([charts below](#performance)).
 * 🍓 **Real time on a Raspberry Pi Zero.** Wake-word features, voice activity, tiny TTS voices and
   Citrinet ASR all run faster than real time on the Zero W's single 1 GHz ARM11 core with 512 MB of RAM,
   and its GPU's 12 QPUs make them **1.1x to 3.4x faster still**: a Piper-size voice too, with them.
@@ -97,18 +97,18 @@ output length. **A bar past the dashed line means loom is faster**:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/charts/pi4-vs-onnxruntime-dark.svg">
-  <img alt="Raspberry Pi 4: loom against onnxruntime. F32: VITS 1.34x, Pocket TTS 2.06x, Qwen3 1.06x, Moonshine 1.13x, whisper 1.00x, Citrinet 0.65x, tiny-voca 0.77x. Int8: VITS 5.03x, Pocket TTS 3.27x, Qwen3 3.45x, Moonshine 1.75x, whisper 1.17x, Citrinet 9.31x, tiny-voca 1.01x." src="assets/charts/pi4-vs-onnxruntime-light.svg" width="760">
+  <img alt="Raspberry Pi 4: loom against onnxruntime. F32: VITS 1.36x, Pocket TTS 2.06x, Qwen3 1.06x, Moonshine 1.13x, whisper 1.00x, Citrinet 0.65x, tiny-voca 1.30x. Int8: VITS 5.04x, Pocket TTS 3.27x, Qwen3 3.45x, Moonshine 1.75x, whisper 1.17x, Citrinet 9.31x, tiny-voca 1.81x." src="assets/charts/pi4-vs-onnxruntime-light.svg" width="760">
 </picture>
 
 | Raspberry Pi 4, 4 threads | loom F32 | onnxruntime FP32 | loom int8 | onnxruntime int8 |
 |---|---|---|---|---|
-| VITS Piper en-GB · TTS, 3.3 s of speech | **0.80 s** | 1.07 s | **0.82 s** | 4.12 s |
+| VITS Piper en-GB · TTS, 3.3 s of speech | **0.80 s** | 1.08 s | **0.82 s** | 4.14 s |
 | Pocket TTS · TTS, 4.8 s of speech¹ | **9.11 s** | 18.77 s | **4.25 s** | 13.88 s |
 | Qwen3-0.6B · 24 tokens | **16.6 s** | 17.6 s | **4.15 s** | 14.28 s |
 | Moonshine tiny · ASR, 11 s clip | **1.34 s** | 1.50 s | **0.85 s** | 1.49 s |
 | whisper-small · ASR, 11 s clip | 20.7 s | 20.6 s | **12.5 s** | 14.7 s |
 | Citrinet-256 · ASR, 11 s clip | 0.45 s | **0.29 s**² | **0.46 s** | 4.30 s² |
-| tiny-voca · TTS, 5.4 s of speech | 0.67 s | **0.52 s** | 0.63 s³ | 0.64 s³ |
+| tiny-voca · TTS, 5.4 s of speech | **0.40 s** | 0.52 s | **0.35 s**³ | 0.64 s³ |
 
 The tiny models run below real time even on a Pi Zero, and the Zero's GPU speeds every one of them
 up: on a board booted without `vc4-kms-v3d`, `device="auto"` runs the convolutions and matrix products on
@@ -116,23 +116,23 @@ its 12 QPUs ([ggml-vc4](backends/ggml-vc4/)) and the rest on the CPU.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/charts/pi-zero-rtf-dark.svg">
-  <img alt="Raspberry Pi Zero W real-time factors, CPU then CPU plus VC4: WakeHuBERT 0.17, 0.12; Silero VAD 0.18, 0.16; sanoTTS heartnano 0.22, 0.19; sanoTTS heart 0.54, 0.29; Citrinet-256 0.65, 0.31; sanoTTS thorsten 0.72, 0.35; sanoTTS amy 2.30, 0.69; Moonshine tiny 1.80, 1.17; Conformer-CTC small 1.90, 1.39; Pocket TTS 2m 1.84, 1.39; VITS piper 5.83, 1.74; tiny-voca 2.99, 2.57; Pocket TTS 7m 3.94, 2.92; Pocket TTS 18m 4.85, 3.82." src="assets/charts/pi-zero-rtf-light.svg" width="760">
+  <img alt="Raspberry Pi Zero W real-time factors, CPU then CPU plus VC4: WakeHuBERT 0.17, 0.12; Silero VAD 0.18, 0.16; sanoTTS heartnano 0.18, 0.17; sanoTTS heart 0.52, 0.27; Citrinet-256 0.65, 0.31; sanoTTS thorsten 0.72, 0.35; sanoTTS amy 2.30, 0.69; Moonshine tiny 1.80, 1.17; Conformer-CTC small 1.90, 1.39; Pocket TTS 2m 1.84, 1.39; VITS piper 5.70, 1.69; tiny-voca 2.44, 1.95; Pocket TTS 7m 3.94, 2.92; Pocket TTS 18m 4.85, 3.82." src="assets/charts/pi-zero-rtf-light.svg" width="760">
 </picture>
 
 | Raspberry Pi Zero W | audio | CPU | CPU + VC4 | speedup |
 |---|---|---|---|---|
 | WakeHuBERT tiny · wake word | 11.0 s | 1.83 s | **1.36 s** | 1.34x |
 | Silero VAD | 11.0 s | 1.99 s | **1.74 s** | 1.15x |
-| sanoTTS heartnano · TTS | 3.06 s | 0.67 s | **0.57 s** | 1.17x |
-| sanoTTS heart · TTS | 3.18 s | 1.71 s | **0.92 s** | 1.85x |
+| sanoTTS heartnano · TTS | 3.06 s | 0.56 s | **0.53 s** | 1.06x |
+| sanoTTS heart · TTS | 3.18 s | 1.65 s | **0.87 s** | 1.89x |
 | Citrinet-256 · ASR | 11.0 s | 7.14 s | **3.38 s** | 2.11x |
 | sanoTTS thorsten (de) · TTS | 4.40 s | 3.17 s | **1.53 s** | 2.07x |
 | sanoTTS amy · TTS | 5.90 s | 13.54 s | **4.08 s** | 3.32x |
 | Moonshine tiny · ASR | 11.0 s | 19.77 s | **12.90 s** | 1.53x |
 | Conformer-CTC small · ASR | 3.0 s | 5.70 s | **4.16 s** | 1.37x |
 | Pocket TTS 2m · TTS | 4.80 s | 8.85 s | **6.66 s** | 1.33x |
-| VITS Piper en-GB · TTS | 3.39 s | 19.77 s | **5.88 s** | 3.36x |
-| tiny-voca · TTS | 5.39 s | 16.15 s | **13.85 s** | 1.16x |
+| VITS Piper en-GB · TTS | 3.39 s | 19.38 s | **5.73 s** | 3.37x |
+| tiny-voca · TTS | 5.39 s | 13.20 s | **10.48 s** | 1.25x |
 | Pocket TTS 7m · TTS | 4.80 s | 18.91 s | **14.04 s** | 1.35x |
 | Pocket TTS 18m · TTS | 4.80 s | 23.27 s | **18.33 s** | 1.27x |
 
@@ -146,7 +146,7 @@ before each one. Both engines did the same work: the same samples, transcripts a
 ¹ Against the community ONNX export [`KevinAHM/pocket-tts-onnx`](https://huggingface.co/KevinAHM/pocket-tts-onnx),
 since there is no official one. ² onnxruntime is timed from precomputed mel features; loom's time includes
 its front end. ³ Each engine's int8 duration head moves a few frames, so the two make 1% different lengths
-of audio: level per second of speech. The onnxruntime side is upstream's own ONNX file.</sub>
+of audio: 1.81x per second of speech. The onnxruntime side is upstream's own ONNX file.</sub>
 
 ## Supported models
 

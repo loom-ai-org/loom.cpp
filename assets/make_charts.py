@@ -12,13 +12,13 @@ OUT = Path(__file__).resolve().parent / "charts"
 
 # docs/BENCHMARKS.md, "Raspberry Pi 4": onnxruntime time / loom time, 4 threads, paired medians.
 PI4 = [  # model, task, F32 vs onnxruntime FP32, Q8_0_PC vs onnxruntime int8
-    ("VITS (piper)", "TTS", 1.34, 5.03),
+    ("VITS (piper)", "TTS", 1.36, 5.04),
     ("Pocket TTS", "TTS", 2.06, 3.27),
     ("Qwen3-0.6B", "LM", 1.06, 3.45),
     ("Moonshine tiny", "ASR", 1.13, 1.75),
     ("whisper-small", "ASR", 1.00, 1.17),
     ("Citrinet-256", "ASR", 0.65, 9.31),
-    ("tiny-voca", "TTS", 0.77, 1.01),   # 2026-11-17; int8 per second of audio (footnote 4)
+    ("tiny-voca", "TTS", 1.30, 1.81),   # 2026-11-17, ADR-134; int8 per second of audio (footnote 4)
 ]
 
 # docs/BENCHMARKS.md, "Raspberry Pi Zero W: CPU against CPU+VC4": real-time factor of each device's
@@ -26,16 +26,16 @@ PI4 = [  # model, task, F32 vs onnxruntime FP32, Q8_0_PC vs onnxruntime int8
 PIZERO = [  # model, task, CPU RTF, CPU+VC4 RTF
     ("WakeHuBERT tiny", "wake word", 0.17, 0.12),
     ("Silero VAD", "VAD", 0.18, 0.16),
-    ("sanoTTS heartnano", "TTS", 0.22, 0.19),
-    ("sanoTTS heart", "TTS", 0.54, 0.29),
+    ("sanoTTS heartnano", "TTS", 0.18, 0.17),   # 2026-11-17 re-measure, footnote 2 of that section
+    ("sanoTTS heart", "TTS", 0.52, 0.27),       # 2026-11-17 re-measure, footnote 2 of that section
     ("Citrinet-256", "ASR", 0.65, 0.31),
     ("sanoTTS thorsten (de)", "TTS", 0.72, 0.35),
     ("sanoTTS amy", "TTS", 2.30, 0.69),
     ("Moonshine tiny", "ASR", 1.80, 1.17),
     ("Conformer-CTC small", "ASR", 1.90, 1.39),
     ("Pocket TTS 2m", "TTS", 1.84, 1.39),
-    ("VITS piper (miro)", "TTS", 5.83, 1.74),
-    ("tiny-voca", "TTS", 2.99, 2.57),   # 2026-11-17, footnote 1 of that section
+    ("VITS piper (miro)", "TTS", 5.70, 1.69),
+    ("tiny-voca", "TTS", 2.44, 1.95),   # 2026-11-17, ADR-134; footnote 1 of that section
     ("Pocket TTS 7m", "TTS", 3.94, 2.92),
     ("Pocket TTS 18m", "TTS", 4.85, 3.82),
 ]
@@ -93,7 +93,7 @@ def pi4_chart(t):
 
 
 def pizero_chart(t):
-    w, left, right, row, top, scale = 760, 200, 56, 46, 96, 6.0   # Pocket TTS 18m's CPU bar is 4.85, VITS's 5.85
+    w, left, right, row, top, scale = 760, 200, 56, 46, 96, 6.0   # Pocket TTS 18m's CPU bar is 4.85, VITS's 5.70
     h = top + row * len(PIZERO) + 40
     span = w - left - right
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',

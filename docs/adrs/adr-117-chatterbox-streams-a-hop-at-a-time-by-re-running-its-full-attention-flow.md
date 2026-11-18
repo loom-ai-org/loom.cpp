@@ -105,7 +105,7 @@ Two things differ from CosyVoice3 (ADR-112):
   that one's allocation plan, and the CPU conv fusion's overlap check made HiFT round two ways
   ([Retro-105](../retros/retro-105-a-graph-laid-out-by-the-graph-before-it.md)). `GraphBuilder` now plans
   every rebuild for its own graph; `test_graph_layout_is_its_own` holds it (12 of 22 nodes move without it).
-* Re-export needed: the driver is in the GGUF. Publishing waits for an rc21+ engine like the other streamed
+* Re-export needed: the driver is in the GGUF. Publishing waits for a 1.0.0+ engine like the other streamed
   re-exports, and this one needs the allocation fix too: on an older engine its interleaved streams can
   differ from themselves at 1e-07.
 

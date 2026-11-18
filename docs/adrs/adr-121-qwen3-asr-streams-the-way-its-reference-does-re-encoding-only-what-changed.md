@@ -143,4 +143,4 @@ Option **3**. `infer` is unchanged.
 * **The one-pass gate had gone stale.** `test_e2e_qwen3_asr_mil_export` compared the whole answer to fixtures
   holding only the transcript since 6cc57ea, and passed 52 of 80 ids. The generator now writes the transcript
   ids (`ref_asr_transcript.npy`) and the gate compares those: 81/81 on the new and the published files.
-* Re-export required (rc21+); the published file keeps its one pass and has no live path.
+* Re-export required (1.0.0+); the published file keeps its one pass and has no live path.

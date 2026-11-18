@@ -92,7 +92,7 @@ cut). A re-export adds driver code only. `infer` is unchanged.
   new audio, which is the reference's design. A GPU run has not been done.
 * **Parakeet's buffer is bounded by the encoder phase's traced range (20 s)**, so the script's long-file
   recipe (10/10/5, 25 s) is refused. Raising `MAX_SECONDS` is a re-export, if anyone asks.
-* Publishing needs a re-export on an engine with the door, rc21 or later. The published files give the same
+* Publishing needs a re-export on an engine with the door, 1.0.0 or later. The published files give the same
   text in one call, and the live door refuses them.
 * **CTC and Canary are not this.** They are separate rows with their own references (see Context).
 

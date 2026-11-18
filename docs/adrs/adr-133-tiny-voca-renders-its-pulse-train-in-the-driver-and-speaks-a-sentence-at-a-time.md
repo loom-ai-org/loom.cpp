@@ -8,6 +8,12 @@ supersedes: []
 
 # ADR-133: tiny-voca Renders Its Pulse Train in the Driver and Speaks a Sentence at a Time
 
+> **Amended by [ADR-134](adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md)
+> (2026-11-17):** the pulse train no longer renders in the driver. Option 1's float32 graph, measured,
+> costs nothing once the driver sends a float64 phase per frame and theta is centred (94 dB from
+> upstream). The noise is drawn by the engine. The rest of this decision stands; the Pi 4 numbers below
+> are the ones before the amendment.
+
 Serves [Epic-03](../epics/epic-03-model-coverage.md), [Epic-06](../epics/epic-06-high-level-api-and-hosts.md)
 and [Epic-07](../epics/epic-07-text-frontends-and-tokenizers.md). Follows AuroraTTS's DSP split (its
 phase carried in the driver, `auroratts_export.py`) and [ADR-071](adr-071-a-phoneme-table-declares-its-conventions.md)'s

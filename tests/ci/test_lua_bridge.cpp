@@ -6,6 +6,7 @@
 // test_primitive_registry.cpp. loom.run_subgraph itself is exercised for real only by each model's own
 // Lua-driver e2e test, which needs actual registered modules.
 
+#include <algorithm>
 #include "test_util.h"
 
 #include "loom/loom.h"
@@ -45,6 +46,10 @@ int main() {
 
         function test_scalar_roundtrip(inputs)
             return inputs.x * 2
+        end
+
+        function test_aten_randn(inputs)
+            return loom.aten_randn(inputs.seed, inputs.n)
         end
 
         function test_gaussian(inputs)
@@ -207,6 +212,44 @@ int main() {
             if (std::fabs(arr[i] - expected[i]) > 1e-9) all_match = false;
         }
         LOOM_CHECK(all_match);
+    }
+
+    // --- loom.aten_randn: torch.randn(n, generator=manual_seed(seed)), values from torch 2.8 under
+    //     ATEN_CPU_CAPABILITY=default (ATen's scalar path, which the builtin reproduces). Seed 0 at 17
+    //     exercises the redrawn tail block; 2^32-1 the seed's full 32 bits. The tolerance is for libm:
+    //     on glibc every value is identical, another platform's logf/sinf/cosf may differ by an ulp.
+    {
+        const std::vector<std::pair<std::pair<double, double>, std::vector<double>>> cases = {
+            {{0.0, 17.0}, {-1.1258398294448853, -1.695931315422058, 0.5666505098342896, 0.7935084104537964,
+                           0.5988394618034363, -1.5550950765609741, -0.34136030077934265, 1.85300612449646,
+                           0.46809640526771545, -0.5854971408843994, -0.1733970195055008, 0.18347792327404022,
+                           1.3893661499023438, 1.5863343477249146, 0.946298360824585, -0.8436768054962158,
+                           0.931826651096344}},
+            {{4294967295.0, 33.0}, {-2.664297580718994, -1.0910485982894897, 0.45144736766815186, 0.22836072742938995,
+                                    1.8986179828643799, 1.5642088651657104, -1.2553997039794922, 0.7936442494392395,
+                                    -1.7514946460723877, -0.7096747756004333, 1.218266248703003, 0.22224649786949158,
+                                    -2.5158841609954834, 0.48375222086906433, 0.8417865037918091, 0.1409095972776413,
+                                    1.7933999300003052, 1.7220548391342163, 0.7700403332710266, -1.4820665121078491,
+                                    -0.863675057888031, -0.10301630944013596, -1.2180538177490234, -0.9539583325386047,
+                                    0.7631782293319702, -0.9984314441680908, 0.6818176507949829, -1.1006033420562744,
+                                    1.562240719795227, -1.885819673538208, -1.0488550662994385, -0.7110393047332764,
+                                    0.04037103429436684}},
+        };
+        for (const auto& [args, want] : cases) {
+            const auto result = bridge.call("test_aten_randn", {{"seed", args.first}, {"n", args.second}});
+            const auto& got = std::get<std::vector<double>>(result);
+            LOOM_CHECK(got.size() == want.size());
+            double worst = 0.0;
+            for (size_t i = 0; i < std::min(got.size(), want.size()); ++i) worst = std::max(worst, std::fabs(got[i] - want[i]));
+            LOOM_CHECK(worst <= 1e-6);
+        }
+        bool refused = false;
+        try {
+            bridge.call("test_aten_randn", {{"seed", 0.0}, {"n", 15.0}});
+        } catch (const std::exception&) {
+            refused = true;
+        }
+        LOOM_CHECK(refused);
     }
 
     // --- loom.expand_by_duration: rows=[[1,2],[3,4]] (T=2,C=2), durations=[2,1] ->
