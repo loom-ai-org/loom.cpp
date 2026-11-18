@@ -83,6 +83,12 @@ Kokoro's voices in four languages: one learned row per voice in each half's styl
   float through the exporter's new `float_phases`, because its weights' traced names carry hashes.
   Quantized F0 moves the running phase, so the Q8 waveform is judged by ASR, not by SNR.
 * A file needs loom-py 1.0.0 for the `kokoro` style and for voices by name. Its ops are all rc18's.
+* **On the boards** ([BENCHMARKS](../BENCHMARKS.md#raspberry-pi-4), 2026-11-18, 5.85 s of speech): on the Pi 4,
+  loom takes 1.51 s (F32) and 1.29 s (Q8_0_PC), and upstream's ONNX files in onnxruntime take 0.74 and 0.81 s, so
+  0.49x and 0.63x. Nearly all of loom's time is the six BiLSTMs, swept one timestep per graph (about 1 480 graphs),
+  each on all four threads; two threads take the synthesis to 1.14 s. On the Pi Zero, CPU 15.73 s and CPU+VC4
+  11.83 s (Q8_0_PC both), 1.33x. The VC4's output drifts in phase from the CPU's (18.7 dB, spectra equal), and
+  whisper hears every arm as the sentence.
 
 Word error rate through the door, whisper-small, 2026-11-18: 20 held-out English sentences (10 for
 bf_isabella), and 15 each in French, Spanish and Hindi (CER for Hindi, whose spellings vary). "Own" is

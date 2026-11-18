@@ -1,15 +1,15 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="440" viewBox="0 0 760 440">
-<rect width="760" height="440" rx="10" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="486" viewBox="0 0 760 486">
+<rect width="760" height="486" rx="10" fill="#ffffff"/>
 <text x="20.0" y="30.0" fill="#1f2328" font-size="17" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">Raspberry Pi 4 — loom vs onnxruntime</text>
 <text x="20.0" y="52.0" fill="#59636e" font-size="12" text-anchor="start" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">speedup over onnxruntime 1.28 at the same precision · 4 threads · higher is better</text>
 <text x="170.0" y="72.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">F32 vs onnxruntime FP32</text>
-<line x1="170.0" y1="78" x2="170.0" y2="406" stroke="#d1d9e0" stroke-width="1"/>
-<text x="170.0" y="422.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0x</text>
-<line x1="274.0" y1="78" x2="274.0" y2="406" stroke="#d1d9e0" stroke-width="1"/>
-<text x="274.0" y="422.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">1x</text>
-<line x1="378.0" y1="78" x2="378.0" y2="406" stroke="#d1d9e0" stroke-width="1"/>
-<text x="378.0" y="422.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">2x</text>
-<line x1="274.0" y1="76" x2="274.0" y2="406" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="4 3"/>
+<line x1="170.0" y1="78" x2="170.0" y2="452" stroke="#d1d9e0" stroke-width="1"/>
+<text x="170.0" y="468.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0x</text>
+<line x1="274.0" y1="78" x2="274.0" y2="452" stroke="#d1d9e0" stroke-width="1"/>
+<text x="274.0" y="468.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">1x</text>
+<line x1="378.0" y1="78" x2="378.0" y2="452" stroke="#d1d9e0" stroke-width="1"/>
+<text x="378.0" y="468.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">2x</text>
+<line x1="274.0" y1="76" x2="274.0" y2="452" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="4 3"/>
 <rect x="170.0" y="88.0" width="141.4" height="22" rx="4" fill="#0969da"/>
 <text x="317.4" y="104.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">1.36x</text>
 <rect x="170.0" y="134.0" width="214.2" height="22" rx="4" fill="#0969da"/>
@@ -24,20 +24,22 @@
 <text x="243.6" y="334.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.65x</text>
 <rect x="170.0" y="364.0" width="135.2" height="22" rx="4" fill="#0969da"/>
 <text x="311.2" y="380.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">1.30x</text>
+<rect x="170.0" y="410.0" width="51.0" height="22" rx="4" fill="#0969da"/>
+<text x="227.0" y="426.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.49x</text>
 <text x="460.0" y="72.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">Q8_0_PC vs onnxruntime int8</text>
-<line x1="460.0" y1="78" x2="460.0" y2="406" stroke="#d1d9e0" stroke-width="1"/>
-<text x="460.0" y="422.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0x</text>
-<line x1="512.0" y1="78" x2="512.0" y2="406" stroke="#d1d9e0" stroke-width="1"/>
-<text x="512.0" y="422.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">2x</text>
-<line x1="564.0" y1="78" x2="564.0" y2="406" stroke="#d1d9e0" stroke-width="1"/>
-<text x="564.0" y="422.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">4x</text>
-<line x1="616.0" y1="78" x2="616.0" y2="406" stroke="#d1d9e0" stroke-width="1"/>
-<text x="616.0" y="422.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">6x</text>
-<line x1="668.0" y1="78" x2="668.0" y2="406" stroke="#d1d9e0" stroke-width="1"/>
-<text x="668.0" y="422.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">8x</text>
-<line x1="720.0" y1="78" x2="720.0" y2="406" stroke="#d1d9e0" stroke-width="1"/>
-<text x="720.0" y="422.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">10x</text>
-<line x1="486.0" y1="76" x2="486.0" y2="406" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="4 3"/>
+<line x1="460.0" y1="78" x2="460.0" y2="452" stroke="#d1d9e0" stroke-width="1"/>
+<text x="460.0" y="468.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0x</text>
+<line x1="512.0" y1="78" x2="512.0" y2="452" stroke="#d1d9e0" stroke-width="1"/>
+<text x="512.0" y="468.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">2x</text>
+<line x1="564.0" y1="78" x2="564.0" y2="452" stroke="#d1d9e0" stroke-width="1"/>
+<text x="564.0" y="468.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">4x</text>
+<line x1="616.0" y1="78" x2="616.0" y2="452" stroke="#d1d9e0" stroke-width="1"/>
+<text x="616.0" y="468.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">6x</text>
+<line x1="668.0" y1="78" x2="668.0" y2="452" stroke="#d1d9e0" stroke-width="1"/>
+<text x="668.0" y="468.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">8x</text>
+<line x1="720.0" y1="78" x2="720.0" y2="452" stroke="#d1d9e0" stroke-width="1"/>
+<text x="720.0" y="468.0" fill="#59636e" font-size="11" text-anchor="middle" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">10x</text>
+<line x1="486.0" y1="76" x2="486.0" y2="452" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="4 3"/>
 <rect x="460.0" y="88.0" width="131.0" height="22" rx="4" fill="#bf3989"/>
 <text x="597.0" y="104.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">5.04x</text>
 <rect x="460.0" y="134.0" width="85.0" height="22" rx="4" fill="#bf3989"/>
@@ -52,6 +54,8 @@
 <text x="696.1" y="334.0" fill="#ffffff" font-size="12" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">9.31x</text>
 <rect x="460.0" y="364.0" width="47.1" height="22" rx="4" fill="#bf3989"/>
 <text x="513.1" y="380.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">1.81x</text>
+<rect x="460.0" y="410.0" width="16.4" height="22" rx="4" fill="#bf3989"/>
+<text x="482.4" y="426.0" fill="#1f2328" font-size="12" text-anchor="start" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">0.63x</text>
 <text x="158.0" y="99.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">VITS (piper)</text>
 <text x="158.0" y="113.0" fill="#59636e" font-size="11" text-anchor="end" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">TTS</text>
 <text x="158.0" y="145.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">Pocket TTS</text>
@@ -66,4 +70,6 @@
 <text x="158.0" y="343.0" fill="#59636e" font-size="11" text-anchor="end" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">ASR</text>
 <text x="158.0" y="375.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">tiny-voca</text>
 <text x="158.0" y="389.0" fill="#59636e" font-size="11" text-anchor="end" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">TTS</text>
+<text x="158.0" y="421.0" fill="#1f2328" font-size="13" text-anchor="end" font-weight="600" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">Paradee 1.3</text>
+<text x="158.0" y="435.0" fill="#59636e" font-size="11" text-anchor="end" font-weight="normal" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">TTS</text>
 </svg>

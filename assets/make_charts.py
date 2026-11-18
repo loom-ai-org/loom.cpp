@@ -19,6 +19,7 @@ PI4 = [  # model, task, F32 vs onnxruntime FP32, Q8_0_PC vs onnxruntime int8
     ("whisper-small", "ASR", 1.00, 1.17),
     ("Citrinet-256", "ASR", 0.65, 9.31),
     ("tiny-voca", "TTS", 1.30, 1.81),   # 2026-11-17, ADR-134; int8 per second of audio (footnote 4)
+    ("Paradee 1.3", "TTS", 0.49, 0.63),   # 2026-11-18, ADR-135 (footnote 6)
 ]
 
 # docs/BENCHMARKS.md, "Raspberry Pi Zero W: CPU against CPU+VC4": real-time factor of each device's
@@ -36,6 +37,7 @@ PIZERO = [  # model, task, CPU RTF, CPU+VC4 RTF
     ("Pocket TTS 2m", "TTS", 1.84, 1.39),
     ("VITS piper (miro)", "TTS", 5.70, 1.69),
     ("tiny-voca", "TTS", 2.44, 1.95),   # 2026-11-17, ADR-134; footnote 1 of that section
+    ("Paradee 1.3", "TTS", 2.69, 2.02),   # 2026-11-18, ADR-135; footnote 4 of that section
     ("Pocket TTS 7m", "TTS", 3.94, 2.92),
     ("Pocket TTS 18m", "TTS", 4.85, 3.82),
 ]
