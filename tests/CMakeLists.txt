@@ -185,6 +185,11 @@ set_tests_properties(test_e2e_cosyvoice3_stream PROPERTIES SKIP_RETURN_CODE 77)
 
 # Chatterbox's live stream (ADR-117) against the same re-run loop in PyTorch: its mel, its distance from the
 # one pass, its vocoder's streaming, reset and interleaving. LOOM_CHATTERBOX_STREAM_GGUF + _REF_DIR.
+add_executable(test_e2e_omnivoice gate/test_e2e_omnivoice.cpp)
+target_link_libraries(test_e2e_omnivoice PRIVATE loom::engine)
+add_test(NAME test_e2e_omnivoice COMMAND test_e2e_omnivoice)
+set_tests_properties(test_e2e_omnivoice PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_omnivoice PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_e2e_chatterbox_stream gate/test_e2e_chatterbox_stream.cpp)
 target_link_libraries(test_e2e_chatterbox_stream PRIVATE loom::engine)
 add_test(NAME test_e2e_chatterbox_stream COMMAND test_e2e_chatterbox_stream)
@@ -2174,9 +2179,18 @@ add_executable(test_vc4_qpu_isa ci/test_vc4_qpu_isa.cpp)
 target_include_directories(test_vc4_qpu_isa PRIVATE ${LOOM_VC4_DIR})
 add_test(NAME test_vc4_qpu_isa COMMAND test_vc4_qpu_isa ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/vc4_qpu_golden.hex)
 set_tests_properties(test_vc4_qpu_isa PROPERTIES LABELS ci)
+#
+# **The references must not fuse.** The QPU has no FMA: it rounds the fmul and the fadd apart, and the
+# emulator models exactly that. A reference written `acc + w * v` is one fused multiply-add wherever the
+# compiler targets a CPU with FMA (GCC's `-ffp-contract=fast` is its default), and a bit-exact compare
+# then fails on every accumulation while every value stays inside its float64 bound. That is what
+# GitHub's Ubuntu 26.04 runners did from November 2026 (GCC 15; conv1d_emu and gemm_qb_emu, both
+# reproduced locally with `-march=x86-64-v3` and fixed by this flag). Pinned per target so the contract
+# does not depend on the runner's default `-march`.
 foreach(t test_vc4_gemm_emu test_vc4_gemm_wt_emu test_vc4_conv1d_emu test_vc4_gemm_q8_emu test_vc4_gemm_qb_emu)
     add_executable(${t} ci/${t}.cpp)
     target_include_directories(${t} PRIVATE ${LOOM_VC4_DIR})
+    target_compile_options(${t} PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>)
     add_test(NAME ${t} COMMAND ${t})
     set_tests_properties(${t} PROPERTIES LABELS ci)
 endforeach()
