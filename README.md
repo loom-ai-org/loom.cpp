@@ -97,7 +97,7 @@ output length. **A bar past the dashed line means loom is faster**:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/charts/pi4-vs-onnxruntime-dark.svg">
-  <img alt="Raspberry Pi 4: loom against onnxruntime. F32: VITS 1.36x, Pocket TTS 2.06x, Qwen3 1.06x, Moonshine 1.13x, whisper 1.00x, Citrinet 0.65x, tiny-voca 1.30x, Paradee 0.97x. Int8: VITS 5.04x, Pocket TTS 3.27x, Qwen3 3.45x, Moonshine 1.75x, whisper 1.17x, Citrinet 9.31x, tiny-voca 1.81x, Paradee 1.20x." src="assets/charts/pi4-vs-onnxruntime-light.svg" width="760">
+  <img alt="Raspberry Pi 4: loom against onnxruntime. F32: VITS 1.36x, Pocket TTS 2.06x, Qwen3 1.06x, Moonshine 1.13x, whisper 1.00x, Citrinet 0.65x, tiny-voca 1.30x, Paradee 1.05x. Int8: VITS 5.04x, Pocket TTS 3.27x, Qwen3 3.45x, Moonshine 1.75x, whisper 1.17x, Citrinet 9.31x, tiny-voca 1.81x, Paradee 1.22x." src="assets/charts/pi4-vs-onnxruntime-light.svg" width="760">
 </picture>
 
 | Raspberry Pi 4, 4 threads | loom F32 | onnxruntime FP32 | loom int8 | onnxruntime int8 |
@@ -109,7 +109,7 @@ output length. **A bar past the dashed line means loom is faster**:
 | whisper-small · ASR, 11 s clip | 20.7 s | 20.6 s | **12.5 s** | 14.7 s |
 | Citrinet-256 · ASR, 11 s clip | 0.45 s | **0.29 s**² | **0.46 s** | 4.30 s² |
 | tiny-voca · TTS, 5.4 s of speech | **0.40 s** | 0.52 s | **0.35 s**³ | 0.64 s³ |
-| Paradee 1.3 · TTS, 5.9 s of speech | 0.76 s | **0.74 s** | **0.68 s** | 0.81 s |
+| Paradee 1.3 · TTS, 5.9 s of speech | **0.71 s** | 0.74 s | **0.67 s** | 0.82 s |
 
 The tiny models run below real time even on a Pi Zero, and the Zero's GPU speeds every one of them
 up: on a board booted without `vc4-kms-v3d`, `device="auto"` runs the convolutions and matrix products on
