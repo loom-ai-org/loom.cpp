@@ -1287,21 +1287,36 @@ int LoomLuaBridge::run_recurrent_impl(lua_State* L, bool retain) {
 // A driver that names the wrong one gets a shape error from the consumer, not a wrong answer: a
 // retained copy asserts `ggml_are_same_shape` where marshalling only ever compared element counts.
 int LoomLuaBridge::l_run_bi_recurrent_and_retain(lua_State* L) {
-    const char* fname = "loom.run_bi_recurrent_and_retain";
+    return bi_recurrent_and_retain(L, "loom.run_bi_recurrent_and_retain", /*paired=*/false);
+}
+
+// `loom.run_bi_recurrent_pair_and_retain(fwd, bwd, fwd_seq, bwd_seq, seq_len, input_dim, hidden_dim
+// [, layout])`: the same sweep with a sequence per direction (ADR-137). A projected BiLSTM's cells read
+// their own direction's input projection, `W_ih x + b` -- one product per sequence instead of one per
+// timestep -- so the two directions no longer share a sequence. A NEW name rather than an optional
+// argument on the old one, so a driver that needs it fails on an engine without it instead of feeding
+// the forward projection to both directions.
+int LoomLuaBridge::l_run_bi_recurrent_pair_and_retain(lua_State* L) {
+    return bi_recurrent_and_retain(L, "loom.run_bi_recurrent_pair_and_retain", /*paired=*/true);
+}
+
+int LoomLuaBridge::bi_recurrent_and_retain(lua_State* L, const char* fname, bool paired) {
+    const int k = paired ? 1 : 0;   // every argument after the sequence(s) moves by one
     try {
         auto* self = bridge_from_upvalue(L);
         const std::string fwd_module = luaL_checkstring(L, 1);
         const std::string bwd_module = luaL_checkstring(L, 2);
-        const auto seq_len = static_cast<uint32_t>(luaL_checknumber(L, 4));
-        const auto input_dim = static_cast<uint32_t>(luaL_checknumber(L, 5));
-        const auto hidden_dim = static_cast<uint32_t>(luaL_checknumber(L, 6));
-        const std::string layout = luaL_optstring(L, 7, "rows");
+        const auto seq_len = static_cast<uint32_t>(luaL_checknumber(L, 4 + k));
+        const auto input_dim = static_cast<uint32_t>(luaL_checknumber(L, 5 + k));
+        const auto hidden_dim = static_cast<uint32_t>(luaL_checknumber(L, 6 + k));
+        const std::string layout = luaL_optstring(L, 7 + k, "rows");
         if (layout != "rows" && layout != "layout_a") {
             return luaL_error(L, "%s: layout '%s' -- it is 'rows' ([2*hidden_dim, seq_len], one row "
                                   "per timestep) or 'layout_a' ([seq_len, 2*hidden_dim], time on the "
                                   "fastest axis)", fname, layout.c_str());
         }
         const SequenceSource src = read_sequence_source(self, L, 3, seq_len, input_dim, fname);
+        const SequenceSource bwd_src = paired ? read_sequence_source(self, L, 4, seq_len, input_dim, fname) : src;
 
         const auto it = self->modules_.find(fwd_module);
         if (it == self->modules_.end()) {
@@ -1328,7 +1343,7 @@ int LoomLuaBridge::l_run_bi_recurrent_and_retain(lua_State* L) {
         std::vector<float> h_bwd(hidden_dim, 0.0f), c_bwd(hidden_dim, 0.0f);
         cell_sweep(self, fwd_module, src, seq_len, input_dim, hidden_dim, /*reverse=*/false, fname,
                     sink(0), h_fwd, c_fwd);
-        cell_sweep(self, bwd_module, src, seq_len, input_dim, hidden_dim, /*reverse=*/true, fname,
+        cell_sweep(self, bwd_module, bwd_src, seq_len, input_dim, hidden_dim, /*reverse=*/true, fname,
                     sink(1), h_bwd, c_bwd);
 
         OutputStore* store = nullptr;
@@ -2656,6 +2671,7 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"run_subgraph", &LoomLuaBridge::l_run_subgraph}, {"run_recurrent", &LoomLuaBridge::l_run_recurrent},
         {"run_recurrent_and_retain", &LoomLuaBridge::l_run_recurrent_and_retain},
         {"run_bi_recurrent_and_retain", &LoomLuaBridge::l_run_bi_recurrent_and_retain},
+        {"run_bi_recurrent_pair_and_retain", &LoomLuaBridge::l_run_bi_recurrent_pair_and_retain},
         {"output_shape", &LoomLuaBridge::l_output_shape},
         {"run_ode", &LoomLuaBridge::l_run_ode},
         {"run_ode_and_retain", &LoomLuaBridge::l_run_ode_and_retain},

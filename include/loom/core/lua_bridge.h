@@ -314,6 +314,9 @@ private:
     // them, so the driver pulled both halves back into Lua to build the rows every consumer wants.
     // `layout` picks which axis time runs down; see the definition.
     static int l_run_bi_recurrent_and_retain(lua_State* L);
+    static int l_run_bi_recurrent_pair_and_retain(lua_State* L);
+    // Both bindings' body: `paired` reads a second sequence for the backward direction (ADR-137).
+    static int bi_recurrent_and_retain(lua_State* L, const char* fname, bool paired);
     // Where one recurrent sweep reads its sequence from -- a marshalled array or another module's
     // retained output -- resolved once per call. Defined in the .cpp; nothing outside it needs the
     // shape.
