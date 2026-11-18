@@ -165,6 +165,18 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   precision** (the waveform is 2.1e-3 from upstream at f64 where upstream's own f32 is 5.7e-4: 512-tap
   convolutions summed in f32). *Context: [ADR-133](../adrs/adr-133-tiny-voca-renders-its-pulse-train-in-the-driver-and-speaks-a-sentence-at-a-time.md),
   [ADR-134](../adrs/adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md)*
+* [ ] **A persistent CPU threadpool: measured small on the Pi 4, unmeasured on many cores** (2026-11-18). ggml's CPU
+  backend holds no pool, so every graph compute creates N - 1 threads and joins them. A prototype giving the backend
+  one pool (`ggml_threadpool_new` + `ggml_backend_cpu_set_threadpool` at device open; not committed), paired 3 rounds
+  on the Pi 4 at 4 threads, without/with: VITS 0.993x, Moonshine 1.019x, Qwen3 decode 0.997x, Pocket TTS 1.011x,
+  Paradee 1.004x at poll 50; Qwen3 1.004x and Pocket 1.004x at poll 0. ADR-136 had already taken the case that
+  mattered (a sweep's per-timestep graphs). Open: a many-core x86 box, where a compute creates up to 23 threads
+  (the 24-core workstation), over a graph-per-token or graph-per-frame loop; and what a spinning pool costs the
+  driver's host work there. *Context: [ADR-136](../adrs/adr-136-a-recurrent-sweep-runs-its-cells-on-one-thread.md)*
+* [ ] **Paradee-8M v1.3: publish after 1.0.0 (F32 + Q8_0_PC; voices by name and the `kokoro` text style
+  need loom-py 1.0.0)** (built 2026-11-18; every duration upstream's, 56-67 dB from it; Q8_0_PC keeps ALBERT
+  in float, which English needs).
+  *Context: [ADR-135](../adrs/adr-135-paradee-reuses-kokoros-phases-and-carries-its-voices-as-rows.md)*
 * [ ] **Re-publish sanoTTS, vocetta2 and AuroraTTS with 1.0.0** so they draw their noise in the engine
   (verified on re-exports: 8.2e-7 at most, the card gate passes; ADR-134).
   *Context: [ADR-134](../adrs/adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md)*

@@ -80,6 +80,7 @@ ModelContract ModelContract::read(const GgufModel& model) {
 
     c.default_steps = opt_u32(model, "tts.default_steps");
     c.voices = opt_arr_str(model, "loom.tts.voices");
+    c.voice_languages = opt_arr_str(model, "loom.tts.voice_languages");
 
     // A file that declares no front end but embeds a vocabulary can encode text, and saying so here is
     // not a guess -- the vocabulary either is in the file or is not. This is the ONE inference kept,

@@ -124,6 +124,10 @@ struct ModelContract {
     uint32_t default_steps = 0;
     // Named voices the file carries.
     std::vector<std::string> voices;
+    // The language each of those voices speaks, parallel to `voices` (`loom.tts.voice_languages`), for a
+    // model whose voice decides the G2P (Paradee: each voice is one of Kokoro's, in one language). Empty
+    // when the file does not say, which is every file whose voices share one language.
+    std::vector<std::string> voice_languages;
 
     // The class names a `class`-output model chooses between, INDEXED BY the id its driver returns --
     // `loom.labels`. Empty for every model that is not a classifier, and legitimately empty for one

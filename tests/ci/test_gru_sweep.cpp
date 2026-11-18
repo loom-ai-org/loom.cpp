@@ -60,6 +60,20 @@ int main() {
     }
 
     {
+        // The paired binding (ADR-137): the backward direction sweeps its own sequence. With the forward
+        // one passed twice it is the bidirectional call exactly.
+        auto two = args;
+        two["sequence2"] = json("test.sequence2");
+        const auto got = std::get<std::vector<double>>(session.bridge().call("paired", two));
+        const double w = worst(got, json("test.paired"));
+        std::fprintf(stderr, "paired: %zu values, worst |d| = %.3g\n", got.size(), w);
+        LOOM_CHECK(w < 1e-5);
+        two["sequence2"] = json("test.sequence");
+        const auto same = std::get<std::vector<double>>(session.bridge().call("paired", two));
+        const auto bidi = std::get<std::vector<double>>(session.bridge().call("bidirectional", args));
+        LOOM_CHECK(same == bidi);
+    }
+    {
         const auto got = std::get<std::vector<double>>(session.bridge().call("lstm_forward", args));
         const double w = worst(got, json("test.lstm_forward"));
         std::fprintf(stderr, "lstm_forward: %zu values, worst |d| = %.3g\n", got.size(), w);

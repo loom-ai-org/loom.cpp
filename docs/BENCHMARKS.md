@@ -47,6 +47,7 @@ time. The LM row has no audio, so its time stands alone.
 | Pocket TTS 7m refl (TTS, 4.80 s of audio)³ | 1.275 s (0.27) | — | — | 1.067 s (0.22) | — | — |
 | Pocket TTS 2m refl (TTS, 4.80 s of audio)³ | 0.619 s (0.13) | — | — | 0.593 s (0.12) | — | — |
 | tiny-voca (TTS, 5.39 s of audio)⁴ | 0.397 s (0.07) | 0.515 s (0.10) | **1.30x** | 0.351 s (0.06) | 0.645 s (0.12) | **1.81x** |
+| Paradee 1.3 (TTS, 5.85 s of audio)⁶ | 0.709 s (0.12) | 0.743 s (0.13) | **1.05x** | 0.667 s (0.11) | 0.817 s (0.14) | **1.22x** |
 
 ¹ onnxruntime is timed from NeMo's mel features, computed outside the timer; loom's time includes its front end.
 ² Measured with the rest of each half, and each launch is the mean of 3
@@ -78,6 +79,19 @@ the same audio bit for bit (fnv1a `096eb0d3...`), 0.795 s against 0.797 s, p10-p
 costs nothing here, and the move from 1.34x to 1.36x is within the session-to-session drift of both engines (loom 0.802 s
 to 0.796 s, onnxruntime 1.072 s to 1.084 s). The audio's hash is not October's (`ab001d8d...` at F32): the harness's
 source is October's byte for byte, so the engine has changed since, for the old file and the new alike.
+⁶ Measured on 2026-11-18, in its own session, with footnote ⁴'s protocol (5 paired rounds, cooled to 60 C before every
+arm, each launch the mean of 3 syntheses after an untimed one, median per engine; `scripts/bench_driver.cpp` against
+`scripts/bench_paradee_onnx.py`) on footnote ⁵'s build. The onnxruntime side is upstream's own `onnx/paradee.onnx` and
+`onnx/paradee_int8.onnx` (the int8 file its README says to use). One utterance: misaki's phonemes for footnote ⁴'s
+sentence, 101 Kokoro-vocabulary ids, voice af_heart. Every arm made the same 140 400 samples. Both cells resolve above
+1.00x: F32 p10-p90 1.04-1.06x, Q8_0_PC 1.21-1.23x. The engine is footnote ⁵'s build plus two changes to the BiLSTM sweep
+measured on this row, in order: the cell graphs on one thread
+([ADR-136](adrs/adr-136-a-recurrent-sweep-runs-its-cells-on-one-thread.md)), and each BiLSTM's input half as one product
+before the sweep ([ADR-137](adrs/adr-137-a-bilstms-input-half-is-one-product-before-the-sweep.md)). loom took 1.505 s and
+1.293 s before them (0.49x and 0.63x), 0.764 s and 0.679 s after the first (0.97x and 1.20x), and 0.709 s and 0.667 s after
+both. Q8_0_PC keeps ALBERT at F32 ([ADR-135](adrs/adr-135-paradee-reuses-kokoros-phases-and-carries-its-voices-as-rows.md)).
+The GGUFs are md5 `9a26d78f`/`29bdfb7a`, F32/Q8_0_PC (the Pi Zero row below measured the exports before ADR-137,
+`30d19ce2`/`371c192a`).
 
 * **Both engines did the same work in every pair**, checked by one untimed launch of each arm: the same 73 216 VITS
   samples, the same 24 tokens, and the same transcript at each precision except one word each of Citrinet (loom Q8_0_PC
@@ -145,6 +159,7 @@ Seconds, RTF in brackets; each device's faster precision in bold, and the speedu
 | Pocket TTS 7m (TTS, 4.80 s of audio) | 20.70 s (4.31) | **18.91 s (3.94)** | 14.91 s (3.11) | **14.04 s (2.92)** | 1.35x |
 | Pocket TTS 2m (TTS, 4.80 s of audio) | **8.85 s (1.84)** | 9.07 s (1.89) | **6.66 s (1.39)** | 7.08 s (1.48) | 1.33x |
 | tiny-voca (TTS, 5.39 s of audio)¹ | 13.53 s (2.51) | **13.20 s (2.44)** | **10.48 s (1.95)** | 10.82 s (2.00) | 1.25x |
+| Paradee 1.3 (TTS, 5.85 s of audio)⁴ | 15.90 s (2.72) | **14.88 s (2.54)** | 12.00 s (2.05) | **11.48 s (1.96)** | 1.30x |
 | Citrinet-256-ls (ASR, jfk 11.0 s) | 9.81 s (0.89) | **7.14 s (0.65)** | **3.38 s (0.31)** | 3.49 s (0.32) | 2.11x |
 | Moonshine tiny (ASR, jfk 11.0 s) | 25.50 s (2.32) | **19.77 s (1.80)** | 16.66 s (1.51) | **12.90 s (1.17)** | 1.53x |
 | Conformer-CTC small (ASR, 3.0 s of jfk) | 5.88 s (1.96) | **5.70 s (1.90)** | 4.23 s (1.41) | **4.16 s (1.39)** | 1.37x |
@@ -177,6 +192,14 @@ file's 19.43 s and 5.73 s. The rest of the change from the first row is the engi
 and 50.0 dB at Q8_0_PC, and whisper-small hears every arm as the sentence. One run of the 18 differs: round 2's
 Q8_0_PC on CPU+VC4, launched 3 s after round 1's, found the GPU pool short of a 33 MB buffer and kept the elementwise
 nodes on the CPU (ADR-093's fallback), taking 6.87 s; its output is 77 dB from the other two rounds', which match.
+⁴ Measured on 2026-11-18 with the same protocol, on an ARMv6 build of loom.cpp `a7554b2`: the Pi 4 row's sentence and
+GGUFs (md5 `9a26d78f`/`29bdfb7a`, each BiLSTM's input half one product before the sweep,
+[ADR-137](adrs/adr-137-a-bilstms-input-half-is-one-product-before-the-sweep.md)). The first measurement, the exports and
+build before it (`30d19ce2`/`371c192a` on footnote ²'s), was 16.82 / 15.73 / 13.45 / 11.83 s and 1.33x; ADR-136 changes
+nothing on a one-core board, which ran every graph on one thread already. Every arm made 140 400 samples (5.85 s) and
+hashed the same in each round, and whisper-small hears all four as the sentence, word for word. The VC4's output drifts from the CPU's over the utterance: 35 dB in the first second, 17 dB by the third, 18.7 dB
+over the whole at F32. The head's sine bank integrates the F0, so an F0 the VC4 computes a few ulp apart moves the phase.
+The spectra agree: log-mel L1 0.046, where Q8_0_PC against F32 on the CPU is 0.263.
 Every other arm hashed the same in all three rounds.
 
 * **Every arm's output hashed the same in all three rounds**, and the CPU+VC4 arms' outputs against the CPU's are

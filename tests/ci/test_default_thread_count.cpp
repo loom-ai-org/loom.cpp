@@ -124,5 +124,20 @@ int main() {
     }
 #endif
 
+    // --- A recurrent sweep's cell graphs: one thread unless $LOOM_RECURRENT_THREADS says otherwise ----
+    // One because a cell is a matrix-vector product, and ggml's CPU backend creates and joins a thread
+    // pool per compute (`recurrent_cpu_thread_count`'s note: Paradee on the Pi 4, 1.50 -> 0.77 s).
+    unsetenv("LOOM_RECURRENT_THREADS");
+    LOOM_CHECK(loom::recurrent_cpu_thread_count() == 1);
+    setenv("LOOM_RECURRENT_THREADS", "3", 1);
+    LOOM_CHECK(loom::recurrent_cpu_thread_count() == 3);
+    for (const char* junk : {"", "0", "-2", "oops"}) {
+        setenv("LOOM_RECURRENT_THREADS", junk, 1);
+        LOOM_CHECK(loom::recurrent_cpu_thread_count() == 1);
+    }
+    unsetenv("LOOM_RECURRENT_THREADS");
+    // The guard is a no-op on anything that is not a CPU backend, a null one included.
+    { loom::ScopedCpuThreads none(nullptr, 2); }
+
     LOOM_TEST_REPORT_AND_RETURN();
 }
