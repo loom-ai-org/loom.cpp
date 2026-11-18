@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: backends
-last_updated: 2026-11-12
+last_updated: 2026-11-18
 ---
 
 # Epic-04: Backends and Accelerators
@@ -68,7 +68,7 @@ cost 183 splits against the monolithic export's 181 — measured, against the pr
 | Metal | verified on an M1 Pro ([§5](#5-metal-p411--shipped-2026-08-31-run-on-an-apple-m1-pro), [§6](#6-gpu-correctness-f32-matmul-precision-the-metal-norm-the-cuda-mat-vec-stride-2026-10-08)) |
 | NPU | open; no NPU registers as a `ggml` device type the engine can resolve |
 | Vulkan on V3D (Raspberry Pi 4) | correct and opt-in (`GGML_VK_VISIBLE_DEVICES`); 79-122x slower than the A72s ([§7](#7-p443-v3dv-on-the-raspberry-pi-4-2026-10-28)) |
-| ggml-vc4 (Pi Zero / Pi 1-3 QPUs) | in tree, beside the CPU under `"auto"` on a board booted without `vc4-kms-v3d`; 1.15-3.36x the CPU alone on the Pi Zero W ([§8](#8-p444-p447-ggml-vc4-the-pi-zeros-qpus-beside-the-cpu-2026-10-28-to-30)) |
+| ggml-vc4 (Pi Zero / Pi 1-3 QPUs) | in tree, beside the CPU under `"auto"` on a board booted without `vc4-kms-v3d`; 1.06-3.37x the CPU alone on the Pi Zero W ([§8](#8-p444-p447-ggml-vc4-the-pi-zeros-qpus-beside-the-cpu-2026-10-28-to-30)) |
 
 ## 3. Related Decisions and Artifacts
 
@@ -1413,8 +1413,8 @@ conv-state caches, retained outputs and inputs into the CPU's buffer type (`stat
 by the QPUs through per-call copies. A node the pool refuses at compute time runs on the CPU, a
 `VC4_Q8` weight as its Q8_0 copy in `CPU_ARMV6_I8`.
 
-**Measured** (Pi Zero W, thirteen models, [BENCHMARKS](../BENCHMARKS.md#raspberry-pi-zero-w-cpu-against-cpuvc4)):
-1.15x (Silero VAD) to 3.36x (VITS) over the CPU alone, Pocket TTS 1.27-1.35x; outputs as the CPU's
+**Measured** (Pi Zero W, fourteen models, [BENCHMARKS](../BENCHMARKS.md#raspberry-pi-zero-w-cpu-against-cpuvc4)):
+1.06x (sanoTTS heart-nano) to 3.37x (VITS) over the CPU alone, Pocket TTS 1.27-1.35x; outputs as the CPU's
 within the QPUs' non-IEEE rounding.
 
 **Verified:** the kernels in a QPU emulator in CI (`test_vc4_*_emu`, `test_vc4_qpu_isa`), the module's

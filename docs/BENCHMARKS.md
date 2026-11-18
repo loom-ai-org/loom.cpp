@@ -131,7 +131,7 @@ Seconds, RTF in brackets; each device's faster precision in bold, and the speedu
 | sanoTTS de thorsten 0.51M (TTS, 4.40 s of audio) | 3.19 s (0.72) | **3.17 s (0.72)** | **1.53 s (0.35)** | 1.55 s (0.35) | 2.07x |
 | sanoTTS heart (TTS, 3.18 s of audio)² | 1.79 s (0.56) | **1.65 s (0.52)** | **0.87 s (0.27)** | 0.91 s (0.29) | 1.89x |
 | sanoTTS heartnano (TTS, 3.06 s of audio)² | **0.56 s (0.18)** | 0.57 s (0.19) | **0.53 s (0.17)** | 0.55 s (0.18) | 1.06x |
-| VITS piper en-GB miro (TTS, 3.39 s of audio) | 19.78 s (5.83) | **19.77 s (5.83)** | **5.88 s (1.74)** | 6.20 s (1.83) | 3.36x |
+| VITS piper en-GB miro (TTS, 3.39 s of audio)³ | 19.43 s (5.73) | **19.38 s (5.70)** | **5.73 s (1.69)** | 6.09 s (1.79) | 3.37x |
 | Pocket TTS 18m (TTS, 4.80 s of audio) | 31.10 s (6.48) | **23.27 s (4.85)** | 24.98 s (5.20) | **18.33 s (3.82)** | 1.27x |
 | Pocket TTS 7m (TTS, 4.80 s of audio) | 20.70 s (4.31) | **18.91 s (3.94)** | 14.91 s (3.11) | **14.04 s (2.92)** | 1.35x |
 | Pocket TTS 2m (TTS, 4.80 s of audio) | **8.85 s (1.84)** | 9.07 s (1.89) | **6.66 s (1.39)** | 7.08 s (1.48) | 1.33x |
@@ -158,6 +158,17 @@ heart-nano's CPU time fell from 0.661 s to 0.584 s with the noise still in Lua, 
 (it was the F32 file before), so its speedup is smaller. heart's Q8_0_PC duration head made 76 544 samples where F32
 made 76 288, so its speedup is per second of audio. Every arm hashed the same in every round; the VC4 is 59 dB (heart)
 and 73-81 dB (heart-nano) from the CPU; whisper-small hears all 24 outputs as the sentence.
+³ Re-measured on 2026-11-18 on the Hub's file (md5 `84389cfc`, F32 padded by the exporter, ADR-081), which aborts on the
+VC4 on 1.0.0rc20 and earlier ([Retro-109](retros/retro-109-a-cropped-view-passed-the-vc4-fusion-matcher.md)), on the
+ARMv6 build of footnote ². Its Q8_0_PC, exported again, is byte-identical to the one the first row measured
+(`6e095a95`). The rc18-era F32 that row measured (`3f25d02d`) ran as a third arm in the same session: on the CPU its
+output is the padded file's bit for bit, and it took 19.35 s on the CPU and 5.85 s on CPU+VC4 against the padded
+file's 19.43 s and 5.73 s. The rest of the change from the first row is the engine. Q8_0_PC's duration head made
+75 008 samples where F32 made 74 752, so the speedup is per second of audio. The VC4 is 63.9 dB from the CPU at F32
+and 50.0 dB at Q8_0_PC, and whisper-small hears every arm as the sentence. One run of the 18 differs: round 2's
+Q8_0_PC on CPU+VC4, launched 3 s after round 1's, found the GPU pool short of a 33 MB buffer and kept the elementwise
+nodes on the CPU (ADR-093's fallback), taking 6.87 s; its output is 77 dB from the other two rounds', which match.
+Every other arm hashed the same in all three rounds.
 
 * **Every arm's output hashed the same in all three rounds**, and the CPU+VC4 arms' outputs against the CPU's are
   [ADR-093](adrs/adr-093-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md)'s: transcripts

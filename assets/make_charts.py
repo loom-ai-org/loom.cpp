@@ -34,7 +34,7 @@ PIZERO = [  # model, task, CPU RTF, CPU+VC4 RTF
     ("Moonshine tiny", "ASR", 1.80, 1.17),
     ("Conformer-CTC small", "ASR", 1.90, 1.39),
     ("Pocket TTS 2m", "TTS", 1.84, 1.39),
-    ("VITS piper (miro)", "TTS", 5.83, 1.74),
+    ("VITS piper (miro)", "TTS", 5.70, 1.69),
     ("tiny-voca", "TTS", 2.44, 1.95),   # 2026-11-17, ADR-134; footnote 1 of that section
     ("Pocket TTS 7m", "TTS", 3.94, 2.92),
     ("Pocket TTS 18m", "TTS", 4.85, 3.82),
@@ -93,7 +93,7 @@ def pi4_chart(t):
 
 
 def pizero_chart(t):
-    w, left, right, row, top, scale = 760, 200, 56, 46, 96, 6.0   # Pocket TTS 18m's CPU bar is 4.85, VITS's 5.85
+    w, left, right, row, top, scale = 760, 200, 56, 46, 96, 6.0   # Pocket TTS 18m's CPU bar is 4.85, VITS's 5.70
     h = top + row * len(PIZERO) + 40
     span = w - left - right
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
