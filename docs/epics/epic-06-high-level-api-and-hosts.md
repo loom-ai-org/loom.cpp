@@ -413,6 +413,13 @@ speech and `speech2text` serves transcriptions and translations. It uses only th
 plus ffmpeg from `PATH` for the compressed audio formats. A request names the model, or, when only one
 model has the endpoint's door, that model answers.
 
+### JavaScript, in a browser
+
+`web/` ([ADR-139](../adrs/adr-139-the-engine-runs-in-a-browser-on-webgpu-or-the-cpu.md)) is the fourth host:
+the engine as WebAssembly (WebGPU or CPU), with `js/loom.mjs` offering the doors loom-py does
+(`text2text`, `speech2text.transcribe`, `text2speech.infer`/`stream`, voices, `call`). Its tokenizers
+are the engine's `loom::Tokenizer`, which loom-py and `loom_cli` should move to (hub).
+
 ### Resolution order for anything a model can infer itself
 
 **Optional argument → autodetect from the file → default.** Language is the worked example. Capability

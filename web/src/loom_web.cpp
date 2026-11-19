@@ -175,6 +175,8 @@ public:
     std::string hparam_str(const std::string& key) const {
         return guarded([&] { return model_->hparam_str(key); });
     }
+    // Any string key by its full name ("tokenizer.chat_template...", a fixture's "test.*").
+    std::string kv_str(const std::string& key) const { return guarded([&] { return model_->kv_str(key); }); }
 
     // -- text ---------------------------------------------------------------------------------------
     std::string tokenizer_kind() const { return tokenizer_ ? tokenizer_->kind() : std::string{}; }
@@ -336,7 +338,8 @@ std::string devices() {
 EMSCRIPTEN_BINDINGS(loom) {
     using namespace emscripten;
     function("loadModel", &load_model, allow_raw_pointers() LOOM_ASYNC);
-    function("devices", &devices);
+    // Async too: the first call into ggml's registry registers the WebGPU backend, which waits on the adapter.
+    function("devices", &devices LOOM_ASYNC);
     function("jspi", optional_override([] {
 #ifdef LOOM_WEB_JSPI
         return true;
@@ -367,6 +370,7 @@ EMSCRIPTEN_BINDINGS(loom) {
         .function("driverSource", &Model::driver_source)
         .function("takesVoiceFiles", &Model::takes_voice_files)
         .function("hparamStr", &Model::hparam_str)
+        .function("kvStr", &Model::kv_str)
         .function("tokenizerKind", &Model::tokenizer_kind)
         .function("encode", &Model::encode)
         .function("decodeBytes", &Model::decode_bytes)

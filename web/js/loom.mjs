@@ -74,8 +74,8 @@ export class Loom {
   }
 
   /** The ggml devices this build registered: [{name, description, type}]. */
-  devices() {
-    return JSON.parse(this.module.devices());
+  async devices() {
+    return JSON.parse(await this._run(() => this.module.devices()));
   }
 
   _run(fn) {

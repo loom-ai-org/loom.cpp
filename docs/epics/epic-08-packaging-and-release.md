@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: packaging
-last_updated: 2026-09-30
+last_updated: 2026-11-19
 ---
 
 # Epic-08: Packaging and Release
@@ -77,7 +77,7 @@ list (Supertonic's style example did, and its TTS row skipped), because the gate
 
 | | |
 |---|---|
-| Decisions | [ADR-011](../adrs/adr-011-three-repositories.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-025](../adrs/adr-025-armv6-is-built-in-its-own-emulated-userland.md), [ADR-026](../adrs/adr-026-armv6-is-the-floor-and-gets-its-own-kernels.md), [ADR-037](../adrs/adr-037-the-version-lives-in-one-file.md) |
+| Decisions | [ADR-011](../adrs/adr-011-three-repositories.md), [ADR-139](../adrs/adr-139-the-engine-runs-in-a-browser-on-webgpu-or-the-cpu.md) (`web/`: the `loom-web` npm package), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-025](../adrs/adr-025-armv6-is-built-in-its-own-emulated-userland.md), [ADR-026](../adrs/adr-026-armv6-is-the-floor-and-gets-its-own-kernels.md), [ADR-037](../adrs/adr-037-the-version-lives-in-one-file.md) |
 | Retros | [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-024](../retros/retro-024-a-blocker-read-from-one-half-of-an-agreement.md), [Retro-033](../retros/retro-033-a-shared-library-links-clean-without-its-symbols.md), [Retro-034](../retros/retro-034-the-boards-own-libstdcxx.md), [Retro-035](../retros/retro-035-the-emulator-said-it-was-an-arm10e.md), [Retro-036](../retros/retro-036-one-switch-two-decisions.md), [Retro-037](../retros/retro-037-ps-said-six-percent-top-said-fifty.md), [Retro-038](../retros/retro-038-two-panels-on-one-cache-way.md) |
 | Active tasks | [Backlog → Packaging](../backlog/active-index.md#packaging--release) |
 

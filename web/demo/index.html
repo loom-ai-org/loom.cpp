@@ -80,7 +80,7 @@ function busy(button, on) { button.disabled = on; }
 
 try {
   loom = await init({ flavour });
-  const names = loom.devices().map((d) => d.name).join(", ");
+  const names = (await loom.devices()).map((d) => d.name).join(", ");
   $("status").textContent = `Engine ready: the ${loom.flavour} build (devices: ${names}).` +
     (loom.flavour === "cpu" ? " WebGPU needs a browser with WebGPU and JSPI (Chrome or Edge 137+)." : "");
   $("load").disabled = false;

@@ -59,8 +59,16 @@ python web/test/make_reference.py /tmp/webref --chat gemma-3-270m-it.gguf \
     --phoneme-tts paradee-8m-q8_0_pc.gguf:af_heart
 node web/test/gate.mjs /tmp/webref cpu
 LOOM_GATE_SABOTAGE=1 node web/test/gate.mjs /tmp/webref cpu   # must fail every case
-web/test/browser_gate.sh /tmp/webref                          # headless Chromium, the WebGPU build
+node web/test/browser_gate.mjs /tmp/webref webgpu             # the same cases in headless Chromium
 ```
+
+Greedy text must match the native engine's exactly; a waveform must have the native length and be
+within the case's SNR (35 dB for Paradee, 25 dB for Pocket-TTS's free-running latent loop). Headless
+Chromium on Linux offers WebGPU only through SwiftShader, which has no `shader-f16`, so ggml-webgpu
+declines it and the WebGPU build runs on its CPU there. `--headful` on a desktop uses the real GPU.
+
+CI needs no model: `web/test/smoke.mjs` runs `tests/fixtures/make_gru_sweep_gguf.py`'s GRU and LSTM drivers
+against the float64 references in the file, in both builds.
 
 The demo page is `web/demo/index.html`; serve the `web/` directory (`python -m http.server -d web`) and
 open `/demo/`.

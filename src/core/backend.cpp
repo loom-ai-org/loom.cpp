@@ -114,6 +114,11 @@ void load_loom_backends_default() {
 
 void ensure_backends_loaded() {
     std::lock_guard<std::mutex> lock(loader_mutex());
+#if defined(__EMSCRIPTEN__)
+    // A WebAssembly module links every backend it has (web/, ADR-139) and can load none: ggml's sweep would
+    // only print each search path it could not find.
+    return;
+#endif
     for (const std::string& dir : pending_search_paths()) {
         ggml_backend_load_all_from_path(dir.c_str());
         load_loom_backends_from(dir);
