@@ -33,6 +33,13 @@ of `a + b * c` is a property of the compiler's target, not of the source. A test
 without FMA (the VC4's QPUs, an ARMv6 VFP) is only as exact as that flag. The five VC4 emulator tests now
 set it per target (`tests/CMakeLists.txt`).
 
+**And the engine's own host arithmetic is one of those comparisons.** Once all five stacks were merged, main
+failed `test_lua_bridge` on the same runners: `loom.gaussian_array` against `std::normal_distribution<float>`
+compiled into the test, the same source in two translation units, fused differently in each. `aten_randn`'s
+torch-exact stream (ADR-134) and the drivers' bit-exact phases rest on the same property. So `loom_engine` and
+every test now compile with `-ffp-contract=off` (root and `tests/CMakeLists.txt`); ggml's kernels keep their
+own flags.
+
 ## Record
 
 * Main `f6fe5ee` passed on Ubuntu 24.04.5 / GCC 13.3.0. #132's run 44181776292 failed on Ubuntu 26.04.1 /
@@ -42,3 +49,6 @@ set it per target (`tests/CMakeLists.txt`).
   `-march=native`, and pass at `-march=x86-64-v3 -ffp-contract=off`.
 * With the flag, all five emulator tests pass in the container under a CMake build with
   `CMAKE_CXX_FLAGS=-march=x86-64-v3`.
+* Main after the merges (`7586dc8`): `test_lua_bridge.cpp:168` (`all_match`, the gaussian stream) failed on
+  Ubuntu 26.04. In `ubuntu:26.04` it passes at the default target (27/27) and fails at `-march=x86-64-v3`
+  on the same check; with contraction off engine-wide the whole `ci` label is run there at x86-64-v3.
