@@ -39,7 +39,7 @@ target_link_options(loom_web PRIVATE
     # emscripten's 64 KB default.
     -sSTACK_SIZE=8MB
     -sFORCE_FILESYSTEM=1
-    -sEXPORTED_RUNTIME_METHODS=FS
+    -sEXPORTED_RUNTIME_METHODS=FS,ENV
     -fwasm-exceptions
     -sSUPPORT_LONGJMP=wasm
 )

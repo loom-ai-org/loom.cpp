@@ -1355,6 +1355,12 @@ CPU-only custom op it had put a host round trip into every RMSNorm on every devi
 0.38x to 7.3x real time on the 5090
 ([ADR-112](../adrs/adr-112-cosyvoice3-streams-the-way-its-reference-does-by-re-running-the-flow-a-hop-at-a-time.md)).
 
+**WebGPU, 2026-11-19: f16 tiles.** ggml-webgpu's tiled `mul_mat` stages both operands in f16 and ignored
+`GGML_PREC_F32` (its check read flash attention's op param). Paradee F32 on a Vega 3 was 21.9 dB from the
+CPU, and keeping `MUL_MAT` alone on the CPU gave 83.9 dB, which a deny-list bisection over the op types
+found in five runs. `ggml-0065` gives such products f32 tiles: 90.2 dB, no measurable cost (UPSTREAM PR
+60, [ADR-139](../adrs/adr-139-the-engine-runs-in-a-browser-on-webgpu-or-the-cpu.md)).
+
 **A GPU decode step, fewer kernels and replayed as a graph** ([ADR-113](../adrs/adr-113-a-gpu-decode-step-fewer-kernels-and-cuda-graphs.md)).
 With the host costs out, the LM was GPU-bound on ~1,420 small kernels a token. The exporter now emits `RMS_NORM`
 for any spelling of the square, including `x * x`, and leaves out the `ADD` of an all-zero bias. The engine builds

@@ -8,7 +8,7 @@
 // A check that cannot fail proves nothing: `LOOM_GATE_SABOTAGE=1` flips each comparison's reference
 // (one character of the text, the waveform's sign) and every case must then fail.
 
-export async function runGate(loom, ref, { read, log = console.log, sabotage = false } = {}) {
+export async function runGate(loom, ref, { read, log = console.log, sabotage = false, dump = null } = {}) {
   const results = [];
   for (const c of ref.cases) {
     const t0 = performance.now();
@@ -35,6 +35,7 @@ export async function runGate(loom, ref, { read, log = console.log, sabotage = f
         const audio = c.phonemes != null
           ? await model.text2speech.infer(null, { ...options, phonemes: c.phonemes })
           : await model.text2speech.infer(c.text, options);
+        if (dump) await dump(`${c.name}.${loom.flavour}.f32`, audio.samples);
         const want = new Float32Array((await read(c.name + ".f32", true)).buffer.slice(0));
         if (sabotage) want.forEach((v, i) => (want[i] = -v));
         const snr = snrDb(want, audio.samples);
@@ -86,12 +87,20 @@ if (typeof process !== "undefined" && import.meta.url === new URL(process.argv[1
   const path = await import("node:path");
   const [refDir, flavour = "cpu"] = process.argv.slice(2);
   const { init } = await import(new URL("../dist/loom.mjs", import.meta.url).href);
+  if (flavour === "webgpu") {
+    const { installNodeWebGPU } = await import("./node_webgpu.mjs");
+    console.log(`WebGPU in Node: ${(await installNodeWebGPU()) ?? "none (npm install in web/ for Dawn)"}`);
+  }
   const loom = await init({ flavour });
   const ref = JSON.parse(await readFile(path.join(refDir, "reference.json"), "utf8"));
   const read = async (p) => new Uint8Array(await readFile(path.isAbsolute(p) ? p : path.join(refDir, p)));
   console.log(`loom web gate: ${loom.flavour} build, devices ${(await loom.devices()).map((d) => d.name).join(", ")}`);
   const sabotage = process.env.LOOM_GATE_SABOTAGE === "1";
-  const results = await runGate(loom, ref, { read, sabotage });
+  // LOOM_GATE_DUMP=DIR writes each case's waveform there (<case>.<flavour>.f32), for listening or an ASR check.
+  const dumpDir = process.env.LOOM_GATE_DUMP;
+  const { writeFile } = await import("node:fs/promises");
+  const dump = dumpDir ? (name, samples) => writeFile(path.join(dumpDir, name), Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength)) : null;
+  const results = await runGate(loom, ref, { read, sabotage, dump });
   const failed = results.filter((r) => !r.ok).length;
   console.log(`${results.length - failed}/${results.length} passed${sabotage ? " (sabotaged: all should FAIL)" : ""}`);
   process.exit(sabotage ? (failed === results.length ? 0 : 1) : failed ? 1 : 0);

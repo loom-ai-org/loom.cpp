@@ -26,9 +26,10 @@ export async function webgpuAvailable() {
 /**
  * Load the engine. `flavour` is "webgpu", "cpu" or "auto" (the default): WebGPU when
  * `webgpuAvailable()`, else the CPU build, which runs anywhere WebAssembly does. `base` is where the
- * `loom-<flavour>.mjs/.wasm` pair lives (this file's directory by default).
+ * `loom-<flavour>.mjs/.wasm` pair lives (this file's directory by default). `env` sets the engine's
+ * environment variables (`{LOOM_PROFILE: "1"}`).
  */
-export async function init({ flavour = "auto", base = HERE } = {}) {
+export async function init({ flavour = "auto", base = HERE, env = {} } = {}) {
   if (flavour === "auto") flavour = (await webgpuAvailable()) ? "webgpu" : "cpu";
   if (flavour !== "cpu" && flavour !== "webgpu") throw new Error(`flavour is "auto", "cpu" or "webgpu", not ${flavour}`);
   const url = new URL(`loom-${flavour}.mjs`, base);
@@ -37,6 +38,8 @@ export async function init({ flavour = "auto", base = HERE } = {}) {
     locateFile: (path) => new URL(path, base).href,
     print: (s) => console.log(s),
     printErr: (s) => console.warn(s),
+    // The engine's environment (LOOM_PROFILE, LOOM_DEVICE, ...), which a page has no other way to set.
+    preRun: [(m) => Object.keys(env).length && Object.assign(m.ENV, env)],
   });
   return new Loom(module, flavour);
 }
