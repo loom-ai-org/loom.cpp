@@ -177,6 +177,25 @@ int main(void) { return (int) __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED);
     endif()
 endif()
 
+# Which Lua runs the drivers (ADR-139). LuaJIT everywhere it can be built; PUC Lua 5.1 (+ LuaBitOp for
+# `bit`) under emscripten, where LuaJIT has no target. `-DLOOM_LUA=puc` builds the PUC VM natively too,
+# which is how the suite proves it runs every driver the way LuaJIT does.
+if(EMSCRIPTEN)
+    set(LOOM_LUA_DEFAULT puc)
+else()
+    set(LOOM_LUA_DEFAULT luajit)
+endif()
+set(LOOM_LUA ${LOOM_LUA_DEFAULT} CACHE STRING "The driver VM: luajit or puc (PUC Lua 5.1 + LuaBitOp)")
+set_property(CACHE LOOM_LUA PROPERTY STRINGS luajit puc)
+if(LOOM_LUA STREQUAL "puc")
+    include(${CMAKE_CURRENT_LIST_DIR}/LuaPuc.cmake)
+    return()  # the LuaJIT section below is the last thing in this file
+elseif(NOT LOOM_LUA STREQUAL "luajit")
+    message(FATAL_ERROR "LOOM_LUA=${LOOM_LUA}: luajit or puc")
+elseif(EMSCRIPTEN)
+    message(FATAL_ERROR "LOOM_LUA=luajit under emscripten: LuaJIT has no WebAssembly target; use puc")
+endif()
+
 # LuaJIT: embedded Lua VM for the procedural-generalization orchestration layer (see
 # LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md) -- replaces bespoke per-model C++ drivers
 # with a data-driven Lua script embedded in each model's GGUF. LuaJIT has no upstream CMakeLists (it's a
@@ -310,3 +329,4 @@ set_target_properties(luajit::luajit PROPERTIES
 add_dependencies(luajit::luajit luajit_build)
 # LuaJIT needs libm (math) and libdl (dynamic loading, its FFI/package.loadlib) on Linux.
 target_link_libraries(luajit::luajit INTERFACE ${CMAKE_DL_LIBS} m)
+add_library(loom::lua ALIAS luajit::luajit)

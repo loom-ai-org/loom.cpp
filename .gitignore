@@ -14,3 +14,7 @@ __pycache__/
 _deps/
 CMakeFiles/
 Testing/
+
+# web/build.sh output
+web/dist/
+web/node_modules/

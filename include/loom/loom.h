@@ -66,6 +66,7 @@
 #include "loom/core/unicode.h"
 #include "loom/core/supertonic_text_vectorizer.h"
 #include "loom/core/gpu_reset_watch.h"
+#include "loom/core/tokenizer.h"
 #include "loom/core/chat_template.h"
 #include "loom/core/ctc_decode.h"
 #include "loom/core/generation.h"

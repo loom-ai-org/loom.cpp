@@ -606,6 +606,11 @@ void apply_cpu_threads(ggml_backend_t backend) {
 } // namespace
 
 int default_cpu_thread_count() {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    // A WebAssembly build without pthreads (web/, ADR-139) has one thread and no way to make another:
+    // ggml's threadpool would fail its first pthread_create.
+    return 1;
+#endif
     // Resolution order is this project's usual one for something the machine can answer for itself
     // (see Device::open's `spec`): the environment first, then autodetection. A non-numeric or
     // non-positive $LOOM_N_THREADS falls through to autodetection rather than to ggml's 4, because
