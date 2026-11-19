@@ -5,13 +5,30 @@
   "license": "MIT",
   "type": "module",
   "main": "dist/loom.mjs",
-  "exports": { ".": "./dist/loom.mjs" },
-  "files": ["dist/loom.mjs", "dist/loom-cpu.mjs", "dist/loom-cpu.wasm", "dist/loom-webgpu.mjs", "dist/loom-webgpu.wasm"],
-  "repository": { "type": "git", "url": "https://github.com/loom-ai-org/loom.cpp.git", "directory": "web" },
+  "exports": {
+    ".": "./dist/loom.mjs"
+  },
+  "files": [
+    "dist/loom.mjs",
+    "dist/loom-cpu.mjs",
+    "dist/loom-cpu.wasm",
+    "dist/loom-webgpu.mjs",
+    "dist/loom-webgpu.wasm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/loom-ai-org/loom.cpp.git",
+    "directory": "web"
+  },
   "scripts": {
     "build": "./build.sh",
     "gate": "node test/gate.mjs",
     "gate:webgpu": "node --experimental-wasm-jspi test/gate.mjs"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "webgpu": "0.6.2"
+  }
 }

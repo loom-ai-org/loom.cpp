@@ -2368,6 +2368,36 @@ CosyVoice3's stream joins bit-identical to one vocoder call (0 against 5.9e-03).
 long-row speed comparison against CUB. The rows loom sends are short (9 x frames), and one block
 walks a 40000-element row.
 
+## PR 60 — `webgpu`: honour `GGML_PREC_F32` for a float `mul_mat` (f32 tiles)
+
+*(`cmake/patches/ggml-0065-webgpu-mul-mat-f32-prec.patch`, independent of the others)*
+
+**Problem.** The tiled matmul (`mul_mat_reg_tile.wgsl`, and the subgroup-matrix kernel) stages both
+operands in `f16` workgroup memory, for F32 and F16 weights alike, and accumulates the f16 products in
+f32. So every float product with more than 4 columns is computed on 11-bit operands, whatever
+`op_params[0]` says. `supports_op`'s `GGML_PREC_F32` check reads op param 3, which is flash attention's.
+`mul_mat_vec` (≤ 4 columns) is plain f32. This is PR 58's TF32 problem in another backend. Measured on
+an AMD Vega 3 (RADV, Dawn) with Paradee-8M's F32 file, one 1.6 s utterance: the WebGPU output was 21.9
+dB from the CPU's. With only `MUL_MAT` kept on the CPU it was 83.9 dB.
+
+**Change.** The fast pipeline's key gains `prec_f32`: a float src0 (F32, F16, BF16) with `op_params[0]
+== GGML_PREC_F32`. Such a product builds a variant with `SHMEM_F32`, which makes `SHMEM_SCALAR` f32 in
+`mul_mat_decls.tmpl` (`shmem`, `store_shmem`, the register tile). It never uses the subgroup-matrix
+kernel, whose matrices are f16. The float tile is 8 x 8 x 4 per operand, so 2 KB of workgroup memory in
+f32, far under the 16 KB minimum limit. Default-precision and quantized products are unchanged.
+
+**Measured** (Vega 3, Dawn 0.6.2 in Node and Chromium 155):
+
+| | before | after |
+|---|---|---|
+| Paradee F32 against the CPU | 21.9 dB | 90.2 dB |
+| Pocket-TTS 2M F32 against the CPU | (a different length) | 78.8 dB, the same length |
+| Paradee Q8_0_PC (float ALBERT) against the CPU | −1.1 dB | 28.5 dB |
+
+Warm wall time is unchanged within run-to-run noise (Gemma-3-270M F32 chat, 24 tokens, 3.30 s
+against 3.35 s; the two TTS files about 1.7 s either way), since these small models are dispatch-bound
+on an iGPU. Not measured: a large F32 GEMM's throughput with f32 tiles on a discrete GPU.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the

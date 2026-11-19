@@ -55,17 +55,19 @@ web/build.sh                   # both builds into web/dist/; `web/build.sh cpu` 
 
 ```sh
 python web/test/make_reference.py /tmp/webref --chat gemma-3-270m-it.gguf \
-    --asr moonshine-tiny-q8_0.gguf --tts pocket-tts-2m-q8_0_pc.gguf:voices/alba.gguf \
-    --phoneme-tts paradee-8m-q8_0_pc.gguf:af_heart
+    --asr moonshine-tiny-q8_0.gguf --tts pocket-tts-2m-f32.gguf:voices/alba.gguf \
+    --phoneme-tts paradee-8m-f32.gguf:af_heart
 node web/test/gate.mjs /tmp/webref cpu
 LOOM_GATE_SABOTAGE=1 node web/test/gate.mjs /tmp/webref cpu   # must fail every case
 node web/test/browser_gate.mjs /tmp/webref webgpu             # the same cases in headless Chromium
 ```
 
 Greedy text must match the native engine's exactly; a waveform must have the native length and be
-within the case's SNR (35 dB for Paradee, 25 dB for Pocket-TTS's free-running latent loop). Headless
-Chromium on Linux offers WebGPU only through SwiftShader, which has no `shader-f16`, so ggml-webgpu
-declines it and the WebGPU build runs on its CPU there. `--headful` on a desktop uses the real GPU.
+within the case's SNR of it (60 dB for Paradee, 50 dB for Pocket-TTS's free-running latent loop; give
+F32 TTS files, as above). On WebGPU, add `--experimental-wasm-jspi` and `npm install` here for Dawn's
+Node bindings (`test/node_webgpu.mjs`), which run on the machine's real GPU. Headless Chromium on Linux
+offers only SwiftShader, which has no `shader-f16`, so ggml-webgpu declines it and the WebGPU build runs
+on its CPU there; `--headful` on a desktop uses the real GPU.
 
 CI needs no model: `web/test/smoke.mjs` runs `tests/fixtures/make_gru_sweep_gguf.py`'s GRU and LSTM drivers
 against the float64 references in the file, in both builds.

@@ -925,10 +925,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Backends & accelerators
 
-* [ ] **WebGPU on a real GPU adapter, measured** (web/, ADR-139). The `loom-webgpu` build is gated only where it
-  falls back to its CPU: headless Chromium on Linux offers SwiftShader, which lacks `shader-f16`, so ggml-webgpu
-  declines it. Run `web/test/browser_gate.mjs REF webgpu --headful` (or Dawn for Node) on a GPU, against the
-  native references, and record speed. *Context: [ADR-139](../adrs/adr-139-the-engine-runs-in-a-browser-on-webgpu-or-the-cpu.md)*
+* [ ] **WebGPU is slower than the WASM CPU build on small models** (web/, ADR-139). On a Vega 3, Paradee F32
+  takes 1.74 s against 0.36 s and Gemma-3-270M chat 3.36 s against 2.55 s; only Moonshine is faster (1.94 s
+  against 3.12 s). Measure where the time goes (dispatches per graph, CPU-fallback splits, the recurrent
+  sweeps' ~1 500 graphs) before choosing a lever. *Context: [ADR-139](../adrs/adr-139-the-engine-runs-in-a-browser-on-webgpu-or-the-cpu.md)*
 * [ ] **A threaded web build** (pthreads + SharedArrayBuffer, for a cross-origin-isolated page). Today both
   flavours run one CPU thread. *Context: [ADR-139](../adrs/adr-139-the-engine-runs-in-a-browser-on-webgpu-or-the-cpu.md)*
 * [ ] **ggml-vulkan keeps no `VkPipelineCache`, so a process without a driver cache recompiles every launch.**

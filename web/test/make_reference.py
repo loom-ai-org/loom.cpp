@@ -4,7 +4,7 @@ Runs each door through loom-py (the native engine, LuaJIT) and writes what came 
 
     python web/test/make_reference.py OUT_DIR \
         --chat gemma-3-270m-it.gguf --asr moonshine-tiny-q8_0.gguf \
-        --tts pocket-tts-2m-q8_0_pc.gguf:voices/alba.gguf --phoneme-tts paradee-8m-q8_0_pc.gguf:af_heart
+        --tts pocket-tts-2m-f32.gguf:voices/alba.gguf --phoneme-tts paradee-8m-f32.gguf:af_heart
 
 OUT_DIR/reference.json holds the texts and the case list, each waveform OUT_DIR/<name>.f32 (raw
 little-endian float32). The JS gates (`node web/test/node_gate.mjs`, `web/test/browser_gate.mjs`)
@@ -68,10 +68,12 @@ def main() -> None:
         m = loom.Model.from_file(path)
         case = {"name": "phoneme_tts" if phonemes else "tts", "door": "text2speech",
                 "model": str(Path(path).resolve()),
-                # Paradee is one pass; Pocket-TTS draws its latents frame by frame, so the last-bit
-                # differences between WASM SIMD and x86 sums compound (the sample count, which is every
-                # frame's stop decision, must still match exactly).
-                "min_snr_db": 35.0 if phonemes else 25.0}
+                # Give F32 files: every matmul then runs in f32 on both builds (WebGPU: ggml-0065), and the
+                # web output is within 78-92 dB of native. Paradee is one pass; Pocket-TTS draws its latents
+                # frame by frame, so differences compound (its sample count, every frame's stop decision,
+                # must still match exactly). A quantised TTS on a GPU differs by more than this, by design:
+                # its matmuls round activations to f16 where the CPU quantises them to Q8 (ADR-139).
+                "min_snr_db": 60.0 if phonemes else 50.0}
         kwargs = {}
         if voice and voice.endswith(".gguf"):
             vpath = (Path(path).parent / voice).resolve()

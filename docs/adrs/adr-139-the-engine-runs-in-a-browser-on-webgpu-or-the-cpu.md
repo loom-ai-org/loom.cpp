@@ -68,14 +68,32 @@ has WASM SIMD kernels. What stood between the engine and a browser was not ggml:
   from upstream, with its seed-only draw 6e-08 from the pinned one, so `aten_randn` is still torch's
   stream.
 * **The web gate** (`web/test/gate.mjs` in Node, `browser_gate.mjs` in Chromium 155) compares against
-  the native engine's own answers. Greedy chat (Gemma-3-270M, 24 tokens) and transcription (Moonshine
-  tiny) are identical. Pocket-TTS 2M has the native sample count and is 28.3 dB from native (a
-  free-running latent loop, where WASM and x86 sums diverge). Paradee is 41.8 dB. Both builds pass in
-  Node and in headless Chromium, and a sabotaged reference fails every case. CPU wasm, one thread:
-  Moonshine 11 s of audio in 7.6 s, Pocket-TTS 2.9 s in 1.8 s.
-* **WebGPU on a real GPU is not yet measured.** Headless Chromium on Linux offers only SwiftShader,
-  which lacks `shader-f16`. ggml-webgpu then declines the adapter, and the WebGPU build falls back to
-  its CPU. That path is gated, and correct. A run on a GPU adapter is a hub item.
+  the native engine's own answers. Greedy chat (Gemma-3-270M F32, 24 tokens) and transcription
+  (Moonshine tiny Q8) are identical on both builds. The TTS cases use F32 files: Pocket-TTS 2M has the
+  native sample count and is 84.3 dB from native on the CPU build and 78.8 dB on WebGPU (thresholds 50
+  dB; a free-running latent loop), and Paradee is 92.1 and 90.2 dB (threshold 60). A sabotaged
+  reference fails every case.
+* **WebGPU on a real GPU** (AMD Vega 3, RADV): Dawn's Node bindings (`web/test/node_webgpu.mjs`, the
+  `webgpu` dev dependency) and a visible Chromium window with `--enable-features=Vulkan` gave the same
+  numbers. Headless Chromium on Linux offers only SwiftShader, which has no `shader-f16`, so
+  ggml-webgpu declines it and the build runs on its CPU there. That path is gated too.
+* **ggml-webgpu ignored `GGML_PREC_F32`** on `mul_mat`. Its tiled kernel stages both operands in f16,
+  so Paradee F32 on WebGPU was 21.9 dB from native, and keeping `MUL_MAT` alone on the CPU made it
+  83.9 dB. `ggml-0065` (UPSTREAM.md PR 60) gives such products f32 tiles, at no measurable cost here.
+  A quantised file still differs on a GPU by design, because its matmuls round activations to f16 where
+  the CPU quantises them to Q8: Paradee Q8 is 28.5 dB from native on WebGPU, intelligible (Moonshine
+  transcribes it as it does the native audio), so the gate's TTS cases are F32.
+* **Speed**, warm, three runs each, one CPU thread against the Vega 3:
+
+  | case | CPU wasm | WebGPU |
+  |---|---|---|
+  | Gemma-3-270M F32 chat, 24 tokens | 2.55 s | 3.36 s |
+  | Moonshine tiny Q8, 11 s of audio | 3.12 s | 1.94 s |
+  | Pocket-TTS 2M F32, 2.9 s of audio | 0.44 s | 1.74 s |
+  | Paradee F32, 1.6 s of audio | 0.36 s | 1.74 s |
+
+  WebGPU wins only on the transformer ASR. These models run many small graphs (Paradee's recurrent
+  sweeps alone are about 1 500), so an integrated GPU pays its dispatch cost on each (a hub item).
 * **CI:** a `puc-lua` job runs the suite on PUC Lua. A `web` job builds both flavours with emscripten
   7.0.0 and runs `web/test/smoke.mjs`, a GRU and LSTM driver against float64 references, plus its
   sabotage.

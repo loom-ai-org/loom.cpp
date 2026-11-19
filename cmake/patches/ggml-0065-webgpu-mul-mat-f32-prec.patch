@@ -1,0 +1,118 @@
+diff --git a/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp b/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp
+index 65556f35..8e9b35a6 100644
+--- a/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp
++++ b/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp
+@@ -1011,10 +1011,12 @@ struct ggml_webgpu_mul_mat_pipeline_key {
+     int       vectorized;
+     int       use_subgroup_matrix;
+     bool      src_overlap;
++    bool      prec_f32;  // loom ggml-0065: f32 tiles for a float matmul that asked for GGML_PREC_F32
+ 
+     bool operator==(const ggml_webgpu_mul_mat_pipeline_key & other) const {
+         return src0_type == other.src0_type && src1_type == other.src1_type && vectorized == other.vectorized &&
+-               use_subgroup_matrix == other.use_subgroup_matrix && src_overlap == other.src_overlap;
++               use_subgroup_matrix == other.use_subgroup_matrix && src_overlap == other.src_overlap &&
++               prec_f32 == other.prec_f32;
+     }
+ };
+ 
+@@ -1026,6 +1028,7 @@ struct ggml_webgpu_mul_mat_pipeline_key_hash {
+         ggml_webgpu_hash_combine(seed, key.vectorized);
+         ggml_webgpu_hash_combine(seed, key.use_subgroup_matrix);
+         ggml_webgpu_hash_combine(seed, key.src_overlap);
++        ggml_webgpu_hash_combine(seed, key.prec_f32);
+         return seed;
+     }
+ };
+@@ -2159,7 +2162,12 @@ class ggml_webgpu_shader_lib {
+                                    (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
+                                       1 :
+                                       0;
+-        key.use_subgroup_matrix = context.supports_subgroup_matrix;
++        // GGML_PREC_F32 (ggml_mul_mat_set_prec, op param 0) on a float src0: the f16 tiles below would round
++        // both operands to 11 bits, so this matmul gets f32 tiles and never the f16 subgroup-matrix kernel.
++        key.prec_f32 = ggml_get_op_params_i32(context.dst, 0) == GGML_PREC_F32 &&
++                       (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16 ||
++                        context.src0->type == GGML_TYPE_BF16);
++        key.use_subgroup_matrix = context.supports_subgroup_matrix && !key.prec_f32;
+         key.src_overlap         = src_overlap;
+ 
+         auto it = mul_mat_fast_pipelines.find(key);
+@@ -2292,6 +2300,11 @@ class ggml_webgpu_shader_lib {
+             variant += "_src_overlap";
+         }
+ 
++        if (key.prec_f32) {
++            defines.push_back("SHMEM_F32");
++            variant += "_prec_f32";
++        }
++
+         if (!key.use_subgroup_matrix) {
+             defines.push_back("WORKGROUP_SIZE_M=" + std::to_string(WEBGPU_MUL_MAT_WG_SIZE_M) + "u");
+             defines.push_back("WORKGROUP_SIZE_N=" + std::to_string(WEBGPU_MUL_MAT_WG_SIZE_N) + "u");
+diff --git a/src/ggml-webgpu/wgsl-shaders/mul_mat_decls.tmpl b/src/ggml-webgpu/wgsl-shaders/mul_mat_decls.tmpl
+index 83f6fa17..18d6d299 100644
+--- a/src/ggml-webgpu/wgsl-shaders/mul_mat_decls.tmpl
++++ b/src/ggml-webgpu/wgsl-shaders/mul_mat_decls.tmpl
+@@ -5,14 +5,22 @@
+ #define SRC1 src1
+ #endif
+ 
++// SHMEM_F32: a float matmul that asked for GGML_PREC_F32 stages its tiles in f32 (loom ggml-0065), where the
++// default rounds both operands to f16 on the way into shared memory.
++#ifdef SHMEM_F32
++#define SHMEM_SCALAR f32
++#else
++#define SHMEM_SCALAR f16
++#endif
++
+ #ifdef VEC
+ #define VEC_SIZE 4
+-#define SHMEM_TYPE vec4<f16>
++#define SHMEM_TYPE vec4<SHMEM_SCALAR>
+ #define DST_TYPE vec4<f32>
+ #define SRC0_TYPE vec4<SRC0_INNER_TYPE>
+ #define SRC1_TYPE vec4<SRC1_INNER_TYPE>
+ 
+-fn store_shmem(val: vec4<f16>, idx: u32) {
++fn store_shmem(val: vec4<SHMEM_SCALAR>, idx: u32) {
+     shmem[idx] = val.x;
+     shmem[idx + 1] = val.y;
+     shmem[idx + 2] = val.z;
+@@ -22,12 +30,12 @@ fn store_shmem(val: vec4<f16>, idx: u32) {
+ 
+ #ifdef SCALAR
+ #define VEC_SIZE 1
+-#define SHMEM_TYPE f16
++#define SHMEM_TYPE SHMEM_SCALAR
+ #define DST_TYPE f32
+ #define SRC0_TYPE SRC0_INNER_TYPE
+ #define SRC1_TYPE SRC1_INNER_TYPE
+ 
+-fn store_shmem(val: f16, idx: u32) {
++fn store_shmem(val: SHMEM_SCALAR, idx: u32) {
+     shmem[idx] = val;
+ }
+ #endif // SCALAR
+diff --git a/src/ggml-webgpu/wgsl-shaders/mul_mat_reg_tile.wgsl b/src/ggml-webgpu/wgsl-shaders/mul_mat_reg_tile.wgsl
+index 0e17fae1..4ec1f709 100644
+--- a/src/ggml-webgpu/wgsl-shaders/mul_mat_reg_tile.wgsl
++++ b/src/ggml-webgpu/wgsl-shaders/mul_mat_reg_tile.wgsl
+@@ -63,7 +63,7 @@ const TOTAL_WORKGROUP_SIZE = WORKGROUP_SIZE_M * WORKGROUP_SIZE_N;
+ const TILE_SRC0_SHMEM = TILE_K * WORKGROUP_SIZE_M * TILE_M;
+ const TILE_SRC1_SHMEM = TILE_K * WORKGROUP_SIZE_N * TILE_N;
+ 
+-var<workgroup> shmem: array<f16, TILE_SRC0_SHMEM + TILE_SRC1_SHMEM>;
++var<workgroup> shmem: array<SHMEM_SCALAR, TILE_SRC0_SHMEM + TILE_SRC1_SHMEM>;
+ 
+ @compute @workgroup_size(TOTAL_WORKGROUP_SIZE)
+ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
+@@ -123,7 +123,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
+         let k_end = min(TILE_K, params.k - k_outer);
+ 
+         for (var k_inner = 0u; k_inner < k_end; k_inner++) {
+-            var src0_tile: array<f16, TILE_M>;
++            var src0_tile: array<SHMEM_SCALAR, TILE_M>;
+             for (var tm = 0u; tm < TILE_M; tm++) {
+                 let src0_m = local_m * TILE_M + tm;
+                 let src0_idx = k_inner + src0_m * TILE_K;

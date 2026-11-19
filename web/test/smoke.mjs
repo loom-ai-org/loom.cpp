@@ -9,6 +9,10 @@ import { init } from "../dist/loom.mjs";
 
 const [file, flavour = "cpu"] = process.argv.slice(2);
 const sabotage = process.env.LOOM_GATE_SABOTAGE === "1";
+if (flavour === "webgpu") {
+  const { installNodeWebGPU } = await import("./node_webgpu.mjs");
+  console.log(`WebGPU in Node: ${(await installNodeWebGPU()) ?? "none (npm install in web/ for Dawn)"}`);
+}
 const loom = await init({ flavour });
 const model = await loom.loadModel(file);
 const ref = (key) => JSON.parse(model._h.kvStr(key)).map((v) => (sabotage ? v + 1e-3 : v));

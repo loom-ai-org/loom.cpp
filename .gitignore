@@ -18,3 +18,5 @@ Testing/
 # web/build.sh output
 web/dist/
 web/node_modules/
+a.out.js
+a.out.wasm
