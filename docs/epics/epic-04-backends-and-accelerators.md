@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: backends
-last_updated: 2026-11-18
+last_updated: 2026-11-19
 ---
 
 # Epic-04: Backends and Accelerators
@@ -74,7 +74,7 @@ cost 183 splits against the monolithic export's 181 — measured, against the pr
 
 | | |
 |---|---|
-| Decisions | [ADR-007](../adrs/adr-007-backend-capability-negotiation.md), [ADR-008](../adrs/adr-008-atan-approximation.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md), [ADR-089](../adrs/adr-089-v3dv-is-correct-and-opt-in.md), [ADR-090](../adrs/adr-090-the-pi-zero-qpus-are-an-accelerator-beside-the-cpu.md), [ADR-091](../adrs/adr-091-the-qpus-take-convolutions-and-per-channel-int8.md), [ADR-092](../adrs/adr-092-the-qpus-take-the-epilogue-q4-0-and-the-pointwise-convolutions.md), [ADR-093](../adrs/adr-093-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md) |
+| Decisions | [ADR-007](../adrs/adr-007-backend-capability-negotiation.md), [ADR-008](../adrs/adr-008-atan-approximation.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md), [ADR-089](../adrs/adr-089-v3dv-is-correct-and-opt-in.md), [ADR-140](../adrs/adr-140-a-gpu-reset-fails-the-graph-even-when-the-driver-says-it-finished.md), [ADR-090](../adrs/adr-090-the-pi-zero-qpus-are-an-accelerator-beside-the-cpu.md), [ADR-091](../adrs/adr-091-the-qpus-take-convolutions-and-per-channel-int8.md), [ADR-092](../adrs/adr-092-the-qpus-take-the-epilogue-q4-0-and-the-pointwise-convolutions.md), [ADR-093](../adrs/adr-093-the-qpus-take-the-transposed-convolutions-and-the-weights-leave-the-pool.md) |
 | Retros | [Retro-007](../retros/retro-007-gpu-chose-the-integrated-gpu.md), [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-009](../retros/retro-009-host-callback-count-was-the-wrong-lens.md), [Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md), [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md), [Retro-075](../retros/retro-075-upstream-had-already-fixed-the-norm.md), [Retro-076](../retros/retro-076-a-full-device-said-device-lost.md), [Retro-077](../retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md), [Retro-094](../retros/retro-094-a-speedup-measured-against-a-run-with-different-output.md), [Retro-095](../retros/retro-095-an-emulator-that-allows-what-the-hardware-breaks.md), [Retro-096](../retros/retro-096-an-accelerator-primary-rewrote-the-graphs-it-did-not-touch.md), [Retro-097](../retros/retro-097-an-emulator-that-runs-the-qpus-one-at-a-time.md), [Retro-098](../retros/retro-098-a-scheduler-that-placed-weight-ops-by-accident.md), [Retro-099](../retros/retro-099-a-slowdown-blamed-on-the-dimension-that-was-large.md), [Retro-100](../retros/retro-100-a-free-memory-figure-that-is-a-lower-bound.md), [Retro-101](../retros/retro-101-a-board-test-that-linked-what-production-loads.md), [Retro-102](../retros/retro-102-a-room-check-made-before-the-plan-took-its-room.md) |
 | Active tasks | [Backlog → Backends](../backlog/active-index.md#backends--accelerators) |
 
@@ -1368,6 +1368,11 @@ projects q, k and v at once and rotates q and k together, exactly. The sentence 
 
 The user asked for the Pi 4's GPU now that Mesa's V3DV exposes it as a Vulkan 1.3 device, and to
 measure before deciding what to patch. Decision and alternatives: [ADR-089](../adrs/adr-089-v3dv-is-correct-and-opt-in.md).
+
+**A hung job is a failed graph** ([ADR-140](../adrs/adr-140-a-gpu-reset-fails-the-graph-even-when-the-driver-says-it-finished.md),
+loom.cpp#124). V3DV reports a job the kernel killed for hanging as finished. Once a V3D device is
+selected, every graph reads the kernel's v3d reset count around itself, and a count that moved throws
+`DeviceLostError` instead of returning the job's leftovers.
 
 **What it took to run at all** (`ggml-0054`, `ggml-0055`, `cmake/patches/UPSTREAM.md` PRs 50/51): device
 init threw on 16 KB of shared memory over one IQ type's tile; 32 shaders asked for 512 invocations where
