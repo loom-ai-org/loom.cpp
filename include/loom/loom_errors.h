@@ -53,6 +53,14 @@ public:
     explicit SchemaError(const std::string& what) : Error(what) {}
 };
 
+// Thrown when the GPU was reset while a graph ran on it, so its output cannot be used: the kernel's hang
+// check killed a job, and a driver that reports that job as finished (V3DV) would otherwise hand back
+// whatever its buffers held (loom/core/gpu_reset_watch.h, loom.cpp#124).
+class LOOM_ERROR_API DeviceLostError : public Error {
+public:
+    explicit DeviceLostError(const std::string& what) : Error(what) {}
+};
+
 // Thrown by PrimitiveRegistry::get() when a JSON node references an "op" with no registered primitive.
 class LOOM_ERROR_API UnknownOpError : public Error {
 public:
