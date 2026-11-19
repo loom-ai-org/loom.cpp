@@ -245,6 +245,7 @@ checkpoint into a loom GGUF, and a new family is an export, not engine code.
 | Linux ARMv6: Raspberry Pi Zero, Zero W, Pi 1 | ✅ tuned for the ARM1176's VFP | — | [wheel on the release page](https://github.com/loom-ai-org/loom-py/releases/latest) |
 | macOS on Apple Silicon | ✅ with Accelerate | Metal | `pip install loom-py-rt` |
 | macOS on Intel | ✅ built and imported in CI, best effort | — | `pip install loom-py-rt` |
+| A web browser, or Node | ✅ WebAssembly with SIMD, one thread | WebGPU (Chrome, Edge), experimental | [`web/`](web/README.md): `web/build.sh`, then `import { init } from "loom.mjs"` |
 
 GPU backends are separate, small packages (`pip install "loom-py-rt[vulkan]"`, `[cuda]`, `[metal]`) and
 the engine falls back to the CPU for anything a backend cannot run. Windows is not supported yet.

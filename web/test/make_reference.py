@@ -10,8 +10,9 @@ OUT_DIR/reference.json holds the texts and the case list, each waveform OUT_DIR/
 little-endian float32). The JS gates (`node web/test/node_gate.mjs`, `web/test/browser_gate.mjs`)
 read the same cases.
 
-Greedy text must match token for token. A waveform passes when it is within `min_snr_db` of the native
-one: LuaJIT and PUC Lua give the same numbers, but WASM SIMD and x86 sum products in different orders.
+Greedy text must match token for token. A waveform must have the native sample count and be within its
+case's `min_snr_db`: LuaJIT and PUC Lua give the same numbers and the seeded draws are the same on every
+platform (ADR-141), but WASM SIMD and x86 sum products in different orders.
 """
 import argparse
 import array
@@ -24,7 +25,7 @@ import loom
 
 ROOT = Path(__file__).resolve().parents[2]
 JFK = ROOT / "samples" / "jfk.wav"
-CHAT = [{"role": "user", "content": "What is the capital of France? Answer in one word."}]
+CHAT = [{"role": "user", "content": "Write one sentence about the sea."}]
 SPEECH = "Hello from loom, running in a browser."
 PHONEME_TEXT = "Hello from loom."
 
@@ -66,7 +67,11 @@ def main() -> None:
         path, _, voice = spec.partition(":")
         m = loom.Model.from_file(path)
         case = {"name": "phoneme_tts" if phonemes else "tts", "door": "text2speech",
-                "model": str(Path(path).resolve()), "min_snr_db": 40.0}
+                "model": str(Path(path).resolve()),
+                # Paradee is one pass; Pocket-TTS draws its latents frame by frame, so the last-bit
+                # differences between WASM SIMD and x86 sums compound (the sample count, which is every
+                # frame's stop decision, must still match exactly).
+                "min_snr_db": 35.0 if phonemes else 25.0}
         kwargs = {}
         if voice and voice.endswith(".gguf"):
             vpath = (Path(path).parent / voice).resolve()

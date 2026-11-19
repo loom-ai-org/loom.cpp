@@ -9,6 +9,9 @@
 #
 # One thread in both: a pthread build needs SharedArrayBuffer, so a cross-origin-isolated page (COOP/COEP
 # headers), which a page cannot assume. `default_cpu_thread_count` returns 1 here.
+# $<LINK_LIBRARY:WHOLE_ARCHIVE,...> below.
+cmake_minimum_required(VERSION 3.24)
+
 if(NOT EMSCRIPTEN)
     message(FATAL_ERROR "web/ builds under emscripten only (emcmake cmake ...)")
 endif()
@@ -16,7 +19,9 @@ endif()
 set(LOOM_WEB_FLAVOUR "cpu" CACHE STRING "Which web build: cpu or webgpu")
 
 add_executable(loom_web src/loom_web.cpp)
-target_link_libraries(loom_web PRIVATE loom_engine)
+# WHOLE: the primitives register themselves from static initialisers (src/ops/primitive_registry.cpp), and
+# a static link keeps only the objects something references -- without it every op is "unknown".
+target_link_libraries(loom_web PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,loom_engine>")
 set_target_properties(loom_web PROPERTIES OUTPUT_NAME "loom-${LOOM_WEB_FLAVOUR}" SUFFIX ".mjs")
 
 target_link_options(loom_web PRIVATE

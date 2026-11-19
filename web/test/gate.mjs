@@ -89,7 +89,7 @@ if (typeof process !== "undefined" && import.meta.url === new URL(process.argv[1
   const loom = await init({ flavour });
   const ref = JSON.parse(await readFile(path.join(refDir, "reference.json"), "utf8"));
   const read = async (p) => new Uint8Array(await readFile(path.isAbsolute(p) ? p : path.join(refDir, p)));
-  console.log(`loom web gate: ${loom.flavour} build, devices ${loom.devices().map((d) => d.name).join(", ")}`);
+  console.log(`loom web gate: ${loom.flavour} build, devices ${(await loom.devices()).map((d) => d.name).join(", ")}`);
   const sabotage = process.env.LOOM_GATE_SABOTAGE === "1";
   const results = await runGate(loom, ref, { read, sabotage });
   const failed = results.filter((r) => !r.ok).length;
