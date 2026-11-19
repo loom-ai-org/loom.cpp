@@ -437,7 +437,7 @@ int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
 // vocab overflows at ~512 prompt tokens (Retro-004). Sampling in Lua would reinstate that ceiling at
 // exactly the vocabulary size that found it.
 int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* fname, std::mt19937& rng,
-                           std::uniform_real_distribution<float>& uniform, float temperature,
+                           UniformFloat& uniform, float temperature,
                            int64_t top_k, float top_p, int64_t lo, int64_t hi,
                            ggml_tensor* uncond, float guidance_scale, int64_t guidance_top_k,
                            float repetition_penalty, const std::vector<int64_t>& penalized,

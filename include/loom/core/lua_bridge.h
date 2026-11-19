@@ -1,6 +1,7 @@
 #pragma once
 
 #include "loom/core/backend.h"
+#include "loom/core/portable_random.h"
 #include "loom/core/gguf_model.h"
 #include "loom/core/graph_topology.h"
 #include "loom/core/stream_state.h"
@@ -232,7 +233,8 @@ private:
     StreamCaches stream_caches_ = StreamCaches::Auto;
 
     // Backs loom.seed_rng/loom.gaussian_array/loom.uniform_array -- the SAME engine/distribution shapes
-    // (std::mt19937 + std::normal_distribution<float>(0,1) + std::uniform_real_distribution<float>(0,1))
+    // (std::mt19937 + a standard normal + a uniform on [0, 1), libstdc++'s algorithms on every platform:
+    // loom/core/portable_random.h, ADR-141)
     // every existing hand-written driver already uses, so an exact-match test against a C++ driver stays
     // possible (matches loom.argmax_row's own "mirror the real function verbatim" reasoning). Both
     // distributions share the ONE rng_ stream, same as e.g. KokoroDriver/StyleTTS2Driver's own single
@@ -247,8 +249,8 @@ private:
     std::unique_ptr<PlamoVocab> plamo_vocab_;
     bool plamo_checked_ = false;
     const PlamoVocab* plamo_vocab();
-    std::normal_distribution<float> normal_dist_{0.0f, 1.0f};
-    std::uniform_real_distribution<float> uniform_dist_{0.0f, 1.0f};
+    NormalFloat normal_dist_;
+    UniformFloat uniform_dist_;
 
     // Resolves a module name to that module's retained-output store, throwing a loom::Error naming the
     // module if it is unregistered or has never been run with retention. A static member rather than a
