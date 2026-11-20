@@ -18,6 +18,11 @@ extern "C" {
 #include <lualib.h>
 }
 
+#ifdef LOOM_LUA_PUC
+// LuaBitOp (cmake/LuaPuc.cmake): the `bit` library LuaJIT has built in, for the PUC Lua 5.1 build (ADR-139).
+extern "C" int luaopen_bit(lua_State* L);
+#endif
+
 #include <ggml-backend.h>
 
 #include <algorithm>
@@ -432,7 +437,7 @@ int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
 // vocab overflows at ~512 prompt tokens (Retro-004). Sampling in Lua would reinstate that ceiling at
 // exactly the vocabulary size that found it.
 int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* fname, std::mt19937& rng,
-                           std::uniform_real_distribution<float>& uniform, float temperature,
+                           UniformFloat& uniform, float temperature,
                            int64_t top_k, float top_p, int64_t lo, int64_t hi,
                            ggml_tensor* uncond, float guidance_scale, int64_t guidance_top_k,
                            float repetition_penalty, const std::vector<int64_t>& penalized,
@@ -2662,6 +2667,10 @@ std::function<OutputStore&(const std::string&)> LoomLuaBridge::store_lookup(Loom
 LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_(backends) {
     if (L_ == nullptr) throw Error("LoomLuaBridge: luaL_newstate() failed (out of memory)");
     luaL_openlibs(L_);
+#ifdef LOOM_LUA_PUC
+    lua_pushcfunction(L_, luaopen_bit);
+    lua_call(L_, 0, 0);  // registers the global `bit`, as LuaJIT's own is
+#endif
 
     lua_newtable(L_); // the "loom" table
     const struct {

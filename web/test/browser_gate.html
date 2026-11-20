@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>loom web gate</title>
+<pre id="log"></pre>
+<script type="module">
+// Opened by browser_gate.mjs: runs gate.mjs's cases in this browser and posts the results back.
+import { init } from "../dist/loom.mjs";
+import { runGate } from "./gate.mjs";
+
+const params = new URLSearchParams(location.search);
+const post = (where, body) => fetch(where, { method: "POST", body: typeof body === "string" ? body : JSON.stringify(body) });
+const log = (line) => {
+  document.getElementById("log").textContent += line + "\n";
+  post("/log", line);
+};
+try {
+  const loom = await init({ flavour: params.get("flavour") || "auto" });
+  const devices = (await loom.devices()).map((d) => `${d.name} (${d.description})`);
+  log(`loom web gate in ${navigator.userAgent.match(/Chrom\S+/)?.[0]}: ${loom.flavour} build, devices ${devices.join(", ")}`);
+  const ref = await (await fetch("/ref/reference.json")).json();
+  const read = async (p) => new Uint8Array(await (await fetch("/ref/" + encodeURIComponent(p))).arrayBuffer());
+  const results = await runGate(loom, ref, { read, log, sabotage: params.get("sabotage") === "1" });
+  await post("/result", { flavour: loom.flavour, devices, results });
+} catch (e) {
+  log(`error: ${e.stack || e}`);
+  await post("/result", { error: String(e.message || e) });
+}
+</script>

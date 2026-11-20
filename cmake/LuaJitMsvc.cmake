@@ -127,3 +127,4 @@ target_include_directories(luajit_static PUBLIC ${LUAJIT_SRC_DIR})
 target_compile_definitions(luajit_static PRIVATE ${LUAJIT_MSVC_DEFS})
 
 add_library(luajit::luajit ALIAS luajit_static)
+add_library(loom::lua ALIAS luajit_static)

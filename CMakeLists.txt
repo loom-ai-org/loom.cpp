@@ -77,6 +77,7 @@ add_library(loom_engine
     src/core/supertonic_text_vectorizer.cpp
     src/core/ctc_decode.cpp
     src/core/gpu_reset_watch.cpp
+    src/core/tokenizer.cpp
     src/ops/primitive_registry.cpp
     src/ops/primitives_basic.cpp
     src/ops/primitives_mil.cpp
@@ -93,7 +94,7 @@ add_library(loom::engine ALIAS loom_engine)
 target_include_directories(loom_engine PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_link_libraries(loom_engine PUBLIC ggml nlohmann_json::nlohmann_json luajit::luajit)
+target_link_libraries(loom_engine PUBLIC ggml nlohmann_json::nlohmann_json loom::lua)
 
 # MSVC. Three things GCC and Clang give for free:
 #   * EXPORTS. A DLL exports nothing unless told, and this library has no export macro -- on ELF and
@@ -144,4 +145,9 @@ endif()
 if(LOOM_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# The browser build (web/, ADR-139): the engine as a WebAssembly module with a JavaScript API.
+if(EMSCRIPTEN)
+    add_subdirectory(web)
 endif()

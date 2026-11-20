@@ -114,6 +114,11 @@ void load_loom_backends_default() {
 
 void ensure_backends_loaded() {
     std::lock_guard<std::mutex> lock(loader_mutex());
+#if defined(__EMSCRIPTEN__)
+    // A WebAssembly module links every backend it has (web/, ADR-139) and can load none: ggml's sweep would
+    // only print each search path it could not find.
+    return;
+#endif
     for (const std::string& dir : pending_search_paths()) {
         ggml_backend_load_all_from_path(dir.c_str());
         load_loom_backends_from(dir);
@@ -606,6 +611,11 @@ void apply_cpu_threads(ggml_backend_t backend) {
 } // namespace
 
 int default_cpu_thread_count() {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    // A WebAssembly build without pthreads (web/, ADR-139) has one thread and no way to make another:
+    // ggml's threadpool would fail its first pthread_create.
+    return 1;
+#endif
     // Resolution order is this project's usual one for something the machine can answer for itself
     // (see Device::open's `spec`): the environment first, then autodetection. A non-numeric or
     // non-positive $LOOM_N_THREADS falls through to autodetection rather than to ggml's 4, because
