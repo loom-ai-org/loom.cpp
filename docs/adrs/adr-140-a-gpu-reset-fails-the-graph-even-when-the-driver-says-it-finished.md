@@ -34,17 +34,21 @@ just never returns that error.
 
 **Ask the kernel instead of the driver.** `loom/core/gpu_reset_watch.h`:
 
-1. `Device::open` arms the watch when the selected device's description names a V3D GPU. On any other
-   device the watch stays unarmed, and the check costs one relaxed atomic load.
-2. Armed, `GraphBuilder::compute` reads the reset count before and after every graph, and a count that
-   moved throws `DeviceLostError` (a new `loom::Error`). Every graph runs through that call, and
-   `ggml_backend_graph_compute` returns only after the GPU has finished, so the check covers each one.
+1. `Device::open` arms the reset count when the selected device's description names a V3D GPU.
+2. **Per device, not per process.** A `GraphBuilder` whose backends include a V3D device (its
+   description, or its name, says V3D) is *watched*. Its `compute` reads the reset count before and
+   after every graph, and a count that moved throws `DeviceLostError` (a new `loom::Error`). Every graph
+   runs through that call, and `ggml_backend_graph_compute` returns only after the GPU has finished, so
+   the check covers each one. A graph on any other device reads nothing: a reset cannot touch a graph
+   that ran on the CPU, so a CPU model in the same process as a V3D one is never refused for it. A CPU
+   graph that reads a V3D graph's output is covered by that graph's own check. For every unwatched graph
+   the cost is one branch on a bool the builder computed once.
 3. The count is the kernel's `DRM_V3D_PARAM_GLOBAL_RESET_COUNTER` (Linux 6.18+), read with one ioctl on
    the v3d render node, which needs only the `render` group. On an older kernel, the fallback is the
    time of the last "Resetting GPU for hang" line in the kernel log (`klogctl`), which needs
    `dmesg_restrict=0` or the `adm` group. With neither, arming prints a warning that resets cannot be
    seen.
-4. The counter is global. A reset caused by another process on the same GPU also fails the graph
+4. The counter is global. A reset caused by another process on the same GPU also fails a V3D graph
    running here. That is the safe answer, because the reset may have taken this process's queued jobs
    with it, and the message says the call can be retried.
 
@@ -63,12 +67,14 @@ just never returns that error.
 
 ## Consequences
 
-* Measured on the Pi 4 with `GGML_VK_VISIBLE_DEVICES=0`, with graphs looping on V3DV for 5 s while a
-  second process plants a hang: one call refused at 1.93 s ("reset count 1 -> 2"), and 15 357 ran.
-  The control run with no hang refused 0 of 11 843. The same loop on the CPU device stays unarmed, and
-  the hang does not affect it.
-* `tests/ci/test_gpu_reset_watch` drives a stand-in counter through a real driver call. It checks:
-  unarmed and non-V3D devices, a still count, a moving count, an unreadable source, the typed error,
-  and the log parse on the Pi's own lines. Sabotaging the `verify` call or the log timestamp fails it.
+* Measured on the Pi 4 with `GGML_VK_VISIBLE_DEVICES=0`. One process ran graphs on V3DV and on the CPU,
+  alternating, for 5 s, while a second process planted a hang. One V3D call was refused, at 0.91 s
+  ("reset count 3 -> 4"), and 13 864 V3D and 13 865 CPU calls ran. No CPU call was refused. The control
+  run with no hang refused 0 of 10 499 on each device.
+* `tests/ci/test_gpu_reset_watch` drives a stand-in counter through a real driver call. CI has no V3D,
+  so it makes the CPU the watched device for one bridge. It checks: unarmed and non-V3D devices, a
+  still count, a moving count on an unwatched graph (it runs) and on a watched one (it fails), an
+  unreadable source, the typed error, and the log parse on the Pi's own lines. Sabotaging the `verify`
+  call, the log timestamp, or the per-device decision (watch everything, watch nothing) fails it.
 * Hosts see an ordinary engine error, `loom.LoomError` in loom-py, naming the reset. Nothing else
   changes for any other device.
