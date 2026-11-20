@@ -1,7 +1,10 @@
 // The GPU reset watch (loom/core/gpu_reset_watch.h, ADR-140, loom.cpp#124), with the kernel's counter
-// replaced by one this test moves: a graph during which the count moves must fail, through the same
-// driver call a model makes, and one during which it does not must run as before. The kernel half (the
-// v3d ioctl, the log fallback) is the Pi 4 gate in ADR-140, with a planted hang.
+// replaced by one this test moves. A graph on a watched device during which the count moves must fail,
+// through the same driver call a model makes; one during which it does not must run as before; and a
+// graph on any other device -- the CPU, here -- must run whatever the count does, because the watch is
+// per device, not per process. CI has no V3D, so the test makes the CPU the watched device for one
+// bridge. The kernel half (the v3d ioctl, the log fallback) is the Pi 4 run in ADR-140, with a planted
+// hang.
 
 #include "test_util.h"
 
@@ -10,6 +13,7 @@
 #include "cpu_backend.h"
 
 #include <atomic>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -27,6 +31,22 @@ const char* kScript = R"lua(
         return loom.run_subgraph('stage', {n_tokens = #inputs.tokens, n_past = 0}, {tokens = inputs.tokens})
     end
 )lua";
+
+std::unique_ptr<loom::LoomLuaBridge> make_bridge(ggml_backend_t backend, loom::GgufModel& model) {
+    auto bridge = std::make_unique<loom::LoomLuaBridge>(backend);
+    bridge->register_module("stage", model, loom::GraphTopology::parse(kStage));
+    bridge->load_script(kScript);
+    return bridge;
+}
+
+bool call_runs(loom::LoomLuaBridge& bridge) {
+    try {
+        bridge.call("infer", {{"tokens", std::vector<double>{1, 2, 3}}});
+        return true;
+    } catch (const loom::Error&) {
+        return false;
+    }
+}
 
 bool call_fails_with(loom::LoomLuaBridge& bridge, const std::string& needle) {
     try {
@@ -65,23 +85,38 @@ int main() {
     bridge.call("infer", inputs);
     bridge.call("infer", inputs);
 
-    // A reset during the graph (the count moves between the two reads): the call fails, naming it.
+    // A reset during a graph (the count moves between the two reads), but the graph ran on the CPU, which
+    // is not a watched device: it runs, as a CPU model beside a V3D one in the same process must.
     watch::arm_for_test([&] { return resets.fetch_add(1); });
-    LOOM_CHECK(call_fails_with(bridge, "the GPU was reset while a graph on CPU ran"));
+    LOOM_CHECK(!watch::watches(backend.get()));
+    LOOM_CHECK(call_runs(bridge));
 
-    // The same check, without the bridge in between: a DeviceLostError, the type a host can catch.
+    // The same graph on a device that IS watched (the CPU made one, for this bridge): the call fails,
+    // naming the reset.
+    watch::watch_devices_for_test("CPU");
+    LOOM_CHECK(watch::watches(backend.get()));
+    auto watched = make_bridge(backend.get(), *model);
+    LOOM_CHECK(call_fails_with(*watched, "the GPU was reset while a graph on CPU ran"));
+    // The bridge made before still is not: whether a graph is watched is fixed when its builder is made.
+    LOOM_CHECK(call_runs(bridge));
+    watch::watch_devices_for_test("V3D");
+
+    // The same check, without the bridge in between: a DeviceLostError, the type a host can catch -- and
+    // nothing at all for an unwatched graph.
     bool typed = false;
     try {
-        const watch::Check check;
+        const watch::Check check(true);
         check.verify("this graph");
     } catch (const loom::DeviceLostError&) {
         typed = true;
     }
     LOOM_CHECK(typed);
+    const watch::Check unwatched(false);
+    unwatched.verify("a CPU graph");
 
-    // A source that cannot be read (-1) is not a reset.
+    // A source that cannot be read (-1) is not a reset, on a watched graph either.
     watch::arm_for_test([] { return int64_t{-1}; });
-    bridge.call("infer", inputs);
+    watched->call("infer", inputs);
 
     // Disarmed again, and the next call runs.
     watch::arm_for_test({});

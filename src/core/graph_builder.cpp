@@ -203,6 +203,8 @@ GraphBuilder::GraphBuilder(const GraphTopology& topo, GgufModel& model, Backends
       kv_cache_(kv_cache), conv_state_(conv_state), compute_meta_bytes_(compute_meta_bytes) {
     kv_serial_ = kv_cache_ ? kv_cache_->serial() : 0;
     conv_serial_ = conv_state_ ? conv_state_->serial() : 0;
+    watch_resets_ = gpu_reset_watch::watches(backends.primary) || gpu_reset_watch::watches(backends.fallback);
+    for (ggml_backend_t assist : backends.assists) watch_resets_ = watch_resets_ || gpu_reset_watch::watches(assist);
     if (backend_ == nullptr) {
         throw Error("GraphBuilder: no primary backend -- construct a loom::Device, or pass a "
                     "ggml_backend_t directly");
@@ -777,7 +779,7 @@ void GraphBuilder::compute() {
     // buffers (loom/core/profile.h). The branch is a load of a cached bool, and it is here rather than
     // inside profile::compute so that a non-profiled run reaches the ggml call it always did.
     const bool profiled = profile::enabled();
-    const gpu_reset_watch::Check reset_check;  // one atomic load unless a V3D GPU armed it (ADR-140)
+    const gpu_reset_watch::Check reset_check(watch_resets_);  // only a graph on a V3D device (ADR-140)
     const ggml_status status = backends_.hybrid()
         ? (profiled ? profile::compute(sched_.get(), cached_.graph)
                     : ggml_backend_sched_graph_compute(sched_.get(), cached_.graph))

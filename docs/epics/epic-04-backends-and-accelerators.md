@@ -1370,9 +1370,10 @@ The user asked for the Pi 4's GPU now that Mesa's V3DV exposes it as a Vulkan 1.
 measure before deciding what to patch. Decision and alternatives: [ADR-089](../adrs/adr-089-v3dv-is-correct-and-opt-in.md).
 
 **A hung job is a failed graph** ([ADR-140](../adrs/adr-140-a-gpu-reset-fails-the-graph-even-when-the-driver-says-it-finished.md),
-loom.cpp#124). V3DV reports a job the kernel killed for hanging as finished. Once a V3D device is
-selected, every graph reads the kernel's v3d reset count around itself, and a count that moved throws
-`DeviceLostError` instead of returning the job's leftovers.
+loom.cpp#124). V3DV reports a job the kernel killed for hanging as finished. Every graph that runs on
+a V3D device reads the kernel's v3d reset count around itself, and a count that moved throws
+`DeviceLostError` instead of returning the job's leftovers. Graphs on other devices, including the CPU
+in the same process, are not checked.
 
 **What it took to run at all** (`ggml-0054`, `ggml-0055`, `cmake/patches/UPSTREAM.md` PRs 50/51): device
 init threw on 16 KB of shared memory over one IQ type's tile; 32 shaders asked for 512 invocations where

@@ -26,6 +26,7 @@ namespace {
 
 std::atomic<bool> g_armed{false};
 std::mutex g_mutex;
+std::string g_needle = "V3D";  // guarded by g_mutex
 std::function<int64_t()> g_source;  // guarded by g_mutex
 
 #if defined(__linux__)
@@ -117,7 +118,7 @@ int64_t log_token(const std::string& log) {
 }
 
 void arm(const std::string& device_description) {
-    if (device_description.find("V3D") == std::string::npos) return;
+    if (device_description.find("V3D") == std::string::npos) return;  // the kernel source is v3d's alone
 #if defined(__linux__)
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_armed.load(std::memory_order_relaxed)) return;
@@ -127,6 +128,23 @@ void arm(const std::string& device_description) {
 }
 
 bool armed() { return g_armed.load(std::memory_order_relaxed); }
+
+bool watches(ggml_backend_t backend) {
+    if (backend == nullptr) return false;
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) return false;
+    // The description names a GPU ("V3D 4.2.14.0"); the name is what a CPU says it is ("CPU").
+    const char* description = ggml_backend_dev_description(dev);
+    const char* name = ggml_backend_dev_name(dev);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return (description != nullptr && std::string(description).find(g_needle) != std::string::npos) ||
+           (name != nullptr && std::string(name).find(g_needle) != std::string::npos);
+}
+
+void watch_devices_for_test(const std::string& needle) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_needle = needle;
+}
 
 int64_t count() {
     if (!armed()) return -1;
@@ -140,7 +158,7 @@ void arm_for_test(std::function<int64_t()> source) {
     g_armed.store(static_cast<bool>(g_source), std::memory_order_relaxed);
 }
 
-Check::Check() : before_(armed() ? count() : -1) {}
+Check::Check(bool watched) : before_(watched && armed() ? count() : -1) {}
 
 void Check::verify(const std::string& what) const {
     if (before_ < 0) return;
