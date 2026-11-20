@@ -1,4 +1,5 @@
 #include "loom/core/backend.h"
+#include "loom/core/gpu_reset_watch.h"
 #include "loom/loom_errors.h"
 
 #include <algorithm>
@@ -774,6 +775,9 @@ Device Device::open(const std::string& spec, size_t weight_bytes) {
     }
     device.name_ = ggml_backend_dev_name(dev);
     device.description_ = ggml_backend_dev_description(dev);
+    // A V3D GPU reports a job the kernel killed for hanging as finished (loom.cpp#124); from here on every
+    // graph checks the kernel's reset count around itself.
+    gpu_reset_watch::arm(device.description_);
     if (!note.empty()) device.selection_note_ = "'auto' chose " + device.name_ + ": " + note;
     apply_cpu_threads(device.primary_.get());
 

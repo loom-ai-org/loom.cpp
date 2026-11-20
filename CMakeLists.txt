@@ -76,6 +76,7 @@ add_library(loom_engine
     src/core/phoneme_vocab.cpp
     src/core/supertonic_text_vectorizer.cpp
     src/core/ctc_decode.cpp
+    src/core/gpu_reset_watch.cpp
     src/ops/primitive_registry.cpp
     src/ops/primitives_basic.cpp
     src/ops/primitives_mil.cpp
