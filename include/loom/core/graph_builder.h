@@ -298,6 +298,9 @@ private:
     // (the declared inputs, the gallocr's buffer type), and spelling that `backends_.primary` at each
     // site would obscure that they all deliberately go to ONE backend even when two are in play.
     ggml_backend_t backend_;
+    // Whether this graph runs on a V3D device, whose resets loom.cpp#124 makes it check for (ADR-140). Asked
+    // once: a device's description does not change.
+    bool watch_resets_ = false;
     KvCache* kv_cache_;
     ConvStateCache* conv_state_;
     uint64_t kv_serial_ = 0;

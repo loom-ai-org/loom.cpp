@@ -1,4 +1,5 @@
 #include "loom/core/graph_builder.h"
+#include "loom/core/gpu_reset_watch.h"
 #include "loom/core/conv_state_cache.h"
 #include "loom/core/kv_cache.h"
 #include "loom/core/output_store.h"
@@ -202,6 +203,8 @@ GraphBuilder::GraphBuilder(const GraphTopology& topo, GgufModel& model, Backends
       kv_cache_(kv_cache), conv_state_(conv_state), compute_meta_bytes_(compute_meta_bytes) {
     kv_serial_ = kv_cache_ ? kv_cache_->serial() : 0;
     conv_serial_ = conv_state_ ? conv_state_->serial() : 0;
+    watch_resets_ = gpu_reset_watch::watches(backends.primary) || gpu_reset_watch::watches(backends.fallback);
+    for (ggml_backend_t assist : backends.assists) watch_resets_ = watch_resets_ || gpu_reset_watch::watches(assist);
     if (backend_ == nullptr) {
         throw Error("GraphBuilder: no primary backend -- construct a loom::Device, or pass a "
                     "ggml_backend_t directly");
@@ -776,6 +779,7 @@ void GraphBuilder::compute() {
     // buffers (loom/core/profile.h). The branch is a load of a cached bool, and it is here rather than
     // inside profile::compute so that a non-profiled run reaches the ggml call it always did.
     const bool profiled = profile::enabled();
+    const gpu_reset_watch::Check reset_check(watch_resets_);  // only a graph on a V3D device (ADR-140)
     const ggml_status status = backends_.hybrid()
         ? (profiled ? profile::compute(sched_.get(), cached_.graph)
                     : ggml_backend_sched_graph_compute(sched_.get(), cached_.graph))
@@ -786,6 +790,7 @@ void GraphBuilder::compute() {
                     std::string(ggml_backend_name(backend_)) + " (ggml_status " +
                     std::to_string(static_cast<int>(status)) + ")");
     }
+    reset_check.verify(std::string("a graph on ") + ggml_backend_name(backend_));
 }
 
 std::vector<std::string> GraphBuilder::node_backends() const {

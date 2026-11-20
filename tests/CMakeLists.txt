@@ -545,6 +545,13 @@ add_test(NAME test_input_alias COMMAND test_input_alias)
 set_tests_properties(test_input_alias PROPERTIES LABELS ci)
 set_tests_properties(test_input_alias PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+add_executable(test_gpu_reset_watch ci/test_gpu_reset_watch.cpp)
+target_link_libraries(test_gpu_reset_watch PRIVATE loom::engine)
+target_compile_definitions(test_gpu_reset_watch PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_gpu_reset_watch COMMAND test_gpu_reset_watch)
+set_tests_properties(test_gpu_reset_watch PROPERTIES LABELS ci)
+set_tests_properties(test_gpu_reset_watch PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+
 add_executable(test_gallocr_shrink ci/test_gallocr_shrink.cpp)
 target_link_libraries(test_gallocr_shrink PRIVATE loom::engine)
 target_compile_definitions(test_gallocr_shrink PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
