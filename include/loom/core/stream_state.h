@@ -33,6 +33,7 @@
 // ITS OWN RANDOM STREAM, once seeded. A sampled stream drawing from the bridge's one generator would
 // draw a different sequence whenever another stream ran in between; a seeded state carries its own.
 #include "loom/core/cache_lease.h"
+#include "loom/core/portable_random.h"
 
 #include <ggml-backend.h>
 
@@ -104,8 +105,8 @@ public:
 
     struct Rng {
         std::mt19937 engine;
-        std::normal_distribution<float> normal{0.0f, 1.0f};
-        std::uniform_real_distribution<float> uniform{0.0f, 1.0f};
+        NormalFloat normal;
+        UniformFloat uniform;
     };
     // Gives the stream a generator of its own, seeded; null until then, which means the bridge's.
     void seed_rng(uint32_t seed);

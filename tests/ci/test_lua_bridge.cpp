@@ -152,18 +152,18 @@ int main() {
         LOOM_CHECK(std::get<double>(result) == 42.0);
     }
 
-    // --- loom.seed_rng/loom.gaussian_array: same std::mt19937+std::normal_distribution<float>(0,1)
-    //     engine every hand-written driver's own RNG uses -- compare directly against an independent
-    //     instance of that exact engine/distribution computed here, not hand-transcribed magic numbers. ---
+    // --- loom.seed_rng/loom.gaussian_array: std::mt19937 + a standard normal, libstdc++'s algorithm on
+    //     every platform (portable_random.h, ADR-141). Fixed values, recorded from libstdc++'s own
+    //     std::normal_distribution<float>, rather than an instance compiled here: on libc++ (macOS,
+    //     emscripten) that instance returns each polar pair the other way round, which is the defect. ---
     {
         auto result = bridge.call("test_gaussian", {{"seed", 42.0}, {"n", 5.0}});
         const auto& arr = std::get<std::vector<double>>(result);
         LOOM_CHECK(arr.size() == 5);
-        std::mt19937 rng(42);
-        std::normal_distribution<float> normal(0.0f, 1.0f);
+        const float want[] = {1.22192132f, -0.516964138f, 0.86963594f, 0.721332669f, 1.58855629f};
         bool all_match = true;
-        for (double v : arr) {
-            if (std::fabs(v - static_cast<double>(normal(rng))) > 1e-9) all_match = false;
+        for (size_t i = 0; i < arr.size(); ++i) {
+            if (arr[i] != static_cast<double>(want[i])) all_match = false;
         }
         LOOM_CHECK(all_match);
 
@@ -172,19 +172,17 @@ int main() {
         LOOM_CHECK(std::get<std::vector<double>>(result2) == arr);
     }
 
-    // --- loom.uniform_array: same std::mt19937+std::uniform_real_distribution<float>(0,1) engine as
-    //     KokoroDriver/StyleTTS2Driver's own uniform01(rng_) draws -- compare against an independent
-    //     instance of that exact engine/distribution. ---
+    // --- loom.uniform_array: std::mt19937 + a uniform on [0, 1), libstdc++'s generate_canonical, fixed
+    //     values as above. ---
     {
         auto result = bridge.call("test_uniform", {{"seed", 7.0}, {"n", 5.0}});
         const auto& arr = std::get<std::vector<double>>(result);
         LOOM_CHECK(arr.size() == 5);
-        std::mt19937 rng(7);
-        std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+        const float want[] = {0.0763082877f, 0.227339074f, 0.77991879f, 0.31897223f, 0.438409239f};
         bool all_match = true;
-        for (double v : arr) {
-            if (std::fabs(v - static_cast<double>(uniform(rng))) > 1e-9) all_match = false;
-            if (v < 0.0 || v >= 1.0) all_match = false;
+        for (size_t i = 0; i < arr.size(); ++i) {
+            if (arr[i] != static_cast<double>(want[i])) all_match = false;
+            if (arr[i] < 0.0 || arr[i] >= 1.0) all_match = false;
         }
         LOOM_CHECK(all_match);
 
@@ -201,15 +199,11 @@ int main() {
         auto result = bridge.call("test_uniform_then_gaussian", {{"seed", 99.0}, {"n_u", 3.0}, {"n_g", 3.0}});
         const auto& arr = std::get<std::vector<double>>(result);
         LOOM_CHECK(arr.size() == 6);
-        std::mt19937 rng(99);
-        std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-        std::normal_distribution<float> normal(0.0f, 1.0f);
-        std::vector<double> expected;
-        for (int i = 0; i < 3; ++i) expected.push_back(static_cast<double>(uniform(rng)));
-        for (int i = 0; i < 3; ++i) expected.push_back(static_cast<double>(normal(rng)));
+        const float expected[] = {0.672278583f, 0.722539663f, 0.488078386f,
+                                  0.377747387f, 0.385236204f, 0.928030014f};
         bool all_match = true;
         for (size_t i = 0; i < arr.size(); ++i) {
-            if (std::fabs(arr[i] - expected[i]) > 1e-9) all_match = false;
+            if (arr[i] != static_cast<double>(expected[i])) all_match = false;
         }
         LOOM_CHECK(all_match);
     }

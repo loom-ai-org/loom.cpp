@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>loom in the browser</title>
+<style>
+  :root { --bg: #fbfaf7; --fg: #1d1c1a; --muted: #6b675f; --line: #e2ded5; --accent: #2f5d8a; --bad: #a33; --card: #fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --fg: #ecebe7; --muted: #a29f97; --line: #34322e; --accent: #8ab4dc; --bad: #e88; --card: #1f1f1d; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .muted { color: var(--muted); }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-top: 16px; }
+  h2 { font-size: 16px; margin: 0 0 8px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 8px 0 4px; }
+  input[type=text], input[type=url], textarea, select { width: 100%; font: inherit; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); }
+  textarea { min-height: 72px; resize: vertical; }
+  button { font: inherit; padding: 8px 14px; margin-top: 10px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--bg); cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; min-height: 2.5em; margin: 10px 0 0; }
+  .error { color: var(--bad); }
+  audio { width: 100%; margin-top: 10px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>loom in the browser</h1>
+  <p class="muted" id="status">Loading the engine…</p>
+
+  <section>
+    <h2>Model</h2>
+    <label for="url">A loom GGUF: a URL, or pick a file</label>
+    <input id="url" type="url" placeholder="https://huggingface.co/loom-ai-org/moonshine-tiny-loom/resolve/main/moonshine-tiny-q8_0.gguf">
+    <input id="file" type="file" accept=".gguf">
+    <label for="device">Device</label>
+    <select id="device"><option value="">best available</option><option value="cpu">CPU</option></select>
+    <button id="load" disabled>Load</button>
+    <pre id="info"></pre>
+  </section>
+
+  <section id="chat" hidden>
+    <h2>Chat (text2text)</h2>
+    <textarea id="prompt">What is the capital of France?</textarea>
+    <button id="send">Send</button>
+    <pre id="reply"></pre>
+  </section>
+
+  <section id="tts" hidden>
+    <h2>Speech (text2speech)</h2>
+    <textarea id="speak">Hello from loom, running in your browser.</textarea>
+    <label for="voice">Voice</label>
+    <select id="voice"></select>
+    <label for="voicefile">or a voice file for this model</label>
+    <input id="voicefile" type="file" accept=".gguf">
+    <button id="say">Speak</button>
+    <audio id="player" controls></audio>
+    <pre id="ttsinfo"></pre>
+  </section>
+
+  <section id="asr" hidden>
+    <h2>Transcription (speech2text)</h2>
+    <input id="clip" type="file" accept="audio/*">
+    <button id="transcribe">Transcribe</button>
+    <pre id="transcript"></pre>
+  </section>
+</main>
+<script type="module">
+import { init, decodeAudio, toWav } from "../dist/loom.mjs";
+
+const $ = (id) => document.getElementById(id);
+const flavour = new URLSearchParams(location.search).get("flavour") || "auto";
+let loom, model, voiceFile = null;
+
+function fail(where, e) { where.textContent = e.message || String(e); where.classList.add("error"); }
+function busy(button, on) { button.disabled = on; }
+
+try {
+  loom = await init({ flavour });
+  const names = (await loom.devices()).map((d) => d.name).join(", ");
+  $("status").textContent = `Engine ready: the ${loom.flavour} build (devices: ${names}).` +
+    (loom.flavour === "cpu" ? " WebGPU needs a browser with WebGPU and JSPI (Chrome or Edge 137+)." : "");
+  $("load").disabled = false;
+} catch (e) {
+  fail($("status"), e);
+}
+
+$("load").onclick = async () => {
+  const button = $("load");
+  busy(button, true);
+  $("info").classList.remove("error");
+  $("info").textContent = "Loading…";
+  try {
+    model?.dispose();
+    const source = $("file").files[0] || $("url").value.trim();
+    if (!source) throw new Error("give a URL or pick a file");
+    const t0 = performance.now();
+    model = await loom.loadModel(source, { device: $("device").value });
+    const c = model.contract;
+    $("info").textContent = `${c.task || "undeclared"} (${c.interface}) on ${model.device.description}, ` +
+      `loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s` + (c.sample_rate ? `, ${c.sample_rate} Hz` : "");
+    $("chat").hidden = c.interface !== "text2text";
+    $("tts").hidden = c.interface !== "text2speech";
+    $("asr").hidden = c.interface !== "speech2text";
+    $("voice").replaceChildren(...["", ...model.voices].map((v) => new Option(v || "(the model's own)", v)));
+  } catch (e) {
+    fail($("info"), e);
+  }
+  busy(button, false);
+};
+
+$("send").onclick = async () => {
+  const button = $("send");
+  busy(button, true);
+  $("reply").classList.remove("error");
+  $("reply").textContent = "";
+  try {
+    const messages = [{ role: "user", content: $("prompt").value }];
+    const run = model.chatRoles.length ? model.text2text.chatStream(messages) : model.text2text.stream($("prompt").value);
+    for await (const piece of run) $("reply").textContent += piece;
+  } catch (e) {
+    fail($("reply"), e);
+  }
+  busy(button, false);
+};
+
+$("voicefile").onchange = async () => {
+  voiceFile = $("voicefile").files[0] ? await model.loadVoice($("voicefile").files[0]) : null;
+};
+
+$("say").onclick = async () => {
+  const button = $("say");
+  busy(button, true);
+  $("ttsinfo").classList.remove("error");
+  $("ttsinfo").textContent = "Synthesising…";
+  try {
+    const t0 = performance.now();
+    const voice = voiceFile || $("voice").value || undefined;
+    const { samples, sampleRate } = await model.text2speech.infer($("speak").value, voice ? { voice } : {});
+    const seconds = (performance.now() - t0) / 1000;
+    $("player").src = URL.createObjectURL(new Blob([toWav(samples, sampleRate)], { type: "audio/wav" }));
+    $("player").play();
+    const duration = samples.length / sampleRate;
+    $("ttsinfo").textContent = `${duration.toFixed(2)} s of audio in ${seconds.toFixed(2)} s ` +
+      `(${(duration / seconds).toFixed(2)}x real time, RTF ${(seconds / duration).toFixed(3)})`;
+  } catch (e) {
+    fail($("ttsinfo"), e);
+  }
+  busy(button, false);
+};
+
+$("transcribe").onclick = async () => {
+  const button = $("transcribe");
+  busy(button, true);
+  $("transcript").classList.remove("error");
+  $("transcript").textContent = "Transcribing…";
+  try {
+    const file = $("clip").files[0];
+    if (!file) throw new Error("pick an audio file");
+    const samples = await decodeAudio(file, model.sampleRate);
+    const t0 = performance.now();
+    const r = await model.speech2text.transcribe(samples);
+    const seconds = (performance.now() - t0) / 1000;
+    const duration = samples.length / model.sampleRate;
+    $("transcript").textContent = `${r.text}\n\n(${duration.toFixed(1)} s of audio in ${seconds.toFixed(2)} s, ` +
+      `${(duration / seconds).toFixed(2)}x real time)`;
+  } catch (e) {
+    fail($("transcript"), e);
+  }
+  busy(button, false);
+};
+</script>
+</body>
+</html>

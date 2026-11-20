@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: inference-engine
-last_updated: 2026-11-14
+last_updated: 2026-11-19
 ---
 
 # Epic-01: The Data-Driven ggml Inference Engine Core
@@ -83,6 +83,7 @@ straight back ([Retro-045](../retros/retro-045-the-allocator-handed-the-same-add
 | Inputs by reference | [ADR-031](../adrs/adr-031-a-driver-edge-is-a-reference-unless-the-host-does-arithmetic.md), [ADR-073](../adrs/adr-073-a-referenced-input-is-read-in-place.md), [Retro-083](../retros/retro-083-a-pointer-swap-test-must-read-through-a-view.md) |
 | Foundational | [ADR-001](../adrs/adr-001-data-driven-gguf-topologies.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md) |
 | Verification | [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md) |
+| Driver VM, draws | [ADR-139](../adrs/adr-139-the-engine-runs-in-a-browser-on-webgpu-or-the-cpu.md) (`LOOM_LUA=puc`: PUC Lua 5.1 + LuaBitOp where LuaJIT cannot go), [ADR-141](../adrs/adr-141-seeded-draws-are-the-same-numbers-on-every-standard-library.md) (seeded draws identical on every standard library) |
 | Retros | [Retro-001](../retros/retro-001-layout-healing-heuristics.md), [Retro-003](../retros/retro-003-tdt-decoder-recomputed-its-prediction-network.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md), [Retro-045](../retros/retro-045-the-allocator-handed-the-same-address-back.md) |
 | Active tasks | [correctness](../backlog/active-index.md#engine--correctness) · [performance](../backlog/active-index.md#engine--performance) |
 
