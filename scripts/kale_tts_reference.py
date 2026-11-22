@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""kale-tts-1-tiny (loom-exporter `kale_tts_export.py`, ADR-138) by upstream's own code, as the oracle
+"""kale-tts-1-tiny (loom-exporter `kale_tts_export.py`, ADR-142) by upstream's own code, as the oracle
 `test_e2e_kale_tts` is held to.
 
     kale_tts_reference.py OUT_DIR "<text>" [--voice kenzie] [--seed 0] [--model ~/Dev/models/kale-tts-1-tiny]

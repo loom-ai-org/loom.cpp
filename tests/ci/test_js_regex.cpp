@@ -1,7 +1,7 @@
 // Tests loom::JsRegex (src/core/js_regex.cpp), the matcher kale-tts-1's JavaScript front end runs its rules with.
 //
 // **The measured claim is that it IS ECMAScript's RegExp on its subset**: the front end built on it is identical
-// to upstream's JavaScript on 8678 texts (tokens, sentences, IPA; ADR-138). What belongs here is each semantic the
+// to upstream's JavaScript on 8678 texts (tokens, sentences, IPA; ADR-142). What belongs here is each semantic the
 // subset commits to, one case apiece, its expectation taken from node's own RegExp (each match rendered as its
 // groups, `<g0|g1|...>`, and the split of a non-global one), and the subset's refusals.
 

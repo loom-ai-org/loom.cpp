@@ -1,6 +1,6 @@
 #pragma once
 
-// `tokenizer.ggml.model == "kale_tts"` (ADR-138): kale-tts-1-tiny's own text front end. `encode(text, lang)` is
+// `tokenizer.ggml.model == "kale_tts"` (ADR-142): kale-tts-1-tiny's own text front end. `encode(text, lang)` is
 // upstream's whole text path (`KaleTTS.inputs`, frontend/ + js/kale-tts.mjs) -- the terms table, dizione's text
 // rules, sentences, the G2P (lexicon, overrides, homographs, the GRU guesser; the British files and rules for
 // `en-GB`), Kokoro's symbols -- and packs every sentence's model inputs into one id stream the file's driver

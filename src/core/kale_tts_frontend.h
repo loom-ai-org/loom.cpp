@@ -1,6 +1,6 @@
 #pragma once
 
-// kale-tts-1-tiny's text front end (upstream's `frontend/`, JavaScript), the engine half of ADR-138: the shape of
+// kale-tts-1-tiny's text front end (upstream's `frontend/`, JavaScript), the engine half of ADR-142: the shape of
 // every step, with each step's tables and patterns read from the file (`tokenizer.ggml.kale.*`, written by
 // loom-exporter's `kale_tts_tokenizer_export.py`). Internal to `KaleTtsVocab`; one class per upstream module:
 //
