@@ -1,6 +1,6 @@
 // kale-tts-1's words -> IPA: frontend/words/kaleTts.js's `G2p` and `G2pModel`, frontend/dizione/homographs.js, and
 // frontend/words/enGb.js's `BritishG2p` / `toBritish`, method for method. The lexicons, the guesser's weights, the
-// homograph data and the patterns are the file's (ADR-138).
+// homograph data and the patterns are the file's (ADR-142).
 //
 // The guesser is evaluated as upstream's JavaScript evaluates it: every product and sum in double, one term at a
 // time, in upstream's order (this file is compiled with -ffp-contract=off so no multiply-add is fused), fp16

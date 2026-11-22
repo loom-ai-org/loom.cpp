@@ -170,5 +170,5 @@ space (`Ġ` before `)))'`) spans no character of the word, and upstream's overla
 * **The guesser's arithmetic matches upstream's order.** It is evaluated in double precision, one term at a time
   (the engine builds with `-ffp-contract=off`). glibc's `exp` and `tanh` can still differ from V8's in the last
   place, so a near-tie in the argmax could flip; none did over the corpora above.
-* **The model needs the engine that has the kind.** A GGUF of this model needs a `loom-py-rt` after 1.0.0. Its
-  card waits for that release.
+* **The model needs the engine that has the kind.** A GGUF of this model needs `loom-py-rt` 1.0.0, the first
+  release carrying it.

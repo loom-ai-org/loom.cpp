@@ -43,7 +43,7 @@ std::unique_ptr<Tokenizer> Tokenizer::load(const GgufModel& model) {
     else if (k == "pocket_tts") t->pocket_tts_ = PocketTtsVocab::load(model);
     else if (k == "voxcpm2") t->voxcpm_ = VoxCpmVocab::load(model);
     else if (k == "cosyvoice3") t->cosyvoice3_ = CosyVoice3Vocab::load(model);
-    // kale-tts-1-tiny: its JavaScript front end, the packed records its driver reads (ADR-138).
+    // kale-tts-1-tiny: its JavaScript front end, the packed records its driver reads (ADR-142).
     else if (k == "kale_tts") t->kale_tts_ = KaleTtsVocab::load(model);
     else if (k == "soprano") t->soprano_ = SopranoVocab::load(model);
     else if (k == "plamo") t->plamo_ = PlamoVocab::load(model);

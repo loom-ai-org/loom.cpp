@@ -1,4 +1,4 @@
-// kale-tts-1-tiny (loom-exporter kale_tts_export.py, ADR-138) against upstream's own code.
+// kale-tts-1-tiny (loom-exporter kale_tts_export.py, ADR-142) against upstream's own code.
 //
 // The reference directory is what `scripts/kale_tts_reference.py` writes:
 //

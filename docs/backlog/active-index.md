@@ -177,7 +177,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   need loom-py 1.0.0)** (built 2026-11-18; every duration upstream's, 56-67 dB from it; Q8_0_PC keeps ALBERT
   in float, which English needs).
   *Context: [ADR-135](../adrs/adr-135-paradee-reuses-kokoros-phases-and-carries-its-voices-as-rows.md)*
-* [ ] **kale-tts-1-tiny: publish after the release that carries the `kale_tts` tokenizer kind** (built 2026-11-22;
+* [ ] **kale-tts-1-tiny: publish after 1.0.0 (F32 + Q8_0_PC; the `kale_tts` tokenizer kind needs loom-py 1.0.0)** (built 2026-11-22;
   the front end identical to upstream's JavaScript on 8678 texts, every duration upstream's, 56-74 dB from it; the
   card states the door's Whisper numbers).
   *Context: [ADR-142](../adrs/adr-142-kale-tts-runs-its-javascript-front-end-in-the-engine.md)*
