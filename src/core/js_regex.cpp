@@ -761,6 +761,8 @@ std::vector<std::u32string> JsRegex::split(const std::u32string& text) const {
             continue;
         }
         out.push_back(text.substr(p, q - p));
+        // Captures are spliced in after each piece (an unmatched one as empty: `undefined` in ECMAScript).
+        for (size_t g = 1; g < m.groups.size(); ++g) out.push_back(m.group(text, g));
         p = m.end;
         q = p;
     }

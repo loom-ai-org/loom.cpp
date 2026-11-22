@@ -205,6 +205,12 @@ target_link_libraries(test_e2e_paradee PRIVATE loom::engine)
 add_test(NAME test_e2e_paradee COMMAND test_e2e_paradee)
 set_tests_properties(test_e2e_paradee PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_paradee PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_kale_tts gate/test_e2e_kale_tts.cpp)
+target_link_libraries(test_e2e_kale_tts PRIVATE loom::engine)
+add_test(NAME test_e2e_kale_tts COMMAND test_e2e_kale_tts)
+set_tests_properties(test_e2e_kale_tts PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_kale_tts PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_e2e_plamo gate/test_e2e_plamo.cpp)
 target_link_libraries(test_e2e_plamo PRIVATE loom::engine)
 add_test(NAME test_e2e_plamo COMMAND test_e2e_plamo)
@@ -1174,6 +1180,11 @@ add_executable(test_py_regex ci/test_py_regex.cpp)
 target_link_libraries(test_py_regex PRIVATE loom::engine)
 add_test(NAME test_py_regex COMMAND test_py_regex)
 set_tests_properties(test_py_regex PROPERTIES LABELS ci)
+
+add_executable(test_js_regex ci/test_js_regex.cpp)
+target_link_libraries(test_js_regex PRIVATE loom::engine)
+add_test(NAME test_js_regex COMMAND test_js_regex)
+set_tests_properties(test_js_regex PROPERTIES LABELS ci)
 
 add_test(
     NAME gen_voxcpm_vocab_gguf_fixture
