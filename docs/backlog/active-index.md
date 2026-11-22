@@ -177,6 +177,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   need loom-py 1.0.0)** (built 2026-11-18; every duration upstream's, 56-67 dB from it; Q8_0_PC keeps ALBERT
   in float, which English needs).
   *Context: [ADR-135](../adrs/adr-135-paradee-reuses-kokoros-phases-and-carries-its-voices-as-rows.md)*
+* [ ] **kale-tts-1-tiny: publish after 1.0.0 (F32 + Q8_0_PC; the `kale_tts` tokenizer kind needs loom-py 1.0.0)** (built 2026-11-22;
+  the front end identical to upstream's JavaScript on 8678 texts, every duration upstream's, 56-74 dB from it; the
+  card states the door's Whisper numbers).
+  *Context: [ADR-142](../adrs/adr-142-kale-tts-runs-its-javascript-front-end-in-the-engine.md)*
 * [ ] **Re-publish sanoTTS, vocetta2 and AuroraTTS with 1.0.0** so they draw their noise in the engine
   (verified on re-exports: 8.2e-7 at most, the card gate passes; ADR-134).
   *Context: [ADR-134](../adrs/adr-134-tiny-voca-splits-its-pulse-train-at-the-frame-and-draws-torch-noise-in-the-engine.md)*
@@ -432,6 +436,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   `fix/rms-norm-axis-walk`). A CI test should fail when a `loom_*` dialect op is neither known to the
   walk nor declared opaque. Also: the 1.0.0 VoxCPM2 re-export must come from an exporter with that fix.
   *Context: [Retro-106](../retros/retro-106-a-wider-fusion-reached-a-walk-that-did-not-know-its-op.md)*
+
+* [ ] **The shape walk resolves a length read off a LayerNorm's output to the trace's constant.** Ettin's
+  `torch.arange(x.shape[0])`, `x` the embeddings after their LayerNorm, became a static one-row `RANGE_1D` (every
+  position 0, the encoder 18.6 off); read off the input's shape it was symbolic. kale-tts reads it off the input;
+  the walk should carry the symbol through a norm, or refuse.
+  *Context: [ADR-142](../adrs/adr-142-kale-tts-runs-its-javascript-front-end-in-the-engine.md)*
 
 ## Engine — correctness
 

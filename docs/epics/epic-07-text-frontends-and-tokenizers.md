@@ -47,6 +47,13 @@ between punctuation marks (it drops them; the model reads them) and folded per l
 speak one language, declared beside them (`loom.tts.voice_languages`), so the voice picks the G2P
 ([ADR-135](../adrs/adr-135-paradee-reuses-kokoros-phases-and-carries-its-voices-as-rows.md)).
 
+**A JavaScript front end runs in the engine.** kale-tts-1-tiny's text path is upstream's `frontend/` (Kale's
+terms, dizione's text rules, a CMUdict lexicon with overrides, homographs, a GRU guesser, British files and rules),
+and `loom::KaleTtsVocab` (`"kale_tts"`) is its shape with every rule, table and weight from the file. Its rules are
+ECMAScript regular expressions, so they run on `loom::JsRegex`, an ECMAScript dialect beside `PyRegex`. `encode`
+returns each sentence's phoneme ids, word index and Ettin sub-tokens packed for the driver: 8678/8678 texts
+identical to upstream's JS ([ADR-142](../adrs/adr-142-kale-tts-runs-its-javascript-front-end-in-the-engine.md)).
+
 **A family the table does not cover raises a named error rather than mis-tokenizing.** That is what
 turns "add a tokenizer" into a bounded job instead of a mystery, and it is the pattern to keep.
 
