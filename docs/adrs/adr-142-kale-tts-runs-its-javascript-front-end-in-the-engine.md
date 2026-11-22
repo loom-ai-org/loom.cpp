@@ -150,7 +150,15 @@ space (`Ġ` before `)))'`) spans no character of the word, and upstream's overla
   * the gate's four cases (Kenzie, Amy, Magnus, Toby): 57.7-64.3 dB;
   * the seed alone is the pinned run to 1.2e-7;
   * the stream gives one piece per sentence.
-* **Whisper small through `text2speech.infer(text)`:** recorded in the model card.
+* **Whisper small through `text2speech.infer(text)`** (loom-py, the voice's own accent; Paradee's 20 held-out
+  English sentences, numbers and names included):
+
+  | file | over the ten voices | per voice |
+  |---|---|---|
+  | F32 | 3.5% | 2.0-5.8% (Amy 5.8%, Jack 4.3%) |
+  | Q8_0_PC | -- | Kenzie 3.7%, Amy 4.3%, Magnus 3.5% (F32: 3.7%, 5.8%, 3.2%) |
+
+  Kale's own bench lines (12 per voice, no digits) are 0/1210 words wrong.
 
 ## Consequences
 
