@@ -61,6 +61,7 @@
 #include "loom/core/plamo_vocab.h"
 #include "loom/core/voxcpm_vocab.h"
 #include "loom/core/cosyvoice3_vocab.h"
+#include "loom/core/kale_tts_vocab.h"
 #include "loom/core/voice_file.h"
 #include "loom/core/phoneme_vocab.h"
 #include "loom/core/unicode.h"
