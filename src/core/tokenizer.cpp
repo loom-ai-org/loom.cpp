@@ -6,6 +6,7 @@
 #include "loom/core/cosyvoice3_vocab.h"
 #include "loom/core/ctc_vocab.h"
 #include "loom/core/f5_vocab.h"
+#include "loom/core/kale_tts_vocab.h"
 #include "loom/core/phoneme_vocab.h"
 #include "loom/core/plamo_vocab.h"
 #include "loom/core/pocket_tts_vocab.h"
@@ -42,6 +43,8 @@ std::unique_ptr<Tokenizer> Tokenizer::load(const GgufModel& model) {
     else if (k == "pocket_tts") t->pocket_tts_ = PocketTtsVocab::load(model);
     else if (k == "voxcpm2") t->voxcpm_ = VoxCpmVocab::load(model);
     else if (k == "cosyvoice3") t->cosyvoice3_ = CosyVoice3Vocab::load(model);
+    // kale-tts-1-tiny: its JavaScript front end, the packed records its driver reads (ADR-138).
+    else if (k == "kale_tts") t->kale_tts_ = KaleTtsVocab::load(model);
     else if (k == "soprano") t->soprano_ = SopranoVocab::load(model);
     else if (k == "plamo") t->plamo_ = PlamoVocab::load(model);
     else if (k == "llama" || k == "t5") t->spm_ = Vocab::load(model);
@@ -51,7 +54,7 @@ std::unique_ptr<Tokenizer> Tokenizer::load(const GgufModel& model) {
 
 bool Tokenizer::valid() const {
     return spm_ || bpe_ || wordpiece_ || byte_ || supertonic_ || phoneme_ || ctc_ || f5_ || chatterbox_ ||
-           pocket_tts_ || voxcpm_ || cosyvoice3_ || soprano_ || plamo_;
+           pocket_tts_ || voxcpm_ || cosyvoice3_ || soprano_ || plamo_ || kale_tts_;
 }
 
 size_t Tokenizer::size() const {
@@ -66,6 +69,7 @@ size_t Tokenizer::size() const {
     if (pocket_tts_) return pocket_tts_->size();
     if (voxcpm_) return voxcpm_->size();
     if (cosyvoice3_) return cosyvoice3_->size();
+    if (kale_tts_) return kale_tts_->size();
     if (soprano_) return soprano_->size();
     if (plamo_) return plamo_->size();
     // n_tokens(), not vocab_size(): the latter is the 65536-entry BMP lookup table.
@@ -73,6 +77,7 @@ size_t Tokenizer::size() const {
 }
 
 std::vector<int32_t> Tokenizer::encode(const std::string& text, const std::string& lang) const {
+    if (kale_tts_) return kale_tts_->encode(text, lang);
     if (!lang.empty() && !supertonic_) {
         throw SchemaError("tokenizer kind '" + kind_ + "' takes no language argument; only a vocabulary "
                           "that tags its input by language (supertonic) does");
@@ -111,6 +116,7 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
     if (pocket_tts_) return pocket_tts_->decode(ids);
     if (voxcpm_) return voxcpm_->decode(ids);
     if (cosyvoice3_) return cosyvoice3_->decode(ids);
+    if (kale_tts_) return kale_tts_->decode(ids);
     if (soprano_) return soprano_->decode(ids);
     if (plamo_) return plamo_->decode(ids);
     return supertonic_->detokenize(ids);

@@ -38,6 +38,7 @@ class ChatterboxVocab;
 class PocketTtsVocab;
 class VoxCpmVocab;
 class CosyVoice3Vocab;
+class KaleTtsVocab;
 class SopranoVocab;
 
 class Tokenizer {
@@ -75,6 +76,7 @@ private:
     std::unique_ptr<PocketTtsVocab> pocket_tts_;
     std::unique_ptr<VoxCpmVocab> voxcpm_;
     std::unique_ptr<CosyVoice3Vocab> cosyvoice3_;
+    std::unique_ptr<KaleTtsVocab> kale_tts_;
     std::unique_ptr<SopranoVocab> soprano_;
 };
 

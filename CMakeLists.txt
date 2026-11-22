@@ -68,6 +68,10 @@ add_library(loom_engine
     src/core/chatterbox_vocab.cpp
     src/core/pocket_tts_vocab.cpp
     src/core/py_regex.cpp
+    src/core/js_regex.cpp
+    src/core/kale_g2p.cpp
+    src/core/kale_normalizer.cpp
+    src/core/kale_tts_vocab.cpp
     src/core/soprano_vocab.cpp
     src/core/plamo_vocab.cpp
     src/core/voxcpm_vocab.cpp
