@@ -59,7 +59,7 @@ public:
     std::u32string replace(const std::u32string& text, const std::u32string& templ) const;
     // `String.prototype.match` with a global regex: every whole match.
     std::vector<std::u32string> match_all(const std::u32string& text) const;
-    // `String.prototype.split(regex)` (captures are not spliced in: no rule splits with a capturing one).
+    // `String.prototype.split(regex)`, captures spliced in after each piece (an unmatched one as empty).
     std::vector<std::u32string> split(const std::u32string& text) const;
     // `RegExp.prototype.test`.
     bool test(const std::u32string& text) const;
