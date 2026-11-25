@@ -8,14 +8,14 @@
 
 <p align="center">
   <b>Speech, audio and language models on everything from a GPU to a Raspberry Pi Zero.</b><br>
-  One self-describing GGUF per model · no per-model code · built on <a href="https://github.com/ggml-org/ggml">ggml</a>
+  One self-describing GGUF per model · an engine that hardcodes no model · built on <a href="https://github.com/ggml-org/ggml">ggml</a>
 </p>
 
 <p align="center">
   <a href="https://pypi.org/project/loom-py-rt/"><img alt="PyPI" src="https://img.shields.io/pypi/v/loom-py-rt?include_prereleases&label=pip%20install%20loom-py-rt&color=0969da"></a>
-  <a href="https://huggingface.co/loom-ai-org"><img alt="Models on Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20models-64-ffcc4d"></a>
+  <a href="https://huggingface.co/loom-ai-org"><img alt="Models on Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20models-77-ffcc4d"></a>
   <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-1a7f37"></a>
-  <img alt="Platforms" src="https://img.shields.io/badge/runs%20on-x86--64%20%C2%B7%20ARM64%20%C2%B7%20ARMv6%20%C2%B7%20Apple%20Silicon-6e7781">
+  <img alt="Platforms" src="https://img.shields.io/badge/runs%20on-x86--64%20%C2%B7%20ARM64%20%C2%B7%20ARMv6%20%C2%B7%20Apple%20Silicon%20%C2%B7%20Windows-6e7781">
 </p>
 
 ---
@@ -23,8 +23,8 @@
 loom.cpp is a small inference engine for **speech recognition, text to speech, voice activity, speaker
 and language identification, audio codecs, music and small language models**. Every model is a single
 GGUF file that carries its weights, its compute graphs and the script that drives them, so the engine
-runs **64 models** across speech, audio and text without a line of model-specific C++. Export a new
-checkpoint and it runs everywhere loom does.
+runs **77 models** across speech, audio and text without compiling any model's network or decode loop
+into the engine. Export a new checkpoint and it runs everywhere loom does.
 
 ## Highlights
 
@@ -36,10 +36,11 @@ checkpoint and it runs everywhere loom does.
   and its GPU's 12 QPUs make them **1.1x to 3.4x faster still**: a Piper-size voice too, with them.
 * 📦 **One file per model.** Weights, graph topologies, driver script, tokenizer and voices travel
   together. Nothing to configure, and no Python needed at run time.
-* 🧩 **64 models, one engine.** Whisper, Parakeet, Canary, Moonshine, Kokoro, Piper VITS, Pocket TTS,
-  CosyVoice3, Qwen3-TTS, Voxtral TTS, MusicGen, Qwen3, Gemma 3 and more ([catalogue](#supported-models)).
+* 🧩 **77 models, one engine.** Whisper, Parakeet, Canary, Moonshine, Zipformer, Kokoro, Piper VITS,
+  Pocket TTS, CosyVoice3, Qwen3-TTS, OmniVoice, Voxtral TTS, MusicGen, Qwen3, Gemma 3, PLaMo 3 and more
+  ([catalogue](#supported-models)).
 * ⚡ **CPU everywhere, GPU where you have one.** x86-64, ARM64, 32-bit ARMv6 and Apple Silicon on the
-  CPU; Vulkan, CUDA and Metal as optional backends.
+  CPU, on Linux, macOS and Windows; Vulkan, CUDA and Metal as optional backends.
 * 🔢 **Per-channel int8 (`Q8_0_PC`)** with hand-tuned kernels for the Pi 4's Cortex-A72 and the Pi
   Zero's ARM11, beside ggml's own F32, F16 and Q4/Q8 formats.
 
@@ -154,7 +155,7 @@ of audio: 1.81x per second of speech. The onnxruntime side is upstream's own ONN
 
 All on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org), ready for
 `loom.Model.from_pretrained(...)`. Sizes are the GGUF on disk, with the int8 file first where both are
-published. Each model keeps its upstream licence: † marks a non-commercial one, and each model card
+published. Each model keeps its upstream licence: † marks one that limits commercial use, and each model card
 has the details.
 
 ### 🎙️ Speech recognition
@@ -166,13 +167,16 @@ has the details.
 | [Parakeet-TDT 0.6B v3](https://huggingface.co/loom-ai-org/parakeet-tdt-0.6b-loom) | 2.5 GB | 25 | |
 | [Parakeet-RNNT 0.6B](https://huggingface.co/loom-ai-org/parakeet-rnnt-0.6b-loom) | 2.5 GB | en | |
 | [Nemotron 3.5 ASR Streaming 0.6B](https://huggingface.co/loom-ai-org/nemotron-3.5-asr-streaming-0.6b-loom) | 2.6 GB | 35 | streaming, language prompt |
+| [Nemotron-Labs Unified ASR 0.6B](https://huggingface.co/loom-ai-org/nemotron-labs-unified-asr-0.6b-loom) | 719 MB / 2.5 GB | 25 | language prompt, punctuation |
 | [Qwen3-ASR 0.6B](https://huggingface.co/loom-ai-org/qwen3-asr-0.6b-loom) | 3.1 GB | 30 | |
+| [oruk-loop-153M](https://huggingface.co/loom-ai-org/oruk-loop-153m-loom) † | 243 / 802 MB | en | Qwen3-ASR distilled into looped blocks |
 | [Granite Speech 4.0 1B](https://huggingface.co/loom-ai-org/granite-speech-4.0-1b-loom) | 8.8 GB | 6 | transcribe and translate |
 | [Kyutai STT 1B](https://huggingface.co/loom-ai-org/kyutai-stt-1b-en-fr-loom) | 4.2 GB | en, fr | streaming |
 | [LFM2.5-Audio 1.5B](https://huggingface.co/loom-ai-org/lfm2.5-audio-1.5b-asr-loom) | 5.2 GB | en | |
 | [SenseVoice Small](https://huggingface.co/loom-ai-org/sensevoice-small-loom) | 939 MB | zh, en, ja, ko, yue | |
 | [Paraformer-large](https://huggingface.co/loom-ai-org/paraformer-zh-loom) | 866 MB | zh, en | non-autoregressive |
 | [GigaAM v3 RNNT](https://huggingface.co/loom-ai-org/gigaam-v3-rnnt-loom) | 893 MB | ru, en | |
+| [Zipformer small](https://huggingface.co/loom-ai-org/zipformer-small-loom) · [streaming](https://huggingface.co/loom-ai-org/zipformer-small-streaming-loom) | 58 / 140 MB · 61 / 143 MB | zh, en | streaming in 640 ms chunks |
 | [Moonshine tiny](https://huggingface.co/loom-ai-org/moonshine-tiny-loom) | 31 / 110 MB | en | fast on a Pi |
 | [Moonshine Streaming tiny](https://huggingface.co/loom-ai-org/moonshine-streaming-tiny-loom) · [small](https://huggingface.co/loom-ai-org/moonshine-streaming-small-loom) | 136 / 495 MB | en | streaming |
 | [Conformer-CTC small](https://huggingface.co/loom-ai-org/conformer-ctc-small-loom) | 60 MB | en | |
@@ -184,17 +188,24 @@ has the details.
 | Model | Size | Languages | |
 |---|---|---|---|
 | [Pocket TTS](https://huggingface.co/loom-ai-org/pocket-tts-loom) | 130 / 405 MB | en | 26 voices, takes text |
-| Pocket TTS distilled [18M](https://huggingface.co/loom-ai-org/pocket-tts-18m-loom) · [7M](https://huggingface.co/loom-ai-org/pocket-tts-7m-loom) · [2M](https://huggingface.co/loom-ai-org/pocket-tts-2m-loom) | 31 · 11 · 4.2 MB | en | new in 1.0.0-rc19 |
+| Pocket TTS distilled [18M](https://huggingface.co/loom-ai-org/pocket-tts-18m-loom) · [7M](https://huggingface.co/loom-ai-org/pocket-tts-7m-loom) · [2M](https://huggingface.co/loom-ai-org/pocket-tts-2m-loom) | 31 · 11 · 4.2 MB | en | distilled, small enough for a Pi Zero |
 | [Kokoro 82M](https://huggingface.co/loom-ai-org/kokoro-82m-loom) | 325 MB | en | |
+| [kale-tts-1-tiny](https://huggingface.co/loom-ai-org/kale-tts-1-tiny-loom) | 113 / 202 MB | en | 10 voices, takes text |
+| [Paradee 8M](https://huggingface.co/loom-ai-org/paradee-8m-loom) | 20 / 35 MB | en, hi, fr, es | 8 voices, Kokoro distilled |
 | [Piper VITS en-GB miro](https://huggingface.co/loom-ai-org/vits-piper-en-gb-miro-loom) | 63 MB | en-GB | |
+| [Vaniq-Edge](https://huggingface.co/loom-ai-org/vaniq-edge-loom) | 12 / 34 MB | en | an 8.9M-parameter VITS |
+| [tiny-voca](https://huggingface.co/loom-ai-org/tiny-voca-loom) | 6.9 / 21 MB | en | 2 voices, no neural vocoder |
 | [sanoTTS](https://huggingface.co/loom-ai-org/sanotts-loom) | 1–9 MB | 14 | 28 tiny voices (GPL-3.0) |
 | [Vocetta2 1M](https://huggingface.co/loom-ai-org/vocetta2-1m-loom) · [500K](https://huggingface.co/loom-ai-org/vocetta2-500k-loom) · [276K](https://huggingface.co/loom-ai-org/vocetta2-276k-loom) | 2.9 · 1.2 · 0.6 MB | en | a whole TTS in under 3 MB |
+| [AuroraTTS-100K](https://huggingface.co/loom-ai-org/auroratts-100k-loom) | 0.5 MB | en | 96K parameters, a DSP synthesizer |
 | [Supertonic 2](https://huggingface.co/loom-ai-org/supertonic-2-loom) | 268 MB | 5 | takes text |
 | [Soprano 1.1 80M](https://huggingface.co/loom-ai-org/soprano-1.1-80m-loom) | 441 MB | en | 32 kHz |
 | [SpeechT5](https://huggingface.co/loom-ai-org/speecht5-tts-loom) | 636 MB | en | voice files |
 | [Matcha-TTS](https://huggingface.co/loom-ai-org/matcha-tts-ljspeech-loom) · [StyleTTS2](https://huggingface.co/loom-ai-org/styletts2-ljspeech-loom) | 129 · 411 MB | en | LJSpeech |
 | [Chatterbox](https://huggingface.co/loom-ai-org/chatterbox-loom) | 2.7 GB | en | |
 | [Fun-CosyVoice3 0.5B](https://huggingface.co/loom-ai-org/fun-cosyvoice3-0.5b-loom) | 3.4 GB | 9 | voice cloning |
+| [OmniVoice](https://huggingface.co/loom-ai-org/omnivoice-loom) † | 3.2 GB | 600+ | voice design and cloning |
+| [Audio8-TTS Realistic 0.6B](https://huggingface.co/loom-ai-org/audio8-tts-realistic-0.6b-loom) + [its codec](https://huggingface.co/loom-ai-org/audio8-tts-codec-loom) | 650 MB / 2.4 GB + 523 MB | 23 | 44.1 kHz, voice cloning |
 | [Qwen3-TTS 0.6B](https://huggingface.co/loom-ai-org/qwen3-tts-12hz-0.6b-loom) + [its codec](https://huggingface.co/loom-ai-org/qwen3-tts-tokenizer-12hz-loom) | 4.1 GB + 456 MB | 10 | voice cloning |
 | [F5-TTS v1](https://huggingface.co/loom-ai-org/f5-tts-v1-base-loom) † | 1.4 GB | en, zh | voice cloning |
 | [VoxCPM2](https://huggingface.co/loom-ai-org/voxcpm2-loom) | 9.3 GB | 30 | 48 kHz |
@@ -223,6 +234,7 @@ has the details.
 | [SmolLM2 360M Instruct](https://huggingface.co/loom-ai-org/smollm2-360m-instruct-loom) | 1.4 GB | chat |
 | [LFM2 350M](https://huggingface.co/loom-ai-org/lfm2-350m-monolithic-loom) ([modular export](https://huggingface.co/loom-ai-org/lfm2-350m-modular-loom)) | 1.4 GB | completion |
 | [FLAN-T5 small](https://huggingface.co/loom-ai-org/flan-t5-small-loom) | 309 MB | instructions, encoder-decoder |
+| [PLaMo 3 Translate 0.8B](https://huggingface.co/loom-ai-org/plamo-3-translate-0.8b-loom) † | 3.6 GB | translation, 60 languages |
 | [DistilBERT NER](https://huggingface.co/loom-ai-org/distilbert-ner-loom) | 261 MB | named entities |
 | [Punctuate-All](https://huggingface.co/loom-ai-org/punctuate-all-loom) | 1.1 GB | punctuation, 12 languages |
 
@@ -245,10 +257,12 @@ checkpoint into a loom GGUF, and a new family is an export, not engine code.
 | Linux ARMv6: Raspberry Pi Zero, Zero W, Pi 1 | ✅ tuned for the ARM1176's VFP | — | [wheel on the release page](https://github.com/loom-ai-org/loom-py/releases/latest) |
 | macOS on Apple Silicon | ✅ with Accelerate | Metal | `pip install loom-py-rt` |
 | macOS on Intel | ✅ built and imported in CI, best effort | — | `pip install loom-py-rt` |
+| Windows x64 | ✅ every x86-64 CPU (the best kernel is picked at load) | Vulkan | [Python 3.12 wheels on the release page](https://github.com/loom-ai-org/loom-py/releases/latest) |
 | A web browser, or Node | ✅ WebAssembly with SIMD, one thread | WebGPU (Chrome, Edge), experimental | [`web/`](web/README.md): `web/build.sh`, then `import { init } from "loom.mjs"` |
 
 GPU backends are separate, small packages (`pip install "loom-py-rt[vulkan]"`, `[cuda]`, `[metal]`) and
-the engine falls back to the CPU for anything a backend cannot run. Windows is not supported yet.
+the engine falls back to the CPU for anything a backend cannot run. On Windows the Vulkan backend is a
+release-page wheel too.
 
 ## How it works
 
@@ -307,6 +321,11 @@ contract.interface_name(); // "speech2text"
 | [**loom.cpp**](https://github.com/loom-ai-org/loom.cpp) | this one: the engine, its primitives and its Lua bridge |
 | [**loom-py**](https://github.com/loom-ai-org/loom-py) | Python bindings, published on PyPI as `loom-py-rt` |
 | [**loom-exporter**](https://github.com/loom-ai-org/loom-exporter) | turns a PyTorch checkpoint into a GGUF this engine runs |
+
+## Acknowledgements
+
+The coding, debugging and documentation of loom.cpp were assisted by
+[Claude Code](https://claude.com/claude-code) agents.
 
 ## Licence
 
