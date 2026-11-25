@@ -322,6 +322,11 @@ contract.interface_name(); // "speech2text"
 | [**loom-py**](https://github.com/loom-ai-org/loom-py) | Python bindings, published on PyPI as `loom-py-rt` |
 | [**loom-exporter**](https://github.com/loom-ai-org/loom-exporter) | turns a PyTorch checkpoint into a GGUF this engine runs |
 
+## Acknowledgements
+
+The coding, debugging and documentation of loom.cpp were assisted by
+[Claude Code](https://claude.com/claude-code) agents.
+
 ## Licence
 
 MIT, see [`LICENSE`](LICENSE). Each model on the Hub keeps the licence of the checkpoint it was exported
