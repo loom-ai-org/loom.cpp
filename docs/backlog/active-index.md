@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-19
+last_updated: 2026-11-27
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -149,6 +149,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Models
 
+* [ ] **pyannote segmentation: project its four BiLSTM layers (ADR-144)** -- `project_input=True` plus `input_topology` per `BiRecurrentCall`, as the rawi ensemble does. Measure the stream against the per-step export, run the card gate, then republish (the paired binding is in 1.0.0). *Context: [ADR-144](../adrs/adr-144-a-bilstm-stack-swept-a-layer-at-a-time-projects-every-layer.md)*
 * [ ] **OmniVoice: publish after 1.0.0, then a GPU run and the rest of its door** (built 2026-11-17, F32,
   CC-BY-NC weights). Its export needs exporter + engine changes from `feat/omnivoice` (dense ATTENTION,
   last-axis max, POOL_1D on a permuted input), so the file needs the next engine. Open: a card, a Q8_0
