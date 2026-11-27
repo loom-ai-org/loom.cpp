@@ -319,6 +319,9 @@ private:
     static int l_run_bi_recurrent_pair_and_retain(lua_State* L);
     // Both bindings' body: `paired` reads a second sequence for the backward direction (ADR-137).
     static int bi_recurrent_and_retain(lua_State* L, const char* fname, bool paired);
+    // `loom.run_bi_lstm_and_retain(...)`: the arguments and result of `run_bi_recurrent_and_retain`, for the
+    // exporter's plain LSTM cell, with the whole sweep as one graph.
+    static int l_run_bi_lstm_and_retain(lua_State* L);
     // Where one recurrent sweep reads its sequence from -- a marshalled array or another module's
     // retained output -- resolved once per call. Defined in the .cpp; nothing outside it needs the
     // shape.

@@ -24,6 +24,8 @@ extern "C" int luaopen_bit(lua_State* L);
 #endif
 
 #include <ggml-backend.h>
+#include <ggml-alloc.h>
+#include <ggml-cpp.h>
 
 #include <algorithm>
 #include <cmath>
@@ -1368,6 +1370,212 @@ int LoomLuaBridge::bi_recurrent_and_retain(lua_State* L, const char* fname, bool
     }
 }
 
+namespace {
+
+// What a fused sweep needs from an exported LSTM cell topology: the three weights and where each gate
+// sits in the stacked pre-activation. Read from the cell graph itself rather than assumed, because the
+// exporter stores the gates as (i, f, o, z), not PyTorch's (i, f, g, o).
+struct LstmCellWeights {
+    std::string w_ih, w_hh, bias;
+    int64_t off_i = -1, off_f = -1, off_o = -1, off_z = -1;  // element offsets into the 4*hidden gates
+};
+
+LstmCellWeights read_lstm_cell(const GraphTopology& topo, const std::string& module, const char* fname) {
+    std::vector<const TopologyNode*> nodes;
+    for (const TopologyItem& item : topo.items) {
+        if (item.is_repeat) throw Error(std::string(fname) + ": '" + module + "' is not a single LSTM cell");
+        nodes.push_back(&item.node);
+    }
+    auto producer = [&](const std::string& name) -> const TopologyNode* {
+        for (const TopologyNode* n : nodes)
+            if (!n->outputs.empty() && n->outputs[0] == name) return n;
+        return nullptr;
+    };
+    LstmCellWeights w;
+    std::string gates_sum;
+    for (const TopologyNode* n : nodes) {
+        if (n->op == "MUL_MAT" && n->inputs.size() == 2 && n->inputs[1] == "layer_input") w.w_ih = n->inputs[0];
+        if (n->op == "MUL_MAT" && n->inputs.size() == 2 && n->inputs[1] == "h_prev") w.w_hh = n->inputs[0];
+    }
+    // The bias is the ADD operand that no node produces and that is not a declared input.
+    for (const TopologyNode* n : nodes) {
+        if (n->op != "ADD" || n->inputs.size() != 2) continue;
+        for (int k = 0; k < 2; ++k) {
+            const std::string& a = n->inputs[k];
+            const std::string& b = n->inputs[1 - k];
+            const TopologyNode* pb = producer(b);
+            if (!producer(a) && pb && pb->op == "ADD") w.bias = a;
+        }
+    }
+    // Gate roles from how each view is used: z goes through TANH; f multiplies c_prev; o multiplies
+    // tanh(c_new); i multiplies z.
+    auto consumer_of = [&](const std::string& name) -> const TopologyNode* {
+        for (const TopologyNode* n : nodes)
+            for (const std::string& in : n->inputs)
+                if (in == name) return n;
+        return nullptr;
+    };
+    for (const TopologyNode* n : nodes) {
+        if (n->op != "VIEW") continue;
+        const int64_t off = n->attrs.value("offset", int64_t{-1}) / static_cast<int64_t>(sizeof(float));
+        const TopologyNode* act = consumer_of(n->outputs[0]);
+        if (!act) continue;
+        if (act->op == "TANH") { w.off_z = off; continue; }
+        const TopologyNode* use = consumer_of(act->outputs[0]);
+        if (!use || use->op != "MUL") continue;
+        const std::string& other = use->inputs[0] == act->outputs[0] ? use->inputs[1] : use->inputs[0];
+        const TopologyNode* po = producer(other);
+        if (other == "c_prev") w.off_f = off;
+        else if (po && po->op == "TANH" && producer(po->inputs[0]) && producer(po->inputs[0])->op != "VIEW")
+            w.off_o = off;  // tanh(c_new), not the z gate
+        else w.off_i = off;
+    }
+    if (w.w_ih.empty() || w.w_hh.empty() || w.bias.empty() || w.off_i < 0 || w.off_f < 0 || w.off_o < 0 ||
+        w.off_z < 0) {
+        throw Error(std::string(fname) + ": '" + module + "' is not the exporter's LSTM cell (MUL_MAT on "
+                     "layer_input and h_prev, a bias ADD, four gate VIEWs); use run_bi_recurrent_and_retain");
+    }
+    return w;
+}
+
+// One direction of an LSTM, unrolled into `gf`. `proj` is `W_ih x + b` for every timestep,
+// `[4*hidden, seq_len]`; each step adds only `W_hh h`. Each h_t is copied into its column of `dst`.
+void build_lstm_direction(ggml_context* ctx, ggml_cgraph* gf, const LstmCellWeights& cw, ggml_tensor* w_hh,
+                          ggml_tensor* proj, ggml_tensor* h0, ggml_tensor* c0, uint32_t seq_len,
+                          uint32_t hidden, bool reverse, const std::function<ggml_tensor*(uint32_t)>& dst) {
+    ggml_tensor* h = h0;
+    ggml_tensor* c = c0;
+    const size_t fsz = sizeof(float);
+    for (uint32_t step = 0; step < seq_len; ++step) {
+        const uint32_t t = reverse ? seq_len - 1 - step : step;
+        ggml_tensor* gx = ggml_view_1d(ctx, proj, 4 * hidden, static_cast<size_t>(t) * proj->nb[1]);
+        ggml_tensor* g = ggml_add(ctx, gx, ggml_mul_mat(ctx, w_hh, h));
+        auto gate = [&](int64_t off) { return ggml_view_1d(ctx, g, hidden, static_cast<size_t>(off) * fsz); };
+        ggml_tensor* i = ggml_sigmoid(ctx, gate(cw.off_i));
+        ggml_tensor* f = ggml_sigmoid(ctx, gate(cw.off_f));
+        ggml_tensor* o = ggml_sigmoid(ctx, gate(cw.off_o));
+        ggml_tensor* z = ggml_tanh(ctx, gate(cw.off_z));
+        c = ggml_add(ctx, ggml_mul(ctx, f, c), ggml_mul(ctx, i, z));
+        h = ggml_mul(ctx, o, ggml_tanh(ctx, c));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, h, dst(t)));
+    }
+}
+
+} // namespace
+
+// `loom.run_bi_lstm_and_retain(fwd_module, bwd_module, sequence, seq_len, input_dim, hidden_dim
+// [, layout])`: the same arguments and the same retained result as `run_bi_recurrent_and_retain`, for
+// cells that are the exporter's plain LSTM cell. Both directions run as ONE graph: the input
+// projection `W_ih x + b` is one matrix product per direction over the whole sequence, and the steps
+// are unrolled with h and c in backend memory. The per-step path builds and computes one graph per
+// timestep and direction, which costs more than the step's own matrix-vector product.
+int LoomLuaBridge::l_run_bi_lstm_and_retain(lua_State* L) {
+    const char* fname = "loom.run_bi_lstm_and_retain";
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string fwd_module = luaL_checkstring(L, 1);
+        const std::string bwd_module = luaL_checkstring(L, 2);
+        const auto seq_len = static_cast<uint32_t>(luaL_checknumber(L, 4));
+        const auto input_dim = static_cast<uint32_t>(luaL_checknumber(L, 5));
+        const auto hidden = static_cast<uint32_t>(luaL_checknumber(L, 6));
+        const std::string layout = luaL_optstring(L, 7, "rows");
+        if (layout != "rows" && layout != "layout_a") {
+            return luaL_error(L, "%s: layout '%s' -- it is 'rows' or 'layout_a'", fname, layout.c_str());
+        }
+        if (seq_len == 0) return luaL_error(L, "%s: seq_len is 0", fname);
+        const SequenceSource src = read_sequence_source(self, L, 3, seq_len, input_dim, fname);
+
+        auto module = [&](const std::string& name) -> Module& {
+            const auto it = self->modules_.find(name);
+            if (it == self->modules_.end()) throw Error(std::string(fname) + ": unregistered module '" + name + "'");
+            return it->second;
+        };
+        Module& fwd = module(fwd_module);
+        Module& bwd = module(bwd_module);
+        const LstmCellWeights cw_f = read_lstm_cell(fwd.topo, fwd_module, fname);
+        const LstmCellWeights cw_b = read_lstm_cell(bwd.topo, bwd_module, fname);
+
+        const uint32_t width = 2 * hidden;
+        const bool rows_layout = layout == "rows";
+        OutputStore* store = nullptr;
+        ggml_context_ptr template_ctx;
+        ggml_tensor* retained = reshape_store_2d(fwd, rows_layout ? width : seq_len,
+                                                  rows_layout ? seq_len : width, template_ctx, store);
+
+        ggml_tensor* source = nullptr;
+        if (src.by_ref) {
+            source = retained_store(self, src.module).get(static_cast<size_t>(src.index1 - 1));
+            if (source->ne[0] != static_cast<int64_t>(input_dim) || source->ne[1] != static_cast<int64_t>(seq_len)) {
+                throw Error(std::string(fname) + ": {from='" + src.module + "'} retained [" +
+                             std::to_string(source->ne[0]) + "," + std::to_string(source->ne[1]) +
+                             "] but this call declares input_dim=" + std::to_string(input_dim) +
+                             ", seq_len=" + std::to_string(seq_len));
+            }
+            if (source == retained) {
+                throw Error(std::string(fname) + ": the sequence is '" + fwd_module + "''s own retained "
+                             "output, which this call overwrites");
+            }
+        }
+
+        // ~16 nodes per step and direction, plus the projections.
+        const size_t graph_size = static_cast<size_t>(seq_len) * 40 + 64;
+        ggml_init_params params{};
+        params.mem_size = graph_size * ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false);
+        params.no_alloc = true;
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_cgraph* gf = ggml_new_graph_custom(ctx.get(), graph_size, false);
+
+        ggml_tensor* x = source;
+        if (!x) {
+            x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, input_dim, seq_len);
+            ggml_set_input(x);
+        }
+        ggml_tensor* zero = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, hidden);
+        ggml_set_input(zero);
+
+        // Both directions write rows `[2*hidden, seq_len]`; layout_a is that transposed into the store.
+        ggml_tensor* rows = rows_layout ? retained : ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, seq_len);
+        auto direction = [&](Module& mod, const LstmCellWeights& cw, bool reverse, uint32_t half) {
+            ggml_tensor* proj = ggml_add(ctx.get(), ggml_mul_mat(ctx.get(), mod.model->weight(cw.w_ih), x),
+                                         mod.model->weight(cw.bias));
+            const size_t ch0 = static_cast<size_t>(half) * hidden * sizeof(float);
+            build_lstm_direction(ctx.get(), gf, cw, mod.model->weight(cw.w_hh), proj, zero, zero, seq_len, hidden,
+                                 reverse, [&, ch0](uint32_t t) {
+                                     return ggml_view_1d(ctx.get(), rows, hidden, static_cast<size_t>(t) * rows->nb[1] + ch0);
+                                 });
+        };
+        direction(fwd, cw_f, false, 0);
+        direction(bwd, cw_b, true, 1);
+        if (!rows_layout) {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx.get(), ggml_cont(ctx.get(), ggml_transpose(ctx.get(), rows)),
+                                                   retained));
+        }
+
+        ggml_backend_t backend = fwd.backends.primary;
+        ggml_gallocr_ptr galloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)));
+        if (!ggml_gallocr_alloc_graph(galloc.get(), gf)) throw Error(std::string(fname) + ": graph allocation failed");
+        const std::vector<float> zeros(hidden, 0.0f);
+        ggml_backend_tensor_set(zero, zeros.data(), 0, zeros.size() * sizeof(float));
+        if (!src.by_ref) {
+            std::vector<float> xs(src.data.begin(), src.data.end());
+            ggml_backend_tensor_set(x, xs.data(), 0, xs.size() * sizeof(float));
+        }
+        ScopedCpuThreads threads(backend, recurrent_cpu_thread_count());
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            throw Error(std::string(fname) + ": compute failed");
+        }
+        store->bump_generation();
+
+        const std::vector<double> shape = {static_cast<double>(retained->ne[0]),
+                                            static_cast<double>(retained->ne[1]), 1.0, 1.0};
+        lua_pushinteger(L, static_cast<lua_Integer>(store->generation()));
+        push_number_array(L, shape);
+        return 2;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "%s: %s", fname, e.what());
+    }
+}
+
 // `loom.output_shape(module, index)` -> the four `ne` of a retained output, and nothing else.
 //
 // `loom.get_output` already returns `(data, shape)`, but reading the shape through it marshals the
@@ -2681,6 +2889,7 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"run_recurrent_and_retain", &LoomLuaBridge::l_run_recurrent_and_retain},
         {"run_bi_recurrent_and_retain", &LoomLuaBridge::l_run_bi_recurrent_and_retain},
         {"run_bi_recurrent_pair_and_retain", &LoomLuaBridge::l_run_bi_recurrent_pair_and_retain},
+        {"run_bi_lstm_and_retain", &LoomLuaBridge::l_run_bi_lstm_and_retain},
         {"output_shape", &LoomLuaBridge::l_output_shape},
         {"run_ode", &LoomLuaBridge::l_run_ode},
         {"run_ode_and_retain", &LoomLuaBridge::l_run_ode_and_retain},

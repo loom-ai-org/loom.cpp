@@ -1996,6 +1996,21 @@ add_test(NAME test_gru_sweep COMMAND test_gru_sweep)
 set_tests_properties(test_gru_sweep PROPERTIES LABELS ci)
 set_tests_properties(test_gru_sweep PROPERTIES FIXTURES_REQUIRED gru_sweep_gguf_fixture)
 
+# --- `loom.run_bi_lstm_and_retain`: a two-layer BiLSTM as one graph per layer, against a float64 numpy
+#     BiLSTM in both retained layouts and against the per-timestep sweep. ---
+add_test(NAME gen_bilstm_fused_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_bilstm_fused_gguf.py
+            ${LOOM_FIXTURE_DIR}/bilstm_fused.gguf
+)
+set_tests_properties(gen_bilstm_fused_gguf_fixture PROPERTIES FIXTURES_SETUP bilstm_fused_gguf_fixture)
+set_tests_properties(gen_bilstm_fused_gguf_fixture PROPERTIES LABELS ci)
+add_executable(test_bilstm_fused ci/test_bilstm_fused.cpp)
+target_link_libraries(test_bilstm_fused PRIVATE loom::engine)
+target_compile_definitions(test_bilstm_fused PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_bilstm_fused COMMAND test_bilstm_fused)
+set_tests_properties(test_bilstm_fused PROPERTIES LABELS ci)
+set_tests_properties(test_bilstm_fused PROPERTIES FIXTURES_REQUIRED bilstm_fused_gguf_fixture)
+
 # --- `loom.seed_kv`: a saved attention state written into a module's KV cache (ADR-043). A bare
 #     two-layer ATTENTION module whose q/k/v are inputs, so the seeded rows alone decide the output. ---
 add_test(NAME gen_seed_kv_gguf_fixture
