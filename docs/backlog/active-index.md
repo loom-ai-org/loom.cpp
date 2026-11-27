@@ -149,7 +149,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Models
 
-* [ ] **pyannote segmentation: project its four BiLSTM layers (ADR-144)** -- `project_input=True` plus `input_topology` per `BiRecurrentCall`, as the rawi ensemble does. Measure the stream against the per-step export, run the card gate, then republish (the paired binding is in 1.0.0). *Context: [ADR-144](../adrs/adr-144-a-bilstm-stack-swept-a-layer-at-a-time-projects-every-layer.md)*
+* [ ] **pyannote segmentation: republish with its projected BiLSTMs (ADR-144)** -- built, measured and gated 2026-11-27 (loom-exporter `feat/pyannote-projected`): `infer` 1.41-1.63x, the diart stream 5.7x -> 8.3x real time, stream gate 3158/3158, card gate green. Runs on 1.0.0, so the card floor stays. Needs the user's go to publish. *Context: [ADR-144](../adrs/adr-144-a-bilstm-stack-swept-a-layer-at-a-time-projects-every-layer.md)*
 * [ ] **OmniVoice: publish after 1.0.0, then a GPU run and the rest of its door** (built 2026-11-17, F32,
   CC-BY-NC weights). Its export needs exporter + engine changes from `feat/omnivoice` (dense ATTENTION,
   last-axis max, POOL_1D on a permuted input), so the file needs the next engine. Open: a card, a Q8_0

@@ -42,7 +42,8 @@ from its nodes and builds the whole layer as one graph, written by hand in C++.
    references. The paired binding joins `RECURRENT_RETAIN_FNS`, so a reader of the forward store is
    checked as it is for the unpaired binding.
 3. **Opt-in per export**, as in ADR-137. Without `input_topology` the component emits exactly what it
-   did before, so pyannote and AuroraTTS (the two users in the zoo) export the same files.
+   did before. Of the two users in the zoo, pyannote opts in (below). AuroraTTS's BiGRU is a GRU, so it
+   cannot opt in and its export is unchanged.
 4. **No engine change.** The paired binding shipped in 1.0.0, so a projected export runs on the released
    engine. The card floor is already right: `_sweeps_projected_lstms` maps that binding to 1.0.0.
 
@@ -87,8 +88,23 @@ has none at F16 because it sums the terms in another order.
   `input_topology=f"{p}_lstm_l{layer}_input"` on each `BiRecurrentCall`. The file it writes runs on
   loom-py-rt 1.0.0, from PyPI: 0 argmax differences on the 934 sentences. The published fused file stops
   there with `attempt to call field 'run_bi_lstm_and_retain' (a nil value)`.
-* pyannote segmentation (four layers, hidden 128) can take the same two arguments. That needs its own
-  measurement and a card-gate run before a republish.
+* pyannote segmentation-3.0 (four layers, hidden 128) takes the same two arguments. Measured on
+  loom-py-rt 1.0.0, same machine, against the per-step export of the same weights (7 interleaved
+  rounds, median):
+
+  | | per-step | projected |
+  | :--- | ---: | ---: |
+  | `infer`, 5 s | 131 ms | 93 ms (1.41x) |
+  | `infer`, 10 s | 280 ms | 187 ms (1.50x) |
+  | `infer`, 21.5 s | 620 ms | 381 ms (1.63x) |
+  | diart stream, jfk 11 s | 5.7x real time | 8.3x |
+  | diart stream, two speakers 21.5 s | 4.2x real time | 6.6x |
+
+  The output is within 5.1e-7 of the per-step export, at the same distance from pyannote's f64 forward
+  (2.3e-5 to 6.4e-5), with 0 argmax flips. `test_e2e_diart_vad_stream` passes 3158/3158 over 14
+  settings against diart's own code, with 0 rows off, and the card gate passes. A copy whose layer-2
+  directions read each other's projection fails all three checks: 356 of 589 frames flip, the stream
+  gate fails with 1,058 or more rows off, and the card gate reports speech in silence.
 * Tests: `test_recurrent.py` runs a projected two-layer bidirectional stack a layer at a time against
   `nn.LSTM`, and fails if layer 1's directions swap projections.
   `test_a_projected_layer_runs_its_input_half_first` pins the emitted calls and checks the chain with
