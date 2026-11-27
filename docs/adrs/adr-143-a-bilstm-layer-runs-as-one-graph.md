@@ -15,10 +15,9 @@ Serves [Epic-05](../epics/epic-05-edge-performance.md). Follows
 ## Context
 
 `run_bi_recurrent_and_retain` computes one cell graph per timestep and direction, with h and c on the
-host. For a short sequence with a small hidden size, the dispatch of each step costs more than its
-matrix-vector product. The rawi Arabic diacritization ensemble (two networks, two BiLSTM layers each,
-hidden 256, 30-60 characters per sentence) took a median of 398 ms per sentence; onnxruntime fp32 takes
-about 42 ms (loom.cpp#143).
+host. For a short sequence with a small hidden size, the dispatch of each step is a large part of the
+time. The rawi Arabic diacritization ensemble has two networks, two BiLSTM layers each, hidden 256, and
+30-60 characters per sentence (loom.cpp#143).
 
 ## Decision
 
@@ -33,8 +32,10 @@ about 42 ms (loom.cpp#143).
 
 ## Consequences
 
-* rawi ensemble, 934 sentences, dev laptop, CPU: median 398 -> 20 ms (F16) and 30 ms (F32). The argmax
-  equals fp32 ONNX on all 24 477 characters; max |d| against the per-step path is 3.8e-6 (F32).
+* rawi ensemble, 934 sentences, dev laptop, CPU, one binary, both drivers run twice in turn: median
+  per sentence 14.3 -> 11.1 ms (F16) and 17.6 -> 10.7 ms (F32). onnxruntime on the same machine, one
+  thread: 5.0 ms fp32, 1.4 ms int8. The argmax equals fp32 ONNX on all 24 477 characters; max |d|
+  against the per-step path is 3.8e-6 (F32).
 * The graph has about 16 nodes per step and direction and is rebuilt for each call. Very long sequences
   make a large graph; the per-step binding stays for them and for GRU cells.
 * Tests: `test_bilstm_fused` checks two stacked layers (exporter gate order, then torch gate order, the
