@@ -78,6 +78,7 @@ add_library(loom_engine
     src/core/cosyvoice3_vocab.cpp
     src/core/voice_file.cpp
     src/core/phoneme_vocab.cpp
+    src/core/rule_based_phonemizer.cpp
     src/core/supertonic_text_vectorizer.cpp
     src/core/ctc_decode.cpp
     src/core/gpu_reset_watch.cpp

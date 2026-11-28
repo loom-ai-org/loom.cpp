@@ -1250,6 +1250,24 @@ add_test(NAME test_phoneme_vocab COMMAND test_phoneme_vocab)
 set_tests_properties(test_phoneme_vocab PROPERTIES LABELS ci)
 set_tests_properties(test_phoneme_vocab PROPERTIES FIXTURES_REQUIRED "phoneme_vocab_gguf_fixture;byte_vocab_gguf_fixture")
 
+# --- The rule-based phonemizer a file carries as a script plus data (ADR-145), against a toy script. ---
+add_test(
+    NAME gen_rule_based_phonemizer_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_rule_based_phonemizer_gguf.py
+            ${LOOM_FIXTURE_DIR}/rule_phonemizer_test.gguf
+            ${LOOM_FIXTURE_DIR}/rule_phonemizer_bad_kind.gguf
+            ${LOOM_FIXTURE_DIR}/rule_phonemizer_no_entry.gguf
+)
+set_tests_properties(gen_rule_based_phonemizer_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_rule_based_phonemizer_gguf_fixture PROPERTIES FIXTURES_SETUP rule_based_phonemizer_gguf_fixture)
+
+add_executable(test_rule_based_phonemizer ci/test_rule_based_phonemizer.cpp)
+target_link_libraries(test_rule_based_phonemizer PRIVATE loom::engine)
+target_compile_definitions(test_rule_based_phonemizer PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_rule_based_phonemizer COMMAND test_rule_based_phonemizer)
+set_tests_properties(test_rule_based_phonemizer PROPERTIES LABELS ci)
+set_tests_properties(test_rule_based_phonemizer PROPERTIES FIXTURES_REQUIRED "rule_based_phonemizer_gguf_fixture;phoneme_vocab_gguf_fixture")
+
 # --- Qwen3 roadmap item: GQA (n_head_kv < n_head) regression test, verified against numpy before the
 #     real Qwen3-0.6B-Base checkpoint (16 query / 8 KV heads) depends on ATTENTION's broadcast path ---
 set(LOOM_E2E_GQA_REF_DIR ${LOOM_FIXTURE_DIR}/e2e_gqa_ref)

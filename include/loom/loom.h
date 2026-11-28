@@ -64,6 +64,7 @@
 #include "loom/core/kale_tts_vocab.h"
 #include "loom/core/voice_file.h"
 #include "loom/core/phoneme_vocab.h"
+#include "loom/core/rule_based_phonemizer.h"
 #include "loom/core/unicode.h"
 #include "loom/core/supertonic_text_vectorizer.h"
 #include "loom/core/gpu_reset_watch.h"
