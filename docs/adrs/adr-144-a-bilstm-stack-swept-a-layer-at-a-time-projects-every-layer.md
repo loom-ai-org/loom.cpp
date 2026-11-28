@@ -57,30 +57,53 @@ branch, which also has both existing bindings. Three exports of the same weights
 * fused: the plain export with its calls renamed to #144's binding. It is byte-identical to the
   published `rawi_ensemble.*.gguf`.
 
-The runs were interleaved, two rounds each, and every value is the median per sentence.
+The runs were interleaved, three rounds each, at both thread counts this machine has cores for.
+`LOOM_N_THREADS` sets the threads for the graphs outside the sweeps (embedding, projection, head). The
+sweeps and the fused binding run on one thread either way (ADR-136). Every value is the median per
+sentence, and the median of the three rounds.
 
 | | per-step | projected | fused (#144) |
 | :--- | ---: | ---: | ---: |
-| F32 | 27.4 ms | 23.3 ms (1.18x) | 22.6 ms (1.21x) |
-| F16 | 43.0 ms | 31.8 ms (1.35x) | 30.6 ms (1.41x) |
+| F32, 1 thread | 22.2 ms | 17.9 ms (1.24x) | 18.9 ms (1.17x) |
+| F32, 2 threads (the default here) | 23.0 ms | 19.7 ms (1.17x) | 20.5 ms (1.12x) |
+| F16, 1 thread | 36.6 ms | 26.1 ms (1.40x) | 26.6 ms (1.38x) |
+| F16, 2 threads | 38.9 ms | 27.9 ms (1.39x) | 27.7 ms (1.40x) |
 | argmax ≠ fp32 ONNX, F32 / F16 | 0 / 0 | 0 / 2 | 0 / 2 |
 
-At both precisions, the projected and fused outputs are **bit-identical**. Both compute
-`(W_ih x + b) + W_hh h`. The two F16 differences are rounding from the F16 weights. The per-step path
-has none at F16 because it sums the terms in another order.
+At both precisions and both thread counts, the projected and fused outputs are **bit-identical**. Both
+compute `(W_ih x + b) + W_hh h` with the same ggml ops. The two F16 differences are rounding from the F16
+weights. The per-step path has none at F16 because it sums the terms in another order.
+
+Per sentence and paired within a round, projected over fused is 0.96-0.97 at F32 and 0.97-0.99 at F16
+on one thread. On two threads it is 0.88-1.00 at F32 and 0.99-1.02 at F16, which is noise. Two earlier
+runs on two threads had fused 2-4% ahead (22.6 against 23.3 ms, then 21.5 against 21.9, at F32). Three
+interleaved rounds did not reproduce that.
+
+**Where the time goes.** A sentence is about 26 characters, so about 210 cell steps. With cycle-counter
+timers in `cell_sweep`, one step of the projected sweep costs about 65 µs. About 3.3 µs of that is host
+work around the compute: the graph lookup (1.0 µs), the row copy (1.5), setting `h` and `c` (0.3),
+reading them back (0.17), and the sink (0.27). A prototype loop that builds the cell graph once per
+sweep and moves one row view instead of making a view per step gave bit-identical output and no
+measurable change. What does move every variant is the thread count. All three are 3-9% faster on one
+thread: rawi's graphs outside the sweeps are small (26 rows), and two threads cost them more than they
+save. A persistent CPU thread pool (a prototype, poll 0 and 50) did not recover any of it, at 0.99-1.02x
+on two threads, so the cost is not creating the threads. It is also why projected leads only on one
+thread: its projection is a graph of its own on `LOOM_N_THREADS` threads, where the fused binding does
+the same products inside its one-thread graph.
 
 ## Options not taken
 
-* **#144's fused binding.** It is 3% (F32) and 4% (F16) faster than the projected sweep, which is
-  what is left of the per-step dispatch. The cost of that is an LSTM implemented by hand in the engine, the
-  third path after `BiLstmStepper` and `cell_sweep`. It is recognized by matching nodes, so a cell with
-  an extra node would still match and run without it. It bypasses the module's scheduler, so a GPU primary
-  gets no CPU fallback and `LOOM_PROFILE` cannot see the graph. And it rebuilds and reallocates a graph
-  of about 40·T nodes on every call. The speedup it reported came almost entirely from the projection.
+* **#144's fused binding.** It is not faster than the projected sweep: within noise on two threads,
+  2-4% slower on one. The cost of it is an LSTM implemented by hand in the engine, the third path after
+  `BiLstmStepper` and `cell_sweep`. It is recognized by matching nodes, so a cell with an extra node
+  would still match and run without it. It bypasses the module's scheduler, so a GPU primary gets no CPU
+  fallback and `LOOM_PROFILE` cannot see the graph. And it rebuilds and reallocates a graph of about
+  40·T nodes on every call. The speedup it reported came from the projection.
 * **Unrolling the cell topology into one graph** (generic: any cell, its declared carry per ADR-087).
-  This is the right shape if the per-step dispatch ever matters. At 3-4% on rawi it does not yet. It
-  would also need `GraphBuilder` to build a topology into a caller's graph with rebound inputs, which
-  is a change of its own.
+  This is the right shape if the per-step dispatch ever matters. On rawi it does not: the host work
+  around a step is about 5% of it, and a leaner loop did not change the time. It would also need
+  `GraphBuilder` to build a topology into a caller's graph with rebound inputs, which is a change of its
+  own.
 
 ## Consequences
 
