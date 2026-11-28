@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-11-19
+last_updated: 2026-11-28
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -149,6 +149,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Models
 
+* [ ] **pyannote segmentation: republish with its projected BiLSTMs (ADR-144)** -- built, measured and gated 2026-11-27 (loom-exporter `feat/pyannote-projected`): `infer` 1.41-1.63x, the diart stream 5.7x -> 8.3x real time, stream gate 3158/3158, card gate green. Runs on 1.0.0, so the card floor stays. Needs the user's go to publish. *Context: [ADR-144](../adrs/adr-144-a-bilstm-stack-swept-a-layer-at-a-time-projects-every-layer.md)*
 * [ ] **OmniVoice: publish after 1.0.0, then a GPU run and the rest of its door** (built 2026-11-17, F32,
   CC-BY-NC weights). Its export needs exporter + engine changes from `feat/omnivoice` (dense ATTENTION,
   last-axis max, POOL_1D on a permuted input), so the file needs the next engine. Open: a card, a Q8_0
@@ -172,7 +173,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   Paradee 1.004x at poll 50; Qwen3 1.004x and Pocket 1.004x at poll 0. ADR-136 had already taken the case that
   mattered (a sweep's per-timestep graphs). Open: a many-core x86 box, where a compute creates up to 23 threads
   (the 24-core workstation), over a graph-per-token or graph-per-frame loop; and what a spinning pool costs the
-  driver's host work there. *Context: [ADR-136](../adrs/adr-136-a-recurrent-sweep-runs-its-cells-on-one-thread.md)*
+  driver's host work there. A small-graph model on 2 cores (rawi, Ryzen 3 3250U, 2026-11-28) gains nothing either:
+  0.99-1.02x at poll 0 and 50, although it is 3-9% faster at `LOOM_N_THREADS=1`. What its 26-row graphs lose on two
+  threads is not the threads' creation ([ADR-144](../adrs/adr-144-a-bilstm-stack-swept-a-layer-at-a-time-projects-every-layer.md)).
+  *Context: [ADR-136](../adrs/adr-136-a-recurrent-sweep-runs-its-cells-on-one-thread.md)*
 * [ ] **Paradee-8M v1.3: publish after 1.0.0 (F32 + Q8_0_PC; voices by name and the `kokoro` text style
   need loom-py 1.0.0)** (built 2026-11-18; every duration upstream's, 56-67 dB from it; Q8_0_PC keeps ALBERT
   in float, which English needs).
