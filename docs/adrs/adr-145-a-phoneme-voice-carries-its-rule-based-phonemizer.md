@@ -63,6 +63,9 @@ with `phonemize(text, lang) -> IPA`. Its first implementation runs a Lua script 
   * `phonemize(codepoints, lang) -> codepoints, dropped`. `lang` is the 0-based index into `loom.text.languages`.
     `dropped` is optional: the codepoints the script could not read, in text order;
   * optionally `set_lexicon(lang, entries)`, a run-time overlay of `word -> IPA` entries.
+* through one **host function** in that state, defined before the script runs: `phonemizer_data(lang) -> string`,
+  the value of `loom.phonemizer.data.<lang>` for index `lang`, or `nil`. The script pulls a language's data the first
+  time it needs it and caches what it builds, so a file with many languages decodes only the ones a call uses.
 
 The engine exposes it the way it exposes `tokenize`. loom-py, `loom_cli` and the web JS API each make one generic
 call in their `phonemes` path: the file's phonemizer when the file declares one, an installed provider otherwise.
