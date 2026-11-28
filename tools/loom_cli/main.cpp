@@ -1510,9 +1510,28 @@ int main(int argc, char** argv) {
                 // rather than of any checkpoint and is in no GGUF, so this host has nothing to run it
                 // with (docs/HIGH-LEVEL-API.md §5). What it can do is the half that IS in the file,
                 // which is exactly the half that was unreachable from here.
+                // A file that carries its phonemizer (ADR-145) takes TEXT here: it is phonemized first,
+                // in the language --language names, or the file's first language.
+                std::string phonemes = prompt_text;
+                if (auto phonemizer = loom::RuleBasedPhonemizer::load(*model)) {
+                    const auto& langs = phonemizer->languages();
+                    const auto it = language_name.empty() ? langs.begin()
+                                                          : std::find(langs.begin(), langs.end(), language_name);
+                    if (it == langs.end()) {
+                        std::fprintf(stderr, "error: --language %s is not one this file's phonemizer declares\n",
+                                     language_name.c_str());
+                        return 1;
+                    }
+                    const auto result = phonemizer->phonemize(prompt_text, static_cast<int>(it - langs.begin()));
+                    phonemes = result.ipa;
+                    std::printf("  phonemize(%s) -> \"%s\"\n", it->c_str(), phonemes.c_str());
+                    if (!result.dropped.empty()) {
+                        std::printf("  not read by the phonemizer, dropped: \"%s\"\n", result.dropped.c_str());
+                    }
+                }
                 size_t unknown = 0;
-                const auto ids = phoneme_vocab->encode(prompt_text, &unknown);
-                std::printf("  encode(\"%s\") -> [", prompt_text.c_str());
+                const auto ids = phoneme_vocab->encode(phonemes, &unknown);
+                std::printf("  encode(\"%s\") -> [", phonemes.c_str());
                 for (size_t i = 0; i < ids.size(); ++i) std::printf("%s%d", i ? ", " : "", ids[i]);
                 std::printf("]\n");
                 // A dropped symbol is expected rather than exceptional -- a rule-based G2P emits a
