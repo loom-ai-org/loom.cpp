@@ -102,7 +102,7 @@ and date expansion is not part of a phonemizer. A symbol of the IPA that is not 
 ### The exporter
 
 One option shared by the phoneme TTS export configs writes the `loom.phonemizer.*` keys from the phonemizer package
-installed at export time (for orthography2ipa, `orthography2ipa.export_to_loom`). The voice's driver stays as the
+installed at export time (for orthography2ipa, `orthography2ipa.export_to_loom`, orthography2ipa #2789). The voice's driver stays as the
 config writes it. The exporter does not edit generated Lua, and the host does not merge two GGUFs.
 
 ADR-012's licence decision and its fold-down risk stand. Its rejection of rules in each GGUF is replaced for files
