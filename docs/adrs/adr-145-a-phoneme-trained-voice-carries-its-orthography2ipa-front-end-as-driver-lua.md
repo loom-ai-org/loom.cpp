@@ -63,6 +63,12 @@ A phoneme-trained voice may carry its orthography2ipa front end in its own GGUF,
 * **The exporter writes it,** as an option of the VITS export config (`frontend="o2i:<lang>"`), from the
   orthography2ipa package installed at export time. The engine gets no code.
 
+**The same composition serves a `text2phonemes` file with graphs.** arbtok's Arabic G2P puts the rawi diacritizer
+(a BiLSTM ensemble) before the o2i driver for 46 lects. One file holds the rawi graphs, the o2i interpreter and one IR
+for each lect. Its metadata is `export_to_loom`'s (`loom.task = "text2phonemes"`, `loom.text.languages`), and
+`infer({text, lang})` returns IPA codepoints. A table that several lects share, such as a donor lexicon, is stored
+once per file.
+
 ADR-012's licence decision and its fold-down risk stand. Its rejection of per-GGUF rules is replaced for voices that
 carry this driver. A voice exported without the option keeps the loom-py door.
 
